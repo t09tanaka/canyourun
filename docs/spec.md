@@ -163,7 +163,7 @@ schema_version = 1
 mode = "worktree"
 include = []
 exclude = ["canyourun-results/**"]
-secret_files = [".env", "api/.env"]
+secret_files = [".env.test", "packages/*/.env.test"]
 
 [execution]
 profile = "web-dev"
