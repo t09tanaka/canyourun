@@ -68,6 +68,7 @@ pub fn parse_proc_stat(text: &str) -> Option<String> {
 
 /// Send `sig` to `pid` alone. True when the signal was delivered (or the
 /// process is a zombie); false when there is no such process or no right.
+#[allow(clippy::disallowed_methods)] // the one guarded way to kill()
 pub fn signal_pid(pid: u32, sig: i32) -> bool {
     // pid 0 is our own group, 1 is init, and a pid above i32::MAX wraps to a
     // negative pid_t: -1 would reach every process of the user. Never.
@@ -93,6 +94,7 @@ pub enum GroupSignal {
 }
 
 /// Send `sig` to every member of the group `pgid`. Signal 0 only probes.
+#[allow(clippy::disallowed_methods)] // the one guarded way to killpg()
 pub fn signal_process_group(pgid: i32, sig: i32) -> GroupSignal {
     if pgid <= 1 {
         // Group 0/1 would hit our own group or init: never.

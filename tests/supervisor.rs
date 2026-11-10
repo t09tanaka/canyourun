@@ -3,6 +3,7 @@
 
 use remote_task_runner::ids::*;
 use remote_task_runner::platform;
+use remote_task_runner::platform::{signal_pid, signal_process_group};
 use remote_task_runner::state::{AttemptState, Exit, Outcome, Receipt, TimeoutKind, TimeoutPhase};
 use remote_task_runner::storage::{LeaseOutcome, NewAcceptance, StorageError, WorkerStore};
 use remote_task_runner::supervisor::process::{code, spawn_detached, supervise};
@@ -109,12 +110,13 @@ impl Drop for Fx {
             }
         }
         for (pid, group) in all {
-            // pid 0, 1 or a wrapped negative would signal our own group, every
-            // process of the user (kill(-1)) or init: never.
-            if pid <= 1 {
-                continue;
+            // Only through the guarded helpers: pid 0, 1 or a wrapped negative
+            // would reach our own group, init or every process of the user.
+            if group {
+                signal_process_group(pid, libc::SIGKILL);
+            } else if let Ok(p) = u32::try_from(pid) {
+                signal_pid(p, libc::SIGKILL);
             }
-            unsafe { libc::kill(if group { -pid } else { pid }, libc::SIGKILL) };
         }
     }
 }
@@ -156,7 +158,7 @@ fn key(seq: u64) -> LeaseKey {
 }
 
 fn alive(pid: i32) -> bool {
-    unsafe { libc::kill(pid, 0) == 0 }
+    u32::try_from(pid).is_ok_and(|p| signal_pid(p, 0))
 }
 
 fn read_pid(path: &Path) -> Option<i32> {
@@ -662,7 +664,7 @@ fn the_supervisor_finishes_the_attempt_after_its_agent_is_killed() {
         f.store.get(f.attempt()).unwrap().unwrap().state == AttemptState::Active
     });
     // The agent and everything left in its group die.
-    unsafe { libc::killpg(agent_pid, libc::SIGKILL) };
+    signal_process_group(agent_pid, libc::SIGKILL);
     let mut agent = agent;
     agent.wait().unwrap();
     wait_for("the supervisor to settle the attempt", || {
@@ -763,7 +765,7 @@ fn the_supervisor_survives_a_hangup_and_finishes_the_attempt() {
     wait_for("the command to be running", || {
         f.state() == AttemptState::Active
     });
-    unsafe { libc::kill(sup.id() as i32, libc::SIGHUP) };
+    signal_pid(sup.id(), libc::SIGHUP);
     let status = sup.wait().unwrap();
     assert_eq!(status.code(), Some(code::SETTLED), "{status:?}");
     assert_eq!(f.term().outcome(), Outcome::Succeeded);
