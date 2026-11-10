@@ -57,7 +57,7 @@ jobs:
     name: mutation gate (pure modules)
     runs-on: ubuntu-latest
     env:
-      PURE: "src/ids.rs src/state.rs src/error.rs src/wire.rs"
+      PURE: "src/ids.rs src/state.rs src/error.rs src/wire.rs src/config/legacy.rs src/config/parse.rs src/config/paths.rs src/config/resolve.rs"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -69,4 +69,4 @@ jobs:
           if [ -z "$PURE" ]; then echo "no pure modules yet"; exit 0; fi
           scripts/mutation-targets-check.sh $PURE
           args=""; for f in $PURE; do args="$args --file $f"; done
-          cargo schemata $args -- --lib
+          cargo schemata $args
