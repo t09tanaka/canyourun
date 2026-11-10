@@ -356,7 +356,7 @@ mod tests {
         assert_eq!(sized(MAX_COMMAND_BYTES - 3, 1, 1, 1), Ok(()));
         for (a, c, k, v) in [(2, 1, 1, 1), (1, 2, 1, 1), (1, 1, 2, 1), (1, 1, 1, 2)] {
             assert_eq!(
-                sized(MAX_COMMAND_BYTES - 5 + a, c, k, v),
+                sized(MAX_COMMAND_BYTES - 4 + a, c, k, v),
                 Err("the commands are too large")
             );
         }
