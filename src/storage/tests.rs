@@ -706,7 +706,7 @@ fn wx() -> Wx {
 /// The run of a task in these tests: the same task always names the
 /// same run, so a resend is a true replay.
 fn run_of_task(task: &TaskId) -> RunId {
-    RunId::parse(&format!("run_{}", &task.as_str()["tsk_".len()..])).unwrap()
+    RunId::parse(&format!("run_{}", &task.as_str()["task_".len()..])).unwrap()
 }
 
 fn acceptance(a: &AttemptId, task: &TaskId, h: char, epoch: u64) -> NewAcceptance {
