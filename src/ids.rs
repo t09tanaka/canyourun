@@ -1,8 +1,9 @@
 //! Identifiers and digests shared by every component (spec chapter 10).
 //!
 //! Generated identifiers are `<kind prefix>_<ULID>` (for example `run_01J...`).
-//! Names that come from outside (worker, boot, node) are validated strings
-//! over `[A-Za-z0-9._-]`. Epochs and generations are plain `u64`. Every type serializes as a
+//! Worker and boot names are validated strings over `[A-Za-z0-9._-]` (they name
+//! state directories and SSH destinations). Node names are looser display
+//! strings (see [`NodeId`]). Epochs and generations are plain `u64`. Every type serializes as a
 //! bare string or number and validates on deserialization.
 
 use std::fmt;
@@ -23,6 +24,8 @@ pub enum IdError {
         "name must be 1..={max} characters of [A-Za-z0-9._-], not start with `.`, and not contain `..`"
     )]
     BadName { max: usize },
+    #[error("node name must be 1..={max} bytes with no control characters")]
+    BadNodeName { max: usize },
     #[error("digest must look like `sha256:<64 lowercase hex>`, got `{0}`")]
     BadDigest(String),
 }
@@ -141,8 +144,17 @@ fn is_valid_name(s: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
 }
 
+/// Longest accepted node name.
+pub const MAX_NODE_NAME_LEN: usize = 1024;
+
+/// A node name is non-empty, at most [`MAX_NODE_NAME_LEN`] bytes, and has no
+/// control characters. Anything else (spaces, `/`, `:`, `(`, `,`) is allowed.
+fn is_valid_node_name(s: &str) -> bool {
+    !s.is_empty() && s.len() <= MAX_NODE_NAME_LEN && !s.chars().any(char::is_control)
+}
+
 macro_rules! name_id {
-    ($(#[$doc:meta])* $name:ident) => {
+    ($(#[$doc:meta])* $name:ident, $valid:ident, $err:expr) => {
         $(#[$doc])*
         #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
         #[serde(try_from = "String", into = "String")]
@@ -151,10 +163,10 @@ macro_rules! name_id {
         impl $name {
             /// Validate a free-form name.
             pub fn parse(s: &str) -> Result<Self, IdError> {
-                if is_valid_name(s) {
+                if $valid(s) {
                     Ok(Self(s.to_string()))
                 } else {
-                    Err(IdError::BadName { max: MAX_NAME_LEN })
+                    Err($err)
                 }
             }
 
@@ -186,15 +198,26 @@ macro_rules! name_id {
 
 name_id!(
     /// A worker name chosen by the user (for example `mini-a`).
-    WorkerId
+    WorkerId,
+    is_valid_name,
+    IdError::BadName { max: MAX_NAME_LEN }
 );
 name_id!(
     /// The OS boot identifier reported by a worker.
-    WorkerBootId
+    WorkerBootId,
+    is_valid_name,
+    IdError::BadName { max: MAX_NAME_LEN }
 );
 name_id!(
-    /// A setup/step/shard node name inside a plan.
-    NodeId
+    /// A setup/step/shard node name inside a plan. It mirrors local-ci step,
+    /// job and matrix variant names such as `test (ubuntu, 18)` or
+    /// `build/linux:arm64`, so it may contain spaces, `/`, `:`, `(` and `,`.
+    ///
+    /// Never use a `NodeId` as a path component or process argument: it is not
+    /// path-safe. Derive a safe name (for example a digest) first.
+    NodeId,
+    is_valid_node_name,
+    IdError::BadNodeName { max: MAX_NODE_NAME_LEN }
 );
 
 macro_rules! counter {
@@ -422,7 +445,45 @@ mod tests {
             }
         )*};
     }
-    name_tests!(t_worker: WorkerId, t_boot: WorkerBootId, t_node: NodeId);
+    name_tests!(t_worker: WorkerId, t_boot: WorkerBootId);
+
+    mod t_node {
+        use super::*;
+
+        #[test]
+        fn accepts_local_ci_names_and_roundtrips() {
+            for ok in [
+                "test (ubuntu, 18)",
+                "build/linux:arm64",
+                "a b",
+                ".hidden",
+                "..",
+                "é",
+                "mini-a.local_1",
+            ] {
+                let id = NodeId::parse(ok).unwrap();
+                assert_eq!(id.as_str(), ok);
+                assert_eq!(id.to_string(), ok);
+                let json = serde_json::to_string(&id).unwrap();
+                assert_eq!(serde_json::from_str::<NodeId>(&json).unwrap(), id);
+                assert_eq!(String::from(id), ok);
+            }
+            assert!(WorkerId::parse("test (ubuntu, 18)").is_err());
+            assert!(WorkerId::parse("build/linux:arm64").is_err());
+        }
+
+        #[test]
+        fn rejects_empty_control_and_overlong() {
+            for bad in ["", "a\nb", "a\tb", "a\u{0}b", "a\u{7f}b", "a\u{85}b"] {
+                assert!(NodeId::parse(bad).is_err(), "{bad:?}");
+            }
+            assert!(NodeId::parse(&"x".repeat(MAX_NODE_NAME_LEN)).is_ok());
+            assert!(NodeId::parse(&"x".repeat(MAX_NODE_NAME_LEN + 1)).is_err());
+            assert!(serde_json::from_str::<NodeId>("\"\"").is_err());
+            let msg = NodeId::parse("").unwrap_err().to_string();
+            assert!(msg.contains("1024") && msg.contains("control"));
+        }
+    }
 
     #[test]
     fn counters_serialize_as_numbers_and_increment() {
