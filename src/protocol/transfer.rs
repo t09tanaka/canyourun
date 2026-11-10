@@ -241,10 +241,10 @@ pub async fn read_log(
     })
 }
 
-/// One `watch_events` round: the events not seen before.
+/// One `watch_events` round for the cursor's attempt: the events not seen
+/// before. `seq` is per attempt, so the watch is always scoped to one.
 pub async fn watch_events(
     client: &Client,
-    attempt_id: Option<&AttemptId>,
     cursor: &mut EventCursor,
     limit: u32,
     timeout: Duration,
@@ -252,7 +252,7 @@ pub async fn watch_events(
     let request = Request::WatchEvents(WatchEventsRequest {
         schema_version: SchemaVersion::CURRENT,
         request_id: RequestId::generate(),
-        attempt_id: attempt_id.cloned(),
+        attempt_id: Some(cursor.attempt_id().clone()),
         after_seq: cursor.after_seq(),
         limit,
     });

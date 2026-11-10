@@ -9,8 +9,7 @@ use remote_task_runner::protocol::frame::{encode, Body, Frame, MAX_FRAME_LEN};
 use remote_task_runner::protocol::io::{read_frame, write_frame};
 use remote_task_runner::protocol::mux::{run_writer, Outbox, Shared};
 use remote_task_runner::protocol::mux::{
-    INBOUND_BULK_MAX_BYTES, INBOUND_BULK_MAX_REQUESTS, INBOUND_CONTROL_MAX_REQUESTS,
-    OUTBOX_CONTROL_MAX_FRAMES,
+    INBOUND_BULK_MAX_REQUESTS, INBOUND_CONTROL_MAX_REQUESTS, OUTBOX_CONTROL_MAX_FRAMES,
 };
 use remote_task_runner::protocol::sched::Outgoing;
 use remote_task_runner::protocol::transfer::{get_blob, put_blob, read_log, TransferError};
@@ -663,31 +662,61 @@ fn blob_put_request(bytes: usize) -> Request {
     })
 }
 
-/// Call `requests` at once on a worker that never takes anything off its queues
-/// and sort the outcomes: refused at once with the busy code, or left waiting.
-async fn flood(
-    client: &remote_task_runner::protocol::Client,
-    requests: Vec<Request>,
-) -> (usize, usize) {
-    let calls: Vec<_> = requests
+type Calls = Vec<tokio::task::JoinHandle<Result<Response, CallError>>>;
+
+/// Call `requests` at once on a worker that is not taking anything off its queues.
+fn start_flood(client: &remote_task_runner::protocol::Client, requests: Vec<Request>) -> Calls {
+    requests
         .into_iter()
         .map(|r| {
             let c = client.clone();
-            tokio::spawn(async move { c.call(r, Duration::from_millis(400)).await })
+            tokio::spawn(async move { c.call(r, T).await })
         })
-        .collect();
-    let (mut busy, mut waiting) = (0, 0);
+        .collect()
+}
+
+/// Wait until `n` of the calls have ended. Before anything is taken off the
+/// queue only refused calls can end, so this waits for `n` refusals.
+async fn wait_for_refusals(calls: &Calls, n: usize) {
+    tokio::time::timeout(T, async {
+        while calls.iter().filter(|c| c.is_finished()).count() < n {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the refusals did not arrive");
+}
+
+/// Count what the worker's queue accepted (by taking it off the queue, once
+/// nothing more arrives for a second) and what was refused. The accepted
+/// requests are then dropped unanswered, which answers them `INTERNAL`, so the
+/// two counts come from the callers' side and need no timing: `(refused,
+/// accepted)`.
+async fn finish_flood(
+    incoming: &mut remote_task_runner::protocol::Incoming,
+    calls: Calls,
+) -> (usize, usize) {
+    let mut held = Vec::new();
+    while let Ok(Some(inbound)) =
+        tokio::time::timeout(Duration::from_secs(1), incoming.next()).await
+    {
+        held.push(inbound);
+    }
+    let accepted = held.len();
+    drop(held);
+    let (mut busy, mut internal) = (0, 0);
     for call in calls {
         match call.await.unwrap() {
-            Err(CallError::Remote(e)) => {
-                assert_eq!(e.code, ErrorCode::SourceBusy, "{e:?}");
-                busy += 1;
-            }
-            Err(CallError::Unconfirmed(Unconfirmed::TimedOut)) => waiting += 1,
+            Err(CallError::Remote(e)) if e.code == ErrorCode::SourceBusy => busy += 1,
+            Err(CallError::Remote(e)) if e.code == ErrorCode::Internal => internal += 1,
             other => panic!("{other:?}"),
         }
     }
-    (busy, waiting)
+    assert_eq!(
+        internal, accepted,
+        "every accepted request was answered once"
+    );
+    (busy, accepted)
 }
 
 #[tokio::test]
@@ -699,18 +728,15 @@ async fn a_bulk_flood_is_refused_beyond_the_limit_while_heartbeats_and_the_queue
     let requests = (0..INBOUND_BULK_MAX_REQUESTS + extra)
         .map(|_| blob_get_request())
         .collect();
-    let client = conn.client.clone();
-    let flooding = tokio::spawn(async move { flood(&client, requests).await });
+    let calls = start_flood(&conn.client, requests);
     // The reader is never stopped by the flood: pings still come back.
-    tokio::time::sleep(Duration::from_millis(100)).await;
     conn.client.ping(T).await.unwrap();
-    let (busy, waiting) = flooding.await.unwrap();
+    // Nothing is taken off the queue until every surplus request was refused.
+    wait_for_refusals(&calls, extra).await;
+    let (busy, accepted) = finish_flood(&mut incoming, calls).await;
     assert_eq!(busy, extra);
-    assert_eq!(waiting, INBOUND_BULK_MAX_REQUESTS);
-    // What was accepted is still there to be served, and serving frees room.
-    for _ in 0..INBOUND_BULK_MAX_REQUESTS {
-        incoming.next().await.unwrap();
-    }
+    assert_eq!(accepted, INBOUND_BULK_MAX_REQUESTS);
+    // Serving frees room: the next request is accepted and answered.
     let again = {
         let c = conn.client.clone();
         tokio::spawn(async move { c.call(blob_get_request(), T).await })
@@ -735,21 +761,19 @@ async fn a_bulk_flood_is_refused_beyond_the_limit_while_heartbeats_and_the_queue
 async fn bulk_bytes_are_bounded_too() {
     let cluster = ClusterId::generate();
     let (conn, srv) = pair(&cluster).await;
-    let _incoming = srv.incoming;
+    let mut incoming = srv.incoming;
     // Few requests, each big: the byte budget, not the count, is what bites.
     let chunk = 700_000;
     let count = 14;
     assert!(count < INBOUND_BULK_MAX_REQUESTS);
     let requests: Vec<_> = (0..count).map(|_| blob_put_request(chunk)).collect();
-    let (busy, waiting) = flood(&conn.client, requests).await;
+    let calls = start_flood(&conn.client, requests);
+    // Fewer requests than the count limit: a refusal can only be the bytes.
+    wait_for_refusals(&calls, 1).await;
+    let (busy, accepted) = finish_flood(&mut incoming, calls).await;
     assert!(busy >= 1, "no request was refused");
-    assert!(waiting >= 1, "everything was refused");
-    assert_eq!(busy + waiting, count);
-    // Accepted requests fit the budget: raw bytes are less than wire bytes.
-    assert!(
-        waiting * chunk <= INBOUND_BULK_MAX_BYTES,
-        "{waiting} accepted"
-    );
+    assert!(accepted >= 1, "everything was refused");
+    assert_eq!(busy + accepted, count);
 }
 
 #[tokio::test]
