@@ -29,7 +29,7 @@ pub enum Command {
     Exec(ExecArgs),
     /// Submit a command without waiting.
     Submit(SubmitArgs),
-    /// List runs and task.
+    /// List runs and tasks.
     Ls,
     /// Show one run or task.
     Show(IdArgs),
