@@ -531,6 +531,9 @@ async fn a23_a_restarted_agent_adopts_the_living_supervisor() {
     let a = AttemptId::generate();
     submit(&c, &a, &payload(&script)).await;
     wait_for("the command", || read_pid(&pidfile).is_some());
+    wait_for("the running state", || {
+        f.rec(&a).state == AttemptState::Active
+    });
     let pid = read_pid(&pidfile).unwrap();
     let sup = f.supervisors(&a);
     assert_eq!(sup.len(), 1);
@@ -580,6 +583,9 @@ async fn a23_a_dead_supervisor_is_recovered_and_the_command_is_not_started_again
     let a = AttemptId::generate();
     submit(&c, &a, &payload(&script)).await;
     wait_for("the command", || read_pid(&pidfile).is_some());
+    wait_for("the running state", || {
+        f.rec(&a).state == AttemptState::Active
+    });
     let pid = read_pid(&pidfile).unwrap();
     agent.shutdown();
     for s in f.supervisors(&a) {
@@ -843,6 +849,9 @@ async fn status_events_logs_lease_and_inspect_answer_from_the_store() {
     let a = AttemptId::generate();
     submit(&c, &a, &payload(&script)).await;
     wait_for("the command", || read_pid(&pidfile).is_some());
+    wait_for("the running state", || {
+        f.rec(&a).state == AttemptState::Active
+    });
 
     let renew = |seq| {
         Request::RenewLease(RenewLeaseRequest {
@@ -1068,4 +1077,114 @@ fn a_failing_startup_step_refuses_the_start_and_runs_nothing_after_it() {
     assert!(!f.state().join("worker.db").exists());
     assert!(!f.state().join("boot_id").exists());
     assert_eq!(STARTUP_ORDER[1], Step::CoreDumps);
+}
+
+// ------------------------------------------------------------ real host
+
+/// The real host, except for the process-wide core dump limit (this test
+/// shares its process with the others).
+struct RealButCore(remote_task_runner::worker::machine::Machine);
+
+impl Host for RealButCore {
+    fn disable_core_dumps(&self) -> Result<(), ApiError> {
+        Ok(())
+    }
+    fn sweep_store_copies(&self) -> Result<(), ApiError> {
+        self.0.sweep_store_copies()
+    }
+    fn sweep_vault(&self) -> Result<(), ApiError> {
+        self.0.sweep_vault()
+    }
+    fn reconcile_secrets(&self, e: &dyn Fn(&AttemptId) -> bool) -> Result<(), ApiError> {
+        self.0.reconcile_secrets(e)
+    }
+    fn sweep_workspaces(&self, h: &dyn Fn(&AttemptId) -> bool) -> Result<(), ApiError> {
+        self.0.sweep_workspaces(h)
+    }
+    fn prepare(&self, a: &AcceptedAttempt, p: &AttemptPayload) -> Result<Workspace, ApiError> {
+        self.0.prepare(a, p)
+    }
+    fn place_secrets(
+        &self,
+        a: &AcceptedAttempt,
+        ws: &Workspace,
+        files: &[SecretFile],
+    ) -> Result<u32, ApiError> {
+        self.0.place_secrets(a, ws, files)
+    }
+    fn secrets_ready(&self, a: &AcceptedAttempt) -> Result<bool, ApiError> {
+        self.0.secrets_ready(a)
+    }
+    fn cleanup(&self, a: &AttemptId, ws: Option<&Workspace>) -> Result<(), ApiError> {
+        self.0.cleanup(a, ws)
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_real_host_runs_the_command_in_the_snapshot_of_the_run_and_removes_it() {
+    use remote_task_runner::source::{capture_for_run, CaptureParams, SourceRequest, SourceStore};
+    let f = fx();
+    let state = f.state();
+    let env: BTreeMap<String, String> = [
+        ("PATH", "/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin"),
+        ("HOME", f.path("home").to_str().unwrap()),
+        ("GIT_CONFIG_GLOBAL", "/dev/null"),
+        ("GIT_CONFIG_NOSYSTEM", "1"),
+    ]
+    .into_iter()
+    .map(|(k, v)| (k.to_string(), v.to_string()))
+    .collect();
+    std::fs::create_dir_all(f.path("home")).unwrap();
+    let plain = f.path("plain");
+    std::fs::create_dir_all(plain.join("sub")).unwrap();
+    std::fs::write(plain.join("sub/x.txt"), "from the snapshot\n").unwrap();
+
+    // The source of the run is in the worker's store, bound to the run.
+    let run = RunId::generate();
+    let store = SourceStore::open(&state).unwrap();
+    capture_for_run(
+        &env,
+        &store,
+        &run,
+        &SourceRequest::Directory { dir: plain.clone() },
+        &CaptureParams::default(),
+    )
+    .unwrap();
+    // An orphan of an attempt nobody knows: the startup sweep takes it.
+    let orphan = state
+        .join("workspaces")
+        .join(AttemptId::generate().as_str());
+    std::fs::create_dir_all(&orphan).unwrap();
+
+    let machine =
+        remote_task_runner::worker::machine::Machine::open(&state, env, state.join("cluster.key"))
+            .unwrap();
+    let agent = Agent::start(f.cfg("boot-a"), Arc::new(RealButCore(machine))).unwrap();
+    f.agents.lock().unwrap().push(agent.clone());
+    assert!(!orphan.exists());
+
+    let c = f.connect(&agent).await;
+    let out = f.path("out");
+    let mut p = payload(&format!("pwd > {0}; cat x.txt >> {0}", out.display()));
+    p.run_id = run;
+    p.commands[0].cwd = "sub".into();
+    let a = AttemptId::generate();
+    submit(&c, &a, &p).await;
+    assert_eq!(f.wait_terminal(&a), Outcome::Succeeded);
+    let text = std::fs::read_to_string(&out).unwrap();
+    let mut it = text.lines();
+    let cwd = PathBuf::from(it.next().unwrap());
+    assert!(cwd.ends_with(format!("workspaces/{a}/sub")), "{cwd:?}");
+    assert_eq!(it.next(), Some("from the snapshot"));
+    // The original is untouched and the workspace goes at the end.
+    wait_for("the workspace to go", || !cwd.exists());
+    assert!(plain.join("sub/x.txt").exists());
+
+    // A run whose source never arrived fails as such; nothing is started.
+    let b = AttemptId::generate();
+    let mut q = payload("true");
+    q.task_id = TaskId::generate();
+    submit(&c, &b, &q).await;
+    assert_eq!(f.wait_terminal(&b), Outcome::Failed);
+    assert!(f.store().launches(&b).unwrap().is_empty());
 }

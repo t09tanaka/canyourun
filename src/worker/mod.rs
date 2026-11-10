@@ -5,10 +5,12 @@
 //! - [`agent`]: the operations over the worker database, the startup
 //!   sequence, and the thread that takes an attempt to its supervisor
 //! - [`host`]: the machine around the agent (sweeps, workspace, secrets)
+//! - [`machine`]: the real host (source store, fast-worktree, secret files)
 //! - [`serve`]: the tokio side (connections, housekeeping)
 
 pub mod agent;
 pub mod host;
+pub mod machine;
 pub mod policy;
 pub mod serve;
 

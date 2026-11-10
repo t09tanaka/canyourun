@@ -485,7 +485,11 @@ impl Agent {
         }
         let dir = self.attempt_dir(attempt);
         private_dir(&dir).map_err(|e| internal("attempt directory", e))?;
-        let ws = self.host.prepare(rec, &payload)?;
+        // An agent that died after making the workspace left its record.
+        let ws = match self.workspace_of(attempt) {
+            Some(ws) if ws.root.is_dir() => ws,
+            _ => self.host.prepare(rec, &payload)?,
+        };
         let ws_json = serde_json::to_vec(&ws).map_err(|e| internal("workspace record", e))?;
         write_atomic(&self.workspace_path(attempt), &ws_json)
             .map_err(|e| internal("workspace record", e))?;
