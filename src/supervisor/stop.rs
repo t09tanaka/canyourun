@@ -153,6 +153,8 @@ mod tests {
             assert!(std::time::Instant::now() < until, "the group did not start");
             std::thread::sleep(Duration::from_millis(10));
         }
+        // Leave nothing behind in the temp directory.
+        let _ = std::fs::remove_file(&ready_path);
         let pid = child.id();
         let target = StopTarget {
             pid,
