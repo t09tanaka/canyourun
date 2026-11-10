@@ -12,7 +12,7 @@ use std::collections::BTreeSet;
 /// Commands in one attempt.
 pub const MAX_COMMANDS: usize = 256;
 /// Bytes of all argv, cwd and env strings of one attempt.
-pub const MAX_COMMAND_BYTES: usize = 1024 * 1024;
+pub const MAX_COMMAND_BYTES: usize = 1_048_576;
 /// Attempts in one `list_attempts` answer.
 pub const MAX_LIST_ATTEMPTS: u32 = 500;
 /// Events in one `watch_events` answer.
