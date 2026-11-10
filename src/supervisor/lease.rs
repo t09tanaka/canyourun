@@ -6,6 +6,11 @@
 //! database; the supervisor observes the highest applied key and, whenever it
 //! grows, restarts its own countdown from the moment it noticed.
 //!
+//! The supervisor only looks every `poll_ms`, so a renewal (or the grant at
+//! the start) can have happened up to one poll before it is noticed. The
+//! countdown is shortened by that delay (`duration - poll_ms`): the lease
+//! never outlives what the coordinator granted.
+//!
 //! All functions take the current monotonic time as an argument, so the
 //! decisions are pure.
 
@@ -23,7 +28,8 @@ pub enum LeaseStatus {
 
 #[derive(Debug, Clone)]
 pub struct LeaseClock {
-    duration_ms: u64,
+    /// What one grant is worth after the noticing delay is taken off.
+    window_ms: u64,
     deadline_ms: u64,
     applied: Option<LeaseKey>,
     expired: bool,
@@ -31,11 +37,13 @@ pub struct LeaseClock {
 
 impl LeaseClock {
     /// The lease the agent granted by starting the supervisor: `duration_ms`
-    /// from `now_ms`. `applied` is the highest key already in the database.
-    pub fn start(now_ms: u64, duration_ms: u64, applied: Option<LeaseKey>) -> Self {
+    /// from `now_ms`, less `poll_ms` for the delay in noticing it. `applied`
+    /// is the highest key already in the database.
+    pub fn start(now_ms: u64, duration_ms: u64, poll_ms: u64, applied: Option<LeaseKey>) -> Self {
+        let window_ms = duration_ms.saturating_sub(poll_ms);
         LeaseClock {
-            duration_ms,
-            deadline_ms: now_ms.saturating_add(duration_ms),
+            window_ms,
+            deadline_ms: now_ms.saturating_add(window_ms),
             applied,
             expired: false,
         }
@@ -61,7 +69,7 @@ impl LeaseClock {
         if let Some(key) = seen {
             if key.extends(self.applied) {
                 self.applied = Some(key);
-                self.deadline_ms = now_ms.saturating_add(self.duration_ms);
+                self.deadline_ms = now_ms.saturating_add(self.window_ms);
             }
         }
         LeaseStatus::Valid {
@@ -92,7 +100,7 @@ mod tests {
 
     #[test]
     fn the_start_grants_one_full_lease() {
-        let mut c = LeaseClock::start(1_000, 60_000, None);
+        let mut c = LeaseClock::start(1_000, 60_000, 0, None);
         assert_eq!(c.observe(1_000, None, false), valid(60_000));
         assert_eq!(c.observe(31_000, None, false), valid(30_000));
         assert_eq!(c.observe(60_999, None, false), valid(1));
@@ -103,7 +111,7 @@ mod tests {
 
     #[test]
     fn a_greater_key_restarts_the_countdown_from_when_it_was_seen() {
-        let mut c = LeaseClock::start(0, 10_000, Some(key(1, 1)));
+        let mut c = LeaseClock::start(0, 10_000, 0, Some(key(1, 1)));
         assert_eq!(c.observe(6_000, Some(key(1, 2)), false), valid(10_000));
         assert_eq!(c.observe(15_999, Some(key(1, 2)), false), valid(1));
         assert_eq!(
@@ -114,7 +122,7 @@ mod tests {
 
     #[test]
     fn renewal_is_idempotent_a_replay_never_extends_again() {
-        let mut c = LeaseClock::start(0, 10_000, None);
+        let mut c = LeaseClock::start(0, 10_000, 0, None);
         assert_eq!(c.observe(5_000, Some(key(1, 1)), false), valid(10_000));
         // The same key, seen again later, does not extend.
         assert_eq!(c.observe(9_000, Some(key(1, 1)), false), valid(6_000));
@@ -125,19 +133,19 @@ mod tests {
 
     #[test]
     fn the_key_already_applied_at_start_is_not_a_renewal() {
-        let mut c = LeaseClock::start(0, 10_000, Some(key(1, 4)));
+        let mut c = LeaseClock::start(0, 10_000, 0, Some(key(1, 4)));
         assert_eq!(c.observe(8_000, Some(key(1, 4)), false), valid(2_000));
     }
 
     #[test]
     fn a_newer_epoch_wins_over_a_higher_sequence() {
-        let mut c = LeaseClock::start(0, 10_000, Some(key(1, 50)));
+        let mut c = LeaseClock::start(0, 10_000, 0, Some(key(1, 50)));
         assert_eq!(c.observe(4_000, Some(key(2, 1)), false), valid(10_000));
     }
 
     #[test]
     fn a_late_renewal_does_not_revive_an_expired_lease() {
-        let mut c = LeaseClock::start(0, 10_000, None);
+        let mut c = LeaseClock::start(0, 10_000, 0, None);
         assert_eq!(
             c.observe(10_500, Some(key(1, 1)), false),
             LeaseStatus::Expired
@@ -153,7 +161,7 @@ mod tests {
 
     #[test]
     fn the_database_marking_the_lease_expired_is_final() {
-        let mut c = LeaseClock::start(0, 10_000, None);
+        let mut c = LeaseClock::start(0, 10_000, 0, None);
         assert_eq!(c.observe(1, Some(key(1, 1)), true), LeaseStatus::Expired);
         assert!(c.is_expired());
         assert_eq!(c.observe(2, None, false), LeaseStatus::Expired);
@@ -162,7 +170,7 @@ mod tests {
     #[test]
     fn a_long_suspend_expires_the_lease() {
         // The clock counts suspend: a jump of an hour is an hour.
-        let mut c = LeaseClock::start(1_000, 60_000, None);
+        let mut c = LeaseClock::start(1_000, 60_000, 0, None);
         assert_eq!(
             c.observe(1_000 + 3_600_000, None, false),
             LeaseStatus::Expired
@@ -170,8 +178,30 @@ mod tests {
     }
 
     #[test]
+    fn the_noticing_delay_is_taken_off_every_grant() {
+        // Polling every 100 ms: a grant is worth 100 ms less than it says.
+        let mut c = LeaseClock::start(1_000, 10_000, 100, None);
+        assert_eq!(c.observe(1_000, None, false), valid(9_900));
+        assert_eq!(c.observe(10_899, None, false), valid(1));
+        assert_eq!(c.observe(10_900, None, false), LeaseStatus::Expired);
+        // A renewal noticed at 6_000 counts from there, also less 100 ms.
+        let mut c = LeaseClock::start(0, 10_000, 100, Some(key(1, 1)));
+        assert_eq!(c.observe(6_000, Some(key(1, 2)), false), valid(9_900));
+        assert_eq!(
+            c.observe(15_900, Some(key(1, 2)), false),
+            LeaseStatus::Expired
+        );
+    }
+
+    #[test]
+    fn a_poll_longer_than_the_lease_expires_it_at_once() {
+        let mut c = LeaseClock::start(500, 50, 100, None);
+        assert_eq!(c.observe(500, None, false), LeaseStatus::Expired);
+    }
+
+    #[test]
     fn extreme_values_do_not_overflow() {
-        let mut c = LeaseClock::start(u64::MAX - 5, u64::MAX, None);
+        let mut c = LeaseClock::start(u64::MAX - 5, u64::MAX, 0, None);
         assert_eq!(c.observe(u64::MAX - 5, Some(key(1, 1)), false), valid(5));
         assert_eq!(c.observe(u64::MAX, None, false), LeaseStatus::Expired);
     }

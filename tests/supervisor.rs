@@ -533,6 +533,37 @@ fn a_reused_pid_with_another_start_identity_is_not_touched() {
 }
 
 #[test]
+fn a_dead_leader_with_a_surviving_descendant_is_stopped_by_recovery() {
+    let f = fx(vec![node("n", "true")]);
+    let bg = f.path("bg.pid");
+    let mut child = Command::new("sh")
+        .arg("-c")
+        .arg("sleep 60 & echo $! > \"$1\"; wait")
+        .arg("sh")
+        .arg(&bg)
+        .process_group(0)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    wait_for("the descendant", || read_pid(&bg).is_some());
+    let p = ProcessIdentityParts {
+        pid: child.id(),
+        start: platform::process_start_identity(child.id()).unwrap(),
+    };
+    claim(&f, "n", Some((&platform::boot_id().unwrap(), &p)));
+    // The leader dies (and is reaped); its background child stays.
+    child.kill().unwrap();
+    child.wait().unwrap();
+    let bgp = read_pid(&bg).unwrap();
+    assert!(alive(bgp));
+    let t = settled(&recover(&recover_spec(&f), &f.store).unwrap());
+    assert_eq!(t.outcome(), Outcome::Interrupted);
+    wait_for("the descendant to be gone", || !alive(bgp));
+}
+
+#[test]
 fn a_launch_without_an_identity_is_investigated_not_respawned() {
     let f = fx(vec![node("n", "touch /nonexistent-dir/never")]);
     claim(&f, "n", None);
@@ -633,6 +664,61 @@ fn a_killed_supervisor_leaves_the_command_for_recovery_to_stop() {
     wait_for("the orphan to be gone", || !alive(leader_pid));
     assert!(!alive(read_pid(&bg).unwrap()));
     assert_eq!(f.store.launches(f.attempt()).unwrap().len(), 1);
+}
+
+#[test]
+fn a_descendant_left_behind_by_an_early_exit_is_stopped_before_the_result_is_fixed() {
+    let mut f = fx(vec![]);
+    let (n, bg, _leader) = with_pidfiles(&f, "sleep 1000 & echo $! > \"$BGPID\"; exit 0");
+    f.spec.nodes = vec![n];
+    f.spec.term_grace_ms = 500;
+    let spec = f.spec.clone();
+    let runner = std::thread::spawn(move || run(&spec));
+    while !runner.is_finished() {
+        // Read the state first: if it is terminal, the descendant must
+        // already be gone when it is looked at afterwards.
+        let terminal = f.state() == AttemptState::Terminal;
+        let survivor = read_pid(&bg).is_some_and(alive);
+        assert!(!(terminal && survivor), "settled while a descendant lived");
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let t = settled(&runner.join().unwrap().unwrap());
+    assert_eq!(t.outcome(), Outcome::Succeeded);
+    assert!(!alive(read_pid(&bg).unwrap()), "the descendant was stopped");
+    // Either the identity was recorded, or the log says why it was not. (The
+    // command is gone almost at once, so which one depends on timing.)
+    let recorded = f.store.launches(f.attempt()).unwrap()[0].2.is_some();
+    let logged = f
+        .store
+        .events_after(0, 1000)
+        .unwrap()
+        .iter()
+        .any(|e| e.kind == "supervisor_identity_not_recorded");
+    assert!(recorded || logged);
+}
+
+#[test]
+fn the_command_keeps_the_default_sighup_disposition() {
+    let f = fx(vec![node("n", "kill -HUP $$; sleep 1; exit 0")]);
+    let spec_path = write_spec(&f, &f.spec);
+    let mut child = spawn_detached(&exe(), &spec_path).unwrap();
+    child.wait().unwrap();
+    // Killed by the hang-up (the default), not ignoring it.
+    assert_eq!(f.term().exit(), Some(Exit::Signal(libc::SIGHUP)));
+}
+
+#[test]
+fn the_supervisor_survives_a_hangup_and_finishes_the_attempt() {
+    let f = fx(vec![node("n", "sleep 1.5; exit 0")]);
+    let spec_path = write_spec(&f, &f.spec);
+    let mut sup = spawn_detached(&exe(), &spec_path).unwrap();
+    wait_for("the command to be running", || {
+        f.state() == AttemptState::Active
+    });
+    unsafe { libc::kill(sup.id() as i32, libc::SIGHUP) };
+    let status = sup.wait().unwrap();
+    assert_eq!(status.code(), Some(code::SETTLED), "{status:?}");
+    assert_eq!(f.term().outcome(), Outcome::Succeeded);
 }
 
 #[test]

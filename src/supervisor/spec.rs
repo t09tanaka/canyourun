@@ -96,6 +96,10 @@ impl SuperviseSpec {
         if self.lease_ms == 0 || self.poll_ms == 0 {
             return bad("lease_ms and poll_ms must be positive");
         }
+        if self.lease_ms <= self.poll_ms {
+            // The lease is counted less one poll for the delay in noticing it.
+            return bad("lease_ms must be longer than poll_ms");
+        }
         if self.command_timeout_ms == Some(0)
             || self.resource_wait_timeout_ms == Some(0)
             || self.deadline_ms == Some(0)
@@ -221,6 +225,9 @@ mod tests {
         assert!(s.validate().is_err());
         let mut s = spec();
         s.poll_ms = 0;
+        assert!(s.validate().is_err());
+        let mut s = spec();
+        s.lease_ms = s.poll_ms;
         assert!(s.validate().is_err());
         for f in [
             |s: &mut SuperviseSpec| s.command_timeout_ms = Some(0),

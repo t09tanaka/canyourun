@@ -8,7 +8,9 @@ use crate::platform::{self, GroupSignal};
 use std::time::Duration;
 
 /// A recorded command: its leader and process group, and the start identity
-/// that tells the leader from a later process with the same PID.
+/// that tells the leader from a later process with the same PID. Without a
+/// start identity the leader is taken to be gone (it ended before its
+/// identity could be read, or was reaped): only the group is looked at.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StopTarget {
     pub pid: u32,
@@ -41,10 +43,12 @@ pub enum StopResult {
 /// of it may be signalled. With the leader gone, members that remain belong
 /// to the group (a group number is not handed out again while it has members).
 pub fn group_alive(t: &StopTarget) -> bool {
-    match (platform::process_start_identity(t.pid), &t.start_identity) {
-        (Some(now), Some(rec)) if now != *rec => return false,
-        (Some(_), _) => return true,
-        (None, _) => {}
+    if let Some(rec) = &t.start_identity {
+        match platform::process_start_identity(t.pid) {
+            Some(now) if now != *rec => return false,
+            Some(_) => return true,
+            None => {}
+        }
     }
     platform::signal_process_group(t.pgid, 0) != GroupSignal::Empty
 }
@@ -69,6 +73,43 @@ pub fn stop_group(t: &StopTarget, times: StopTimes) -> StopResult {
         }
         std::thread::sleep(Duration::from_millis(times.poll_ms.max(1)));
     }
+}
+
+/// How many more times a stop that could not be confirmed is tried (each try
+/// goes straight to KILL and waits `kill_wait_ms`), so that the whole
+/// retrying stays within [`RETRY_BUDGET_MS`].
+pub fn retries_for(kill_wait_ms: u64) -> u32 {
+    (RETRY_BUDGET_MS / kill_wait_ms.max(1)).min(3) as u32
+}
+
+/// The most time the retries of one stop may take in total.
+pub const RETRY_BUDGET_MS: u64 = 30_000;
+
+/// [`stop_group`], tried again (KILL at once) when the group could not be
+/// confirmed gone, up to `retries` more times.
+pub fn stop_group_retrying(t: &StopTarget, times: StopTimes, retries: u32) -> StopResult {
+    retry(retries, |i| {
+        let times = if i == 0 {
+            times
+        } else {
+            StopTimes {
+                grace_ms: 0,
+                ..times
+            }
+        };
+        stop_group(t, times)
+    })
+}
+
+fn retry(retries: u32, mut f: impl FnMut(u32) -> StopResult) -> StopResult {
+    let mut last = StopResult::Unconfirmed;
+    for i in 0..=retries {
+        last = f(i);
+        if last == StopResult::Confirmed {
+            break;
+        }
+    }
+    last
 }
 
 #[cfg(test)]
@@ -174,6 +215,58 @@ mod tests {
         child.kill().unwrap();
         child.wait().unwrap();
         let _ = platform::signal_process_group(t.pgid, libc::SIGKILL);
+    }
+
+    #[test]
+    fn a_target_without_an_identity_is_judged_by_its_group_alone() {
+        let (mut child, mut t) = spawn_group(false);
+        t.start_identity = None;
+        assert!(group_alive(&t));
+        child.kill().unwrap();
+        child.wait().unwrap();
+        // The leader is gone but its background child remains.
+        assert!(group_alive(&t));
+        assert_eq!(
+            stop_group_retrying(&t, times(5_000), 2),
+            StopResult::Confirmed
+        );
+        assert!(!group_alive(&t));
+    }
+
+    #[test]
+    fn retries_stop_at_the_first_confirmation_and_report_the_last_failure() {
+        let mut calls = Vec::new();
+        let r = retry(3, |i| {
+            calls.push(i);
+            if i == 2 {
+                StopResult::Confirmed
+            } else {
+                StopResult::Unconfirmed
+            }
+        });
+        assert_eq!((r, calls), (StopResult::Confirmed, vec![0, 1, 2]));
+        let mut n = 0;
+        let r = retry(2, |_| {
+            n += 1;
+            StopResult::Unconfirmed
+        });
+        assert_eq!((r, n), (StopResult::Unconfirmed, 3));
+        let mut n = 0;
+        let r = retry(0, |_| {
+            n += 1;
+            StopResult::Unconfirmed
+        });
+        assert_eq!((r, n), (StopResult::Unconfirmed, 1));
+    }
+
+    #[test]
+    fn the_retries_fit_the_budget() {
+        assert_eq!(retries_for(5_000), 3);
+        assert_eq!(retries_for(10_000), 3);
+        assert_eq!(retries_for(15_000), 2);
+        assert_eq!(retries_for(30_000), 1);
+        assert_eq!(retries_for(60_000), 0);
+        assert_eq!(retries_for(0), 3);
     }
 
     #[test]

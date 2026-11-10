@@ -18,7 +18,11 @@ pub mod code {
     pub const SETTLED: i32 = 0;
     /// The spec could not be used.
     pub const BAD_SPEC: i32 = 2;
-    /// The processes could not be confirmed stopped; the attempt is unresolved.
+    /// The processes could not be confirmed stopped (after bounded retries);
+    /// the attempt is unresolved and a `supervisor_unresolved` event says why.
+    /// Not retried here: the parent's reconcile sees the supervisor lock free
+    /// and the attempt non-terminal, starts `supervise` again, and recovery
+    /// redoes the stop (S10/S12).
     pub const UNRESOLVED: i32 = 3;
     /// Another supervisor holds the attempt.
     pub const ALIVE: i32 = 4;
@@ -46,6 +50,8 @@ pub fn spawn_detached(exe: &Path, spec: &Path) -> std::io::Result<Child> {
     cmd.spawn()
 }
 
+extern "C" fn ignore_hangup(_: libc::c_int) {}
+
 /// Run the supervisor for the spec file and return the process exit code.
 pub fn main(spec_path: &Path) -> i32 {
     // Not tied to a terminal or an SSH session that goes away.
@@ -54,7 +60,13 @@ pub fn main(spec_path: &Path) -> i32 {
         // Leave the caller's session and process group. Fails harmlessly when
         // this process already leads its own (spawn_detached does that).
         libc::setsid();
-        libc::signal(libc::SIGHUP, libc::SIG_IGN);
+        // A handler, not SIG_IGN: an ignored signal stays ignored across exec
+        // and would reach the user's command; a handler is reset to the
+        // default by exec, so the command keeps the default SIGHUP.
+        libc::signal(
+            libc::SIGHUP,
+            ignore_hangup as extern "C" fn(libc::c_int) as usize,
+        );
         libc::signal(libc::SIGPIPE, libc::SIG_IGN);
     }
     let spec = match SuperviseSpec::from_file(spec_path) {
