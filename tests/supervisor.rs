@@ -40,7 +40,13 @@ fn node(name: &str, script: &str) -> NodeSpec {
 }
 
 fn fx(nodes: Vec<NodeSpec>) -> Fx {
-    let dir = tempfile::tempdir().unwrap();
+    // Not under the system temp directory: a supervisor left running by a
+    // killed test (setsid keeps it alive) must not write into a directory that
+    // a test runner clears between runs.
+    let dir = tempfile::Builder::new()
+        .prefix("rtr-")
+        .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+        .unwrap();
     let state = dir.path().join("state");
     let traffic = dir.path().join("traffic");
     std::fs::create_dir_all(&state).unwrap();
