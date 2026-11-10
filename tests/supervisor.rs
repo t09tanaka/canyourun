@@ -50,7 +50,7 @@ fn fx(nodes: Vec<NodeSpec>) -> Fx {
             NewAcceptance {
                 attempt_id: attempt.clone(),
                 run_id: RunId::generate(),
-                homework_id: HomeworkId::generate(),
+                task_id: TaskId::generate(),
                 generation: Generation(1),
                 payload_hash: PayloadHash::parse(&format!("sha256:{}", "a".repeat(64))).unwrap(),
                 coordinator_epoch: CoordinatorEpoch(1),
