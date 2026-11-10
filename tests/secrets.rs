@@ -624,6 +624,65 @@ fn a_commit_capture_sends_the_secret_files_of_the_original_worktree() {
     assert_no_plaintext(&fx2.state);
 }
 
+#[cfg(unix)]
+#[test]
+fn a_commit_capture_refuses_a_symlinked_or_oversized_secret_in_the_original_worktree() {
+    let fx = fixture(Some(".env\n"));
+    let commit = SourceRequest::Commit {
+        dir: fx.repo.clone(),
+        rev: "HEAD".into(),
+    };
+    let store = SourceStore::open(&fx.state).unwrap();
+    // an oversized secret file
+    std::fs::write(fx.repo.join("big.env"), vec![b'a'; 2 * 1024 * 1024]).unwrap();
+    let run = RunId::generate();
+    let err = capture_with(&fx, &run, &[spec("big.env")], &commit).unwrap_err();
+    assert_eq!(err.code, ErrorCode::InvalidInput, "{}", err.message);
+    assert!(!run_bundle_path(&store, &run).exists());
+    assert_no_plaintext(&fx.state);
+    std::fs::remove_file(fx.repo.join("big.env")).unwrap();
+    // a symlink standing where a secret file is
+    std::fs::write(fx.repo.join("target.txt"), "x").unwrap();
+    std::os::unix::fs::symlink("target.txt", fx.repo.join("link.env")).unwrap();
+    let run = RunId::generate();
+    let err = capture_with(&fx, &run, &[spec("link.env")], &commit).unwrap_err();
+    assert_eq!(err.code, ErrorCode::InvalidInput, "{}", err.message);
+    assert!(!run_bundle_path(&store, &run).exists());
+    assert_no_plaintext(&fx.state);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_directory_capture_refuses_a_symlinked_secret_file() {
+    let tmp = common::tempdir().unwrap();
+    let state = tmp.path().join("state");
+    let dir = plain_dir(tmp.path());
+    // the undeclared .env would be an ordinary file of the snapshot
+    std::fs::remove_file(dir.join(".env")).unwrap();
+    std::os::unix::fs::symlink("code.txt", dir.join("link.env")).unwrap();
+    let store = SourceStore::open(&state).unwrap();
+    let vault = Vault::open(&state).unwrap();
+    let key = ClusterKey::from_bytes(vec![5; 32]).unwrap();
+    let run = RunId::generate();
+    let err = capture_run(
+        &plain_env(&state),
+        &store,
+        &vault,
+        &SecretInputs {
+            key: &key,
+            declared: &[spec("link.env")],
+        },
+        &run,
+        &SourceRequest::Directory { dir },
+        &CaptureParams::default(),
+    )
+    .unwrap_err();
+    assert_eq!(err.code, ErrorCode::InvalidInput, "{}", err.message);
+    assert!(!run_bundle_path(&store, &run).exists());
+    assert!(!vault.has(&run));
+    assert_no_plaintext(&state);
+}
+
 #[test]
 fn two_runs_of_one_commit_each_get_their_own_bundle_and_a_leftover_at_the_path_is_replaced() {
     let fx = fixture(Some(".env\n"));

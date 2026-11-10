@@ -12,7 +12,7 @@
 //!   pattern is still refused: its patterns are Git's, and there is no
 //!   repository to evaluate them in, so which files it means cannot be told.
 //!
-//! //! The store's plaintext bundle (`<store>/secrets/<run>.json`, a path of the
+//! The store's plaintext bundle (`<store>/secrets/<run>.json`, a path of the
 //! run, created by local-ci and never replaced) lives from
 //! the moment local-ci writes it until the vault has adopted it. Every error
 //! after that moment removes it, a later call for a run whose capture was
@@ -62,9 +62,11 @@ fn is_bundle_tmp(name: &str) -> bool {
 }
 
 /// `capture_for_run` with secret files: the declared globs plus what
-/// `.worktreeinclude` matches (taken from the working tree, so for a worktree
-/// capture only), read by local-ci under the cluster key, and the bundle moved
-/// into the run's own hold in `vault`. Blocking, like the rest of capture.
+/// `.worktreeinclude` matches (taken from the working tree for a worktree
+/// capture, from the original worktree for a commit capture, and for a
+/// directory capture the declared globs only), read by local-ci under the
+/// cluster key, and the bundle moved into the run's own hold in `vault`.
+/// Blocking, like the rest of capture.
 pub fn capture_run(
     env: &BTreeMap<String, String>,
     store: &SourceStore,
