@@ -84,12 +84,12 @@ pub fn record_needed(unrecorded: u64, recorded_dropped: u64, dropped: u64) -> bo
     unrecorded >= MIN_RECORD_BYTES || drop_needs_record(recorded_dropped, dropped)
 }
 
-/// The cap on what one attempt may store (both streams): the homework's limit
+/// The cap on what one attempt may store (both streams): the task's limit
 /// less what its other attempts already stored. The limit of the spec is per
-/// homework, so the caller (which knows the homework's attempts and their
+/// task, so the caller (which knows the task's attempts and their
 /// `LogPosition`s) passes this to the spool as its limit.
-pub fn attempt_limit(homework_limit: u64, stored_by_other_attempts: u64) -> u64 {
-    homework_limit.saturating_sub(stored_by_other_attempts)
+pub fn attempt_limit(task_limit: u64, stored_by_other_attempts: u64) -> u64 {
+    task_limit.saturating_sub(stored_by_other_attempts)
 }
 
 /// What a crash left behind in one stream.

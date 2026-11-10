@@ -7,8 +7,8 @@
 //! file formats.
 //!
 //! Offsets. A stream's bytes are stored contiguously from offset 0 up to the
-//! limit (both streams share it). The spec's limit is per homework, so the
-//! limit given to [`AttemptSpool::open`] is the homework's limit less what its
+//! limit (both streams share it). The spec's limit is per task, so the
+//! limit given to [`AttemptSpool::open`] is the task's limit less what its
 //! other attempts stored ([`super::spool_plan::attempt_limit`]); the caller
 //! knows the attempts and sums their `LogPosition`s in the worker database.
 //! Past it, bytes are dropped, not
@@ -143,12 +143,19 @@ struct Budget {
 
 impl Budget {
     fn reserve(&self, len: u64) -> super::spool_plan::Admission {
-        let prev = self
-            .used
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |u| {
-                Some(u + admit(u, self.limit, len).store)
-            })
-            .expect("closure always returns Some");
+        // A compare-exchange loop: `fetch_update` is deprecated on new
+        // toolchains and its replacement is newer than the MSRV.
+        let mut prev = self.used.load(Ordering::SeqCst);
+        loop {
+            let next = prev + admit(prev, self.limit, len).store;
+            match self
+                .used
+                .compare_exchange(prev, next, Ordering::SeqCst, Ordering::SeqCst)
+            {
+                Ok(_) => break,
+                Err(now) => prev = now,
+            }
+        }
         admit(prev, self.limit, len)
     }
 }
@@ -354,7 +361,7 @@ pub struct AttemptSpool {
 impl AttemptSpool {
     /// Create the spool of `attempt` under `root`, or resume it after a crash.
     /// `limit` is the cap on bytes this attempt may store (both streams
-    /// together): the homework limit less its other attempts' bytes.
+    /// together): the task limit less its other attempts' bytes.
     /// A second writer, in this or another process, is [`SpoolError::Locked`];
     /// a spool already finished is [`SpoolError::Finished`].
     pub fn open(root: &Path, attempt: &AttemptId, limit: u64) -> Result<Self> {

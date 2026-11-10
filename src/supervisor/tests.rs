@@ -4,7 +4,7 @@ use super::outcome::{
 use super::spool::{AttemptSpool, SpoolError, SpoolReader, StreamStatus};
 use super::spool_plan::{logs_locator, MAX_READ_BYTES};
 use crate::ids::{
-    AttemptId, CoordinatorEpoch, Digest, Generation, HomeworkId, RunId, SourceId, WorkerId,
+    AttemptId, CoordinatorEpoch, Digest, Generation, RunId, SourceId, TaskId, WorkerId,
 };
 use crate::state::{AttemptState, Outcome, Termination};
 use crate::storage::{NewAcceptance, SubmitOutcome, WorkerStore};
@@ -494,16 +494,16 @@ fn wk() -> Wk {
 }
 
 fn accept(w: &Wk) -> AttemptId {
-    let hw = HomeworkId::generate();
+    let task = TaskId::generate();
     let a = AttemptId::generate();
-    let run = RunId::parse(&format!("run_{}", &hw.as_str()["hw_".len()..])).unwrap();
+    let run = RunId::parse(&format!("run_{}", &task.as_str()["task_".len()..])).unwrap();
     match w
         .store
         .submit(
             NewAcceptance {
                 attempt_id: a.clone(),
                 run_id: run,
-                homework_id: hw,
+                task_id: task,
                 generation: Generation(1),
                 payload_hash: Digest::of_bytes(b"p"),
                 coordinator_epoch: CoordinatorEpoch(1),
