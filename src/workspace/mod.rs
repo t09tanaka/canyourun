@@ -27,7 +27,7 @@ mod git;
 mod overlay;
 pub mod plan;
 
-pub use fastwt::{CliFastWorktree, FastWorktree};
+pub use fastwt::{CliFastWorktree, FastWorktree, DEFAULT_TIMEOUT as DEFAULT_PREPARE_TIMEOUT};
 pub use plan::FwFailure;
 
 use crate::error::{ApiError, ErrorCode};

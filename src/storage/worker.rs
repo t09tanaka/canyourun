@@ -297,6 +297,17 @@ impl WorkerStore {
         &self.worker_id
     }
 
+    /// The highest coordinator epoch a request carried so far.
+    pub fn max_coordinator_epoch(&self) -> Result<CoordinatorEpoch> {
+        self.db.call(|c| {
+            let e: i64 =
+                c.query_row("SELECT max_coordinator_epoch FROM worker_state", [], |r| {
+                    r.get(0)
+                })?;
+            Ok(CoordinatorEpoch(to_u64(e)?))
+        })
+    }
+
     /// A new agent process started: bump the agent epoch.
     pub fn start_agent(&self, at_ms: u64) -> Result<AgentEpoch> {
         self.db.write(move |tx| {
@@ -417,6 +428,74 @@ impl WorkerStore {
             ))?;
             let rows = s.query_map([], |r| Ok(from_row(r)))?;
             rows.map(|r| r?).collect()
+        })
+    }
+
+    /// The attempts this worker knows, newest first, at most `limit`: those
+    /// in one of `states` when given, terminal ones only when
+    /// `include_terminal`. The filter runs in the database, so `limit` counts
+    /// matching attempts; a caller that must not answer with a part asks for
+    /// one more than it will send.
+    pub fn list_attempts(
+        &self,
+        states: Option<&[AttemptState]>,
+        include_terminal: bool,
+        limit: u32,
+    ) -> Result<Vec<AcceptedAttempt>> {
+        // The names are this crate's own constants, never input.
+        let wanted = match states {
+            None => "1".to_string(),
+            Some(states) => {
+                let names: Vec<String> = states
+                    .iter()
+                    .map(|s| format!("'{}'", common::state_str(*s)))
+                    .collect();
+                format!("state IN ({})", names.join(","))
+            }
+        };
+        self.db.call(move |c| {
+            let mut s = c.prepare(&format!(
+                "SELECT {COLS} FROM worker_attempt
+                 WHERE {wanted} AND (?1 OR state <> 'terminal')
+                 ORDER BY accepted_at_ms DESC, attempt_id DESC LIMIT ?2"
+            ))?;
+            let rows = s.query_map(params![include_terminal, limit], |r| Ok(from_row(r)))?;
+            rows.map(|r| r?).collect()
+        })
+    }
+
+    /// How many attempts are not terminal.
+    pub fn count_nonterminal(&self) -> Result<u64> {
+        self.db.call(|c| {
+            let n: i64 = c.query_row(
+                "SELECT COUNT(*) FROM worker_attempt WHERE state <> 'terminal'",
+                [],
+                |r| r.get(0),
+            )?;
+            to_u64(n)
+        })
+    }
+
+    /// How many launch intents the database holds, over every attempt.
+    pub fn count_launches(&self) -> Result<u64> {
+        self.db.call(|c| {
+            let n: i64 = c.query_row("SELECT COUNT(*) FROM command_launch", [], |r| r.get(0))?;
+            to_u64(n)
+        })
+    }
+
+    /// When the last renewal was applied (this worker's wall clock), if any.
+    pub fn lease_renewed_at(&self, attempt_id: &AttemptId) -> Result<Option<u64>> {
+        let a = attempt_id.to_string();
+        self.db.call(move |c| {
+            c.query_row(
+                "SELECT renewed_at_ms FROM lease WHERE attempt_id = ?1",
+                [&a],
+                |r| r.get::<_, i64>(0),
+            )
+            .optional()?
+            .map(to_u64)
+            .transpose()
         })
     }
 
@@ -993,6 +1072,13 @@ impl WorkerStore {
     pub fn events_after(&self, after_seq: u64, limit: u32) -> Result<Vec<Event>> {
         self.db
             .call(move |c| common::events_after(c, after_seq, limit))
+    }
+
+    /// Every event of one attempt, oldest first, at most `limit`.
+    pub fn events_of_attempt(&self, attempt_id: &AttemptId, limit: u32) -> Result<Vec<Event>> {
+        let a = attempt_id.to_string();
+        self.db
+            .call(move |c| common::events_of_attempt(c, &a, limit))
     }
 
     /// The events of one attempt with one `kind`, oldest first.

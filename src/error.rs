@@ -34,6 +34,9 @@ pub mod exit {
     pub const COLLECTION_FAILED: i32 = 78;
     /// Unexpected internal failure.
     pub const INTERNAL: i32 = 79;
+    /// Refused for now, nothing was done: ask again later. Outside `70..=79`
+    /// (all taken); `EX_UNAVAILABLE` of sysexits.
+    pub const OVERLOADED: i32 = 69;
     /// Conventional base for "terminated by signal N": `128 + N`.
     pub const SIGNAL_BASE: i32 = 128;
 }
@@ -71,6 +74,10 @@ pub enum ErrorCode {
     /// cancelling, finalizing, terminal or retired. A merely stale or replayed
     /// renew is not an error; it answers `extended: false`.
     LeaseNotRenewable,
+    /// The peer refused the request for now and committed nothing of it: too
+    /// many requests wait, or its database was busy. The same request may be
+    /// sent again. Unlike `SOURCE_BUSY` this says nothing about the input.
+    Overloaded,
 }
 
 /// Why a task is blocked (accompanies `ErrorCode::Blocked`).
@@ -84,7 +91,7 @@ pub enum BlockedReason {
 
 impl ErrorCode {
     /// Every code.
-    pub const ALL: [ErrorCode; 15] = [
+    pub const ALL: [ErrorCode; 16] = [
         ErrorCode::NotImplemented,
         ErrorCode::InvalidInput,
         ErrorCode::SourceBusy,
@@ -100,6 +107,7 @@ impl ErrorCode {
         ErrorCode::Internal,
         ErrorCode::Retired,
         ErrorCode::LeaseNotRenewable,
+        ErrorCode::Overloaded,
     ];
 
     /// The wire string, identical to the serde form.
@@ -120,6 +128,7 @@ impl ErrorCode {
             ErrorCode::Internal => "INTERNAL",
             ErrorCode::Retired => "RETIRED",
             ErrorCode::LeaseNotRenewable => "LEASE_NOT_RENEWABLE",
+            ErrorCode::Overloaded => "OVERLOADED",
         }
     }
 
@@ -144,6 +153,7 @@ impl ErrorCode {
             // Both are "the addressed attempt no longer accepts this", the
             // same family as a payload conflict; the JSON code tells them apart.
             ErrorCode::Retired | ErrorCode::LeaseNotRenewable => exit::CONFLICT,
+            ErrorCode::Overloaded => exit::OVERLOADED,
         }
     }
 
@@ -247,6 +257,7 @@ mod tests {
         assert_eq!(ErrorCode::Internal.exit_code(), 79);
         assert_eq!(ErrorCode::Retired.exit_code(), 72);
         assert_eq!(ErrorCode::LeaseNotRenewable.exit_code(), 72);
+        assert_eq!(ErrorCode::Overloaded.exit_code(), 69);
         assert_eq!(exit::SUCCESS, 0);
     }
 

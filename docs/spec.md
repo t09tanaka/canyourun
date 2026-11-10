@@ -491,6 +491,14 @@ SSH上でversion付きの長さprefix JSON frameを使う。stdoutはprotocol専
 
 `hello` でprotocol version、feature、worker identity、profile、epochを確認する。互換性のないworkerにはdispatchしない。要求は固定バイナリへ構造化データで渡し、利用者のargvやpathをSSHのshell文字列へ直接連結しない。
 
+workerは受け取る量に上限を持ち、超える要求は一部だけ処理せずerrorで断る。
+
+- `submit_attempt`: terminalでないattemptはworkerあたり32個まで（worker agentの設定 `max_live_attempts`）。超える新規submitは何も保存せず `OVERLOADED` で断り、親は後で同じattemptを送り直す。受理済みattemptの再送は上限に数えず、既存状態を返す。`lease_ms` は24時間以下でworkerの監視間隔より長いこと、`deadline_ms`・各timeoutは7日以下であること。argv・env・cwdのNUL、空またはenv名に `=` を含むものは `INVALID_INPUT` とする。
+- workspaceの準備は同時に4個まで（`max_concurrent_prepares`）。1つの準備は15分（fast-worktreeの既定timeoutと同じ）を超えたらattemptをfailedにする。
+- `list_attempts`: `states` の絞り込みはDB側で行う。該当が500件を超えるときは先頭だけを返さず `INVALID_INPUT` とし、呼び出し側が `states` を絞る。
+- `secret_bundle_put`: workspaceがまだ無いときは `NOT_FOUND`（送り直す）、commandが始まり得る状態以降は `CONFLICT`（確定）、cancel・retire済みは `RETIRED`。
+- `OVERLOADED` は「今は受けられない。何も行っていないので後で同じ要求を送り直せる」を表す（live attemptの上限、DBのbusy、bulk streamの満杯）。CLIの終了コードは69（70〜79は他のcodeが使用済み）。
+
 ## 冪等性
 
 同じ `attempt_id + payload_hash` のsubmit再送は、既存状態を返す。異なるpayloadならconflictとする。workerはacceptedをcommitする前にuser commandを起動しない。ACKを返す前後のcrashを想定し、親は同じattemptを同じworkerへ照会・再送する。
@@ -510,6 +518,8 @@ retire・重複排除の最小記録はclusterの寿命中保持する。大量�
 既定値はheartbeat 5秒、接続stale判定15秒、実行lease 60秒、TERM後の停止猶予10秒とする。これらは設定可能とし、相互の矛盾を検査する。
 
 親がworkerの状態を受け取り、workerは親から制御・lease更新を受ける。短い切断では有効leaseの範囲で実行を継続する。期限が切れた場合は新しいuser commandを開始せず、実行中commandと所有serviceをTERM、猶予後KILLで停止する。agentが落ちてもattempt supervisorがleaseを独立して監視する。
+
+leaseとdeadlineは受理の時点から数える。workspaceの準備中にleaseが切れたattemptはuser commandを開始せずinterruptedにし、deadlineが尽きていればtimed_outにする。supervisorには残りのdeadlineを渡す。supervisorの起動後、受理（または最後のrenew）から数えたleaseが更新されないまま切れたら、agentがDBのleaseを失効にしてsupervisorを止める。
 
 renewはsequenceとrequest IDで冪等にし、同じrenewの再送で期限を再延長しない。失効・cancel・retireが確定したattemptは、遅延renewで実行許可を復活させない。共有setup builderには独立leaseを設け、少なくとも1つの有効なconsumer参照がある間だけ更新する。全参照の失効時はbuilder自身のsupervisorが停止する。
 

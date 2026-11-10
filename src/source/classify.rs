@@ -20,7 +20,9 @@ pub fn attempt_budget(requested: Option<u32>) -> u32 {
 }
 
 /// What a refused capture is to the caller. Nothing is dispatched on any of
-/// these; only `SOURCE_BUSY` says "try again" (the input was moving).
+/// these; of the codes a capture can end with, only `SOURCE_BUSY` says "try
+/// again" (the input was moving). A worker that is too busy to take a request
+/// answers `OVERLOADED`, which has its own exit code and is never a capture's.
 pub fn error_code(e: &SourceError) -> ErrorCode {
     use SourceError::*;
     match e {

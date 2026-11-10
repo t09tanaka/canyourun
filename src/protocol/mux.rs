@@ -600,12 +600,11 @@ pub(crate) fn inbound_queues(outbox: Arc<Outbox>) -> (InboundSenders, Incoming) 
     )
 }
 
-/// What the busy answer says. One place, because the code is a choice: the spec
-/// has no dedicated "overloaded" code, and `SOURCE_BUSY` is the one that already
-/// means "refused for now, ask again later".
+/// What the busy answer says: `OVERLOADED`, "refused for now, nothing was done,
+/// ask again later". Not `SOURCE_BUSY`, which is about a moving input.
 fn busy_error() -> ApiError {
     ApiError::new(
-        ErrorCode::SourceBusy,
+        ErrorCode::Overloaded,
         "the worker has too many bulk requests waiting; retry later",
     )
 }
