@@ -225,7 +225,7 @@ impl Spool {
 /// The limit is a known approximation when two attempts of one task run at
 /// the same time: each sees only what the other had stored when it opened
 /// its spool, so together they may exceed the task's limit (by at most the
-/// limit itself). Attempts of a task normally run one after another.
+/// limit itself for each attempt running beside another). Attempts of a task normally run one after another.
 pub(crate) fn open_spool(
     spec: &SuperviseSpec,
     store: &WorkerStore,

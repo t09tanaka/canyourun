@@ -1062,6 +1062,19 @@ fn a_crash_after_the_log_reference_is_settled_with_that_one_reference() {
         .unwrap();
     let gc = f.store.gc(u64::MAX / 4, 0, 0).unwrap();
     assert_eq!(gc.queued, [format!("{}/logs", f.attempt())]);
+    // Collected and deleted: a later start completes nothing a second time
+    // and does not bring the files (or a reference to them) back.
+    let root = f.spec.spool_dir();
+    let result = f.store.get_result(f.attempt()).unwrap();
+    assert_eq!(drain_pending_deletes(&f.store, &root).unwrap().deleted, 1);
+    let again = run(&f.spec).unwrap();
+    assert_eq!(
+        (again.termination, again.finalized_here),
+        (r.termination, false)
+    );
+    assert!(!root.join(f.attempt().to_string()).exists());
+    assert!(!has_log_ref(&f));
+    assert_eq!(f.store.get_result(f.attempt()).unwrap(), result);
 }
 
 #[test]
