@@ -5,15 +5,16 @@
 
 mod common;
 
-use local_ci::source::{import_objects, seal_manifest, SourceKind, Stage};
+use local_ci::source::{seal_manifest, SourceKind, Stage};
 use local_ci::ExecContext;
 use remote_task_runner::error::ErrorCode;
 use remote_task_runner::ids::RunId;
 use remote_task_runner::source::diff::BlobWant;
 use remote_task_runner::source::{
-    capture, capture_for_run, CaptureParams, SourceRequest, SourceStore,
+    capture, capture_for_run, CaptureParams, ObjectsRepo, Peer, SourceRequest, SourceStore,
 };
 use std::collections::BTreeMap;
+use std::io::Read;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -174,14 +175,62 @@ fn listing(root: &Path) -> Listing {
     out
 }
 
+/// SHA-256 of every file of `<dir>/.git` outside `objects/` (the config, HEAD,
+/// refs, hooks, logs, LFS store, whatever else is there), by relative path.
+fn git_dir_hashes(dir: &Path) -> BTreeMap<String, String> {
+    use sha2::{Digest, Sha256};
+    fn walk(root: &Path, rel: &Path, out: &mut BTreeMap<String, String>) {
+        for e in std::fs::read_dir(root.join(rel)).unwrap() {
+            let e = e.unwrap();
+            let p = rel.join(e.file_name());
+            if p == Path::new("objects") {
+                continue;
+            }
+            let meta = std::fs::symlink_metadata(root.join(&p)).unwrap();
+            if meta.is_dir() {
+                walk(root, &p, out);
+            } else {
+                let bytes = if meta.file_type().is_symlink() {
+                    std::fs::read_link(root.join(&p))
+                        .unwrap()
+                        .to_string_lossy()
+                        .into_owned()
+                        .into_bytes()
+                } else {
+                    std::fs::read(root.join(&p)).unwrap()
+                };
+                let h: String = Sha256::digest(&bytes)
+                    .iter()
+                    .map(|b| format!("{b:02x}"))
+                    .collect();
+                out.insert(p.to_string_lossy().into_owned(), h);
+            }
+        }
+    }
+    let mut out = BTreeMap::new();
+    walk(&dir.join(".git"), Path::new(""), &mut out);
+    out
+}
+
 /// What a capture must not change in the original.
-fn original_state(dir: &Path) -> (Vec<u8>, String, String, String, Listing) {
+fn original_state(
+    dir: &Path,
+) -> (
+    Vec<u8>,
+    String,
+    String,
+    String,
+    Listing,
+    BTreeMap<String, String>,
+) {
     (
         std::fs::read(dir.join(".git/index")).unwrap(),
         git_out(dir, &["for-each-ref"]),
         git_out(dir, &["rev-parse", "HEAD"]),
         git_out(dir, &["status", "--porcelain=v1", "-z", "--ignored"]),
         listing(dir),
+        // `.git/config` and everything else directly in `.git`, objects aside
+        git_dir_hashes(dir),
     )
 }
 
@@ -506,18 +555,71 @@ fn a_directory_outside_git_is_captured() {
 
 // ---- A14 and the receiving side -------------------------------------------
 
+/// The receiving side: a source store and the Git repository the bundles are
+/// unpacked into (the worker's clone; empty here unless a test makes it
+/// otherwise).
+struct Recv {
+    dir: PathBuf,
+    store: SourceStore,
+    objects: ObjectsRepo,
+}
+
+impl Recv {
+    fn path(&self) -> &Path {
+        &self.dir
+    }
+    fn peer(&self) -> Peer<'_> {
+        Peer {
+            store: &self.store,
+            objects: Some(&self.objects),
+        }
+    }
+}
+
+fn recv(f: &Fixture, name: &str) -> Recv {
+    let dir = f.dir.parent().unwrap().join(format!("recv-{name}"));
+    let clone = dir.join("clone");
+    std::fs::create_dir_all(&dir).unwrap();
+    // the worker's clone has the repository's history (a bundle never carries
+    // the merge base)
+    git(
+        &dir,
+        &[
+            "clone",
+            "-q",
+            f.dir.to_str().unwrap(),
+            clone.to_str().unwrap(),
+        ],
+    );
+    Recv {
+        store: SourceStore::open(&dir.join("state")).unwrap(),
+        objects: ObjectsRepo::new(f.env(), clone),
+        dir,
+    }
+}
+
 /// Send everything `from` has for `id` to `to`, the way a transfer would:
-/// blobs by hash, then the manifests, leaf first.
-fn send(from: &SourceStore, to: &SourceStore, ci_id: &str) {
-    let plan = from.plan_transfer(ci_id, to).unwrap();
+/// blobs by hash, the bundle when the peer's objects lack the commit, then the
+/// manifests, leaf first.
+fn send(f: &Fixture, from: &SourceStore, to: &Recv, ci_id: &str) {
+    let plan = from.plan_transfer(ci_id, &to.peer()).unwrap();
     for w in &plan.blobs {
         let bytes = from.read_blob(&w.hash).unwrap();
-        to.ingest_blob(w, &mut &bytes[..]).unwrap();
+        to.store.ingest_blob(w, &mut &bytes[..]).unwrap();
     }
-    for id in &plan.manifests {
-        to.publish_received(&from.manifest(id).unwrap().unwrap())
-            .unwrap();
+    if plan.bundle {
+        let m = from.manifest(ci_id).unwrap().unwrap();
+        let bundle = from.export_bundle(&ExecContext::new(f.env()), &m).unwrap();
+        to.objects.receive_bundle(&bundle, &m).unwrap();
     }
+    let ms: Vec<_> = plan
+        .manifests
+        .iter()
+        .map(|id| from.manifest(id).unwrap().unwrap())
+        .collect();
+    to.store
+        .publish_received_all(&ms, Some(&to.objects))
+        .unwrap();
 }
 
 #[test]
@@ -527,10 +629,10 @@ fn only_what_the_peer_lacks_is_planned_and_a_complete_peer_gets_nothing() {
     let a = f.store();
     let got = capture(&f.env(), &a, &f.worktree(), &CaptureParams::default()).unwrap();
     let id = &got.manifest.ci_source_id;
-    let other = common::tempdir().unwrap();
-    let b = SourceStore::open(other.path()).unwrap();
+    let other = recv(&f, "b");
+    let b = &other.store;
 
-    let all = a.plan_transfer(id, &b).unwrap();
+    let all = a.plan_transfer(id, &other.peer()).unwrap();
     assert_eq!(all.manifests, vec![id.clone()]);
     assert!(all.bundle);
     let distinct: std::collections::BTreeSet<_> = got
@@ -546,12 +648,12 @@ fn only_what_the_peer_lacks_is_planned_and_a_complete_peer_gets_nothing() {
     let first = &all.blobs[0];
     b.ingest_blob(first, &mut &a.read_blob(&first.hash).unwrap()[..])
         .unwrap();
-    let rest = a.plan_transfer(id, &b).unwrap();
+    let rest = a.plan_transfer(id, &other.peer()).unwrap();
     assert_eq!(rest.blobs.len(), all.blobs.len() - 1);
     assert!(!rest.blobs.contains(first));
 
-    send(&a, &b, id);
-    let done = a.plan_transfer(id, &b).unwrap();
+    send(&f, &a, &other, id);
+    let done = a.plan_transfer(id, &other.peer()).unwrap();
     assert!(done.manifests.is_empty() && done.blobs.is_empty() && !done.bundle);
 
     // what arrived unpacks to what the original captured
@@ -579,7 +681,7 @@ fn a_blob_that_is_not_the_one_asked_for_is_not_stored() {
     };
     let err = s.ingest_blob(&want, &mut &b"tampered"[..]).unwrap_err();
     assert!(err.to_string().contains("not the expected"), "{err}");
-    assert!(!remote_task_runner::source::Inventory::has_blob(&s, &hash));
+    assert!(!s.has_blob(&hash));
     let err = s
         .ingest_blob(
             &BlobWant {
@@ -589,10 +691,10 @@ fn a_blob_that_is_not_the_one_asked_for_is_not_stored() {
             &mut &good[..],
         )
         .unwrap_err();
-    assert!(err.to_string().contains("size"), "{err}");
-    assert!(!remote_task_runner::source::Inventory::has_blob(&s, &hash));
+    assert!(err.to_string().contains("longer"), "{err}");
+    assert!(!s.has_blob(&hash));
     s.ingest_blob(&want, &mut &good[..]).unwrap();
-    assert!(remote_task_runner::source::Inventory::has_blob(&s, &hash));
+    assert!(s.has_blob(&hash));
 }
 
 #[test]
@@ -601,18 +703,18 @@ fn a_manifest_is_not_visible_until_everything_it_names_has_arrived() {
     let a = f.store();
     let got = capture(&f.env(), &a, &f.worktree(), &CaptureParams::default()).unwrap();
     let ci = a.manifest(&got.manifest.ci_source_id).unwrap().unwrap();
-    let other = common::tempdir().unwrap();
-    let b = SourceStore::open(other.path()).unwrap();
+    let other = recv(&f, "b");
+    let b = &other.store;
     // a transfer that stopped after the first blob
-    let plan = a.plan_transfer(&ci.source_id, &b).unwrap();
+    let plan = a.plan_transfer(&ci.source_id, &other.peer()).unwrap();
     let w = &plan.blobs[0];
     b.ingest_blob(w, &mut &a.read_blob(&w.hash).unwrap()[..])
         .unwrap();
-    assert!(b.publish_received(&ci).is_err());
+    assert!(b.publish_received(&ci, Some(&other.objects)).is_err());
     assert!(b.manifest(&ci.source_id).unwrap().is_none());
-    assert!(manifests_in(&b).is_empty());
+    assert!(manifests_in(b).is_empty());
     // resumed with the same plan: complete, and then visible
-    send(&a, &b, &ci.source_id);
+    send(&f, &a, &other, &ci.source_id);
     assert_eq!(b.manifest(&ci.source_id).unwrap().unwrap(), ci);
 }
 
@@ -631,9 +733,9 @@ fn a_manifest_that_would_write_outside_the_workspace_is_refused() {
     let a = f.store();
     let got = capture(&f.env(), &a, &f.worktree(), &CaptureParams::default()).unwrap();
     let ci = a.manifest(&got.manifest.ci_source_id).unwrap().unwrap();
-    let other = common::tempdir().unwrap();
-    let b = SourceStore::open(other.path()).unwrap();
-    send(&a, &b, &ci.source_id);
+    let other = recv(&f, "b");
+    let b = &other.store;
+    send(&f, &a, &other, &ci.source_id);
 
     let bad_paths: Vec<(&str, Vec<u8>)> = vec![
         ("parent", b"../escape.txt".to_vec()),
@@ -647,7 +749,7 @@ fn a_manifest_that_would_write_outside_the_workspace_is_refused() {
             e.path = local_ci::source::RelPath(path.clone());
             m.object_manifest.entries.push(e);
         });
-        let err = b.publish_received(&m).unwrap_err();
+        let err = b.publish_received(&m, Some(&other.objects)).unwrap_err();
         assert!(err.to_string().contains("refusing path"), "{name}: {err}");
         assert!(b.manifest(&m.source_id).unwrap().is_none(), "{name}");
         // and it is not unpacked either, from a store that does hold the blobs
@@ -682,16 +784,16 @@ fn a_manifest_that_does_not_match_its_seal_is_refused() {
     let a = f.store();
     let got = capture(&f.env(), &a, &f.worktree(), &CaptureParams::default()).unwrap();
     let mut ci = a.manifest(&got.manifest.ci_source_id).unwrap().unwrap();
-    send(&a, &f.store(), &ci.source_id);
-    let other = common::tempdir().unwrap();
-    let b = SourceStore::open(other.path()).unwrap();
-    send(&a, &b, &ci.source_id);
+
+    let other = recv(&f, "b");
+    let b = &other.store;
+    send(&f, &a, &other, &ci.source_id);
     ci.branch = Some("tampered".into());
-    assert!(b.publish_received(&ci).is_err());
+    assert!(b.publish_received(&ci, Some(&other.objects)).is_err());
     let mut old = ci.clone();
     old.branch = None;
     old.schema_version = 1;
-    assert!(b.publish_received(&old).is_err());
+    assert!(b.publish_received(&old, Some(&other.objects)).is_err());
 }
 
 fn bare_origin_and_clone(f: &Fixture) -> (PathBuf, PathBuf) {
@@ -768,7 +870,28 @@ fn a14_unpushed_commits_travel_in_a_bundle_and_a_worker_never_fetches_origin() {
             != Some(0)
     );
     // origin moves on afterwards: the worker must not depend on it
-    let exec = import_objects(&ctx, &worker, &bundle, &ci).unwrap();
+    let elsewhere = f.dir.parent().unwrap().join("elsewhere");
+    git(
+        f.dir.parent().unwrap(),
+        &["clone", "-q", origin.to_str().unwrap(), "elsewhere"],
+    );
+    std::fs::write(elsewhere.join("moved.txt"), "origin moved\n").unwrap();
+    git(&elsewhere, &["add", "moved.txt"]);
+    git(&elsewhere, &["commit", "-qm", "origin moves on"]);
+    git(&elsewhere, &["push", "-q", "origin", "main"]);
+    // (the worker's clone is not told: nothing below fetches)
+    let objects = ObjectsRepo::new(f.env(), worker.clone());
+    objects.receive_bundle(&bundle, &ci).unwrap();
+    let exec = m.execution_commit.clone().unwrap();
+    assert!(objects.has_commit(&exec));
+    assert!(
+        git_cmd(&worker, &["cat-file", "-e", "origin/main:moved.txt"])
+            .status()
+            .unwrap()
+            .code()
+            != Some(0),
+        "the worker's clone did not hear of the move"
+    );
     assert_eq!(Some(exec.clone()), m.execution_commit);
     assert_eq!(
         git_out(&worker, &["rev-parse", &format!("{exec}^{{tree}}")]),
@@ -783,15 +906,20 @@ fn a14_unpushed_commits_travel_in_a_bundle_and_a_worker_never_fetches_origin() {
         ),
         "unpushed 2\nunpushed 1"
     );
-    // Known gap (reported to the owner of local-ci's bundle): the index tree
-    // is not in the bundle, so a worker cannot reproduce `git diff --cached`
-    // from the bundle alone.
+    // Known gap (L1b, local-ci's bundle): the index tree is not in the bundle,
+    // so a worker cannot reproduce `git diff --cached` from the bundle alone.
+    // This asserts the gap on purpose: when local-ci carries the index tree,
+    // this assert fails, and that is the signal to turn it into
+    // `assert!(reachable)` and to start using the index tree on the worker.
     let index_tree = m.index_tree.clone().unwrap();
-    let ok = git_cmd(&worker, &["cat-file", "-e", &index_tree])
+    let reachable = git_cmd(&worker, &["cat-file", "-e", &index_tree])
         .status()
         .unwrap()
         .success();
-    eprintln!("index_tree {index_tree} reachable on the worker: {ok}");
+    assert!(
+        !reachable,
+        "index_tree {index_tree} is now in the bundle: L1b is fixed, use it"
+    );
 }
 
 fn with_submodule(f: &Fixture) {
@@ -832,12 +960,14 @@ fn a14_a_dirty_submodule_is_captured_whole_and_travels_with_its_parent() {
     assert!(sub.dirty && sub.source_id.is_some());
     assert_ne!(got.manifest.source_id, clean.manifest.source_id);
 
-    let other = common::tempdir().unwrap();
-    let b = SourceStore::open(other.path()).unwrap();
-    let plan = a.plan_transfer(&got.manifest.ci_source_id, &b).unwrap();
+    let other = recv(&f, "b");
+    let b = &other.store;
+    let plan = a
+        .plan_transfer(&got.manifest.ci_source_id, &other.peer())
+        .unwrap();
     assert_eq!(plan.manifests.len(), 2, "the submodule capture goes first");
     assert_eq!(plan.manifests[0], sub.source_id.clone().unwrap());
-    send(&a, &b, &got.manifest.ci_source_id);
+    send(&f, &a, &other, &got.manifest.ci_source_id);
     let ci = b.manifest(&got.manifest.ci_source_id).unwrap().unwrap();
     let dest = other.path().join("ws");
     b.materialize(&ci, &dest).unwrap();
@@ -859,13 +989,16 @@ fn a_submodule_capture_that_has_not_arrived_blocks_publication() {
     let a = f.store();
     let got = capture(&f.env(), &a, &f.worktree(), &CaptureParams::default()).unwrap();
     let ci = a.manifest(&got.manifest.ci_source_id).unwrap().unwrap();
-    let other = common::tempdir().unwrap();
-    let b = SourceStore::open(other.path()).unwrap();
-    for w in &a.plan_transfer(&ci.source_id, &b).unwrap().blobs {
+    let other = recv(&f, "b");
+    let b = &other.store;
+    for w in &a.plan_transfer(&ci.source_id, &other.peer()).unwrap().blobs {
         b.ingest_blob(w, &mut &a.read_blob(&w.hash).unwrap()[..])
             .unwrap();
     }
-    let err = b.publish_received(&ci).unwrap_err();
+    // the bundle (the commits) came, the submodule's capture did not
+    let bundle = a.export_bundle(&ExecContext::new(f.env()), &ci).unwrap();
+    other.objects.receive_bundle(&bundle, &ci).unwrap();
+    let err = b.publish_received(&ci, Some(&other.objects)).unwrap_err();
     assert!(err.to_string().contains("submodule"), "{err}");
     assert!(b.manifest(&ci.source_id).unwrap().is_none());
 }
@@ -902,9 +1035,9 @@ fn a14_an_lfs_file_is_captured_as_its_payload_and_the_pointer_is_not_what_travel
         .unwrap();
     assert_eq!(e.hash, l.oid, "the blob is the payload");
 
-    let other = common::tempdir().unwrap();
-    let b = SourceStore::open(other.path()).unwrap();
-    send(&a, &b, &got.manifest.ci_source_id);
+    let other = recv(&f, "b");
+    let b = &other.store;
+    send(&f, &a, &other, &got.manifest.ci_source_id);
     let ci = b.manifest(&got.manifest.ci_source_id).unwrap().unwrap();
     let dest = other.path().join("ws");
     b.materialize(&ci, &dest).unwrap();
@@ -1075,9 +1208,11 @@ fn a_commit_with_an_lfs_file_is_captured_as_its_payload() {
 }
 
 #[test]
-fn a_commit_with_a_submodule_is_captured_pinned_at_its_revision() {
+fn a_commit_with_a_submodule_is_captured_with_its_files_at_its_revision() {
     let f = fixture();
     with_submodule(&f);
+    // the working copy of the submodule moves on: the commit does not
+    std::fs::write(f.dir.join("vendor/lib/lib.txt"), "not committed\n").unwrap();
     let store = f.store();
     let got = capture(
         &f.env(),
@@ -1087,7 +1222,408 @@ fn a_commit_with_a_submodule_is_captured_pinned_at_its_revision() {
     )
     .unwrap();
     assert_eq!(got.manifest.submodules.len(), 1);
+    let sub = &got.manifest.submodules[0];
     let sub_rev = git_out(&f.dir, &["rev-parse", "HEAD:vendor/lib"]);
-    assert_eq!(got.manifest.submodules[0].revision, sub_rev);
-    assert!(!got.manifest.submodules[0].dirty);
+    assert_eq!(sub.revision, sub_rev);
+    assert!(!sub.dirty);
+    assert!(sub.source_id.is_some(), "files, not only a revision");
+    let ci = store.manifest(&got.manifest.ci_source_id).unwrap().unwrap();
+    let dest = f.state.join("unpacked");
+    store.materialize(&ci, &dest).unwrap();
+    assert_eq!(
+        std::fs::read(dest.join("vendor/lib/lib.txt")).unwrap(),
+        b"lib\n",
+        "the committed content of the submodule"
+    );
+}
+
+#[test]
+fn an_uninitialized_submodule_is_refused_with_its_path_in_both_kinds_of_capture() {
+    let f = fixture();
+    with_submodule(&f);
+    git(&f.dir, &["submodule", "deinit", "-q", "-f", "vendor/lib"]);
+    let store = f.store();
+    let err = capture(&f.env(), &store, &f.worktree(), &CaptureParams::default()).unwrap_err();
+    assert_eq!(err.code, ErrorCode::InvalidInput);
+    assert!(err.message.contains("vendor/lib"), "{err:?}");
+    // a commit capture takes the files from the original's own clone of the
+    // submodule (still there under .git/modules): it works
+    let got = capture(
+        &f.env(),
+        &store,
+        &commit_req(&f, "HEAD"),
+        &CaptureParams::default(),
+    )
+    .unwrap();
+    assert!(got.manifest.submodules[0].source_id.is_some());
+    // with that clone gone too, there is nothing to take them from
+    std::fs::remove_dir_all(f.dir.join(".git/modules")).unwrap();
+    let err = capture(
+        &f.env(),
+        &store,
+        &commit_req(&f, "HEAD"),
+        &CaptureParams::default(),
+    )
+    .unwrap_err();
+    assert_eq!(err.code, ErrorCode::InvalidInput);
+    assert!(err.message.contains("vendor/lib"), "{err:?}");
+}
+
+#[test]
+fn commit_scratch_directories_are_unique_and_never_remove_what_is_there() {
+    let f = fixture();
+    let store = f.store();
+    let sha = git_out(&f.dir, &["rev-parse", "HEAD"]);
+    // a directory that looks like the scratch directory of an earlier version
+    let old =
+        store
+            .root()
+            .join("tmp")
+            .join(format!("commit-{}-{}", std::process::id(), &sha[..12]));
+    std::fs::create_dir_all(&old).unwrap();
+    std::fs::write(old.join("keep"), "mine").unwrap();
+    // the same commit captured at once, twice over
+    let results: Vec<_> = std::thread::scope(|sc| {
+        let hs: Vec<_> = (0..4)
+            .map(|_| {
+                sc.spawn(|| {
+                    capture(
+                        &f.env(),
+                        &store,
+                        &commit_req(&f, "HEAD"),
+                        &CaptureParams::default(),
+                    )
+                })
+            })
+            .collect();
+        hs.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+    let ids: std::collections::BTreeSet<_> = results
+        .iter()
+        .map(|r| r.as_ref().unwrap().manifest.source_id.clone())
+        .collect();
+    assert_eq!(ids.len(), 1);
+    assert_eq!(std::fs::read(old.join("keep")).unwrap(), b"mine");
+    let left: Vec<_> = std::fs::read_dir(store.root().join("tmp"))
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|n| n.starts_with("commit-") && store.root().join("tmp").join(n) != old)
+        .collect();
+    assert!(left.is_empty(), "scratch directories left: {left:?}");
+}
+
+// ---- the run record, the receiving side, the manifest's fields -------------
+
+#[test]
+fn a_run_is_bound_to_what_was_asked_and_a_different_request_is_a_conflict() {
+    let f = fixture();
+    let store = f.store();
+    let run = RunId::generate();
+    let p = CaptureParams::default();
+    capture_for_run(&f.env(), &store, &run, &f.worktree(), &p).unwrap();
+    // the same run, another kind, another ref, another base, other globs
+    for (name, req, params) in [
+        ("kind", commit_req(&f, "HEAD"), p.clone()),
+        (
+            "base",
+            f.worktree(),
+            CaptureParams {
+                base: Some("main".into()),
+                ..p.clone()
+            },
+        ),
+        (
+            "include",
+            f.worktree(),
+            CaptureParams {
+                include: vec!["*.log".into()],
+                ..p.clone()
+            },
+        ),
+    ] {
+        let err = capture_for_run(&f.env(), &store, &run, &req, &params).unwrap_err();
+        assert_eq!(err.code, ErrorCode::Conflict, "{name}: {err:?}");
+    }
+    let run2 = RunId::generate();
+    capture_for_run(&f.env(), &store, &run2, &commit_req(&f, "HEAD"), &p).unwrap();
+    let err = capture_for_run(&f.env(), &store, &run2, &commit_req(&f, "main"), &p).unwrap_err();
+    assert_eq!(err.code, ErrorCode::Conflict, "{err:?}");
+    // the same request again is the same source
+    assert!(capture_for_run(&f.env(), &store, &run2, &commit_req(&f, "HEAD"), &p).is_ok());
+}
+
+#[test]
+fn a_record_whose_manifest_is_gone_is_an_error_and_not_a_new_capture() {
+    let f = fixture();
+    let store = f.store();
+    let run = RunId::generate();
+    let first = capture_for_run(
+        &f.env(),
+        &store,
+        &run,
+        &f.worktree(),
+        &CaptureParams::default(),
+    )
+    .unwrap();
+    std::fs::remove_file(
+        store
+            .object_store()
+            .manifest_path(&first.manifest.ci_source_id),
+    )
+    .unwrap();
+    // the input has moved on: a re-capture would be a different source
+    std::fs::write(f.dir.join("a.txt"), "moved\n").unwrap();
+    let err = capture_for_run(
+        &f.env(),
+        &store,
+        &run,
+        &f.worktree(),
+        &CaptureParams::default(),
+    )
+    .unwrap_err();
+    assert_eq!(err.code, ErrorCode::Internal);
+    assert!(err.message.contains("manifest is missing"), "{err:?}");
+    assert!(
+        manifests_in(&store).is_empty(),
+        "nothing was captured again"
+    );
+}
+
+#[test]
+fn concurrent_captures_of_one_run_capture_once() {
+    let f = fixture();
+    let store = f.store();
+    let run = RunId::generate();
+    let ids: std::collections::BTreeSet<String> = std::thread::scope(|sc| {
+        let hs: Vec<_> = (0..6)
+            .map(|i| {
+                let (store, run, f) = (&store, &run, &f);
+                sc.spawn(move || {
+                    // the input differs between the callers: only the first
+                    // capture counts
+                    let _ = std::fs::write(f.dir.join("a.txt"), format!("v{i}\n"));
+                    capture_for_run(
+                        &f.env(),
+                        store,
+                        run,
+                        &f.worktree(),
+                        &CaptureParams::default(),
+                    )
+                    .unwrap()
+                    .manifest
+                    .ci_source_id
+                })
+            })
+            .collect();
+        hs.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+    assert_eq!(ids.len(), 1, "{ids:?}");
+    assert_eq!(manifests_in(&store).len(), 1);
+}
+
+#[test]
+fn a_blob_of_the_right_size_and_other_content_is_refused() {
+    let tmp = common::tempdir().unwrap();
+    let s = SourceStore::open(tmp.path()).unwrap();
+    let sha = |b: &[u8]| {
+        use sha2::{Digest, Sha256};
+        Sha256::digest(b)
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>()
+    };
+    let want = BlobWant {
+        hash: sha(b"AAAA"),
+        size: 4,
+    };
+    let err = s.ingest_blob(&want, &mut &b"BBBB"[..]).unwrap_err();
+    assert!(err.to_string().contains("not the expected"), "{err}");
+    assert!(!s.has_blob(&want.hash));
+    assert!(!s.has_blob(&sha(b"BBBB")));
+    // a stream that never ends is cut off at once
+    let err = s
+        .ingest_blob(&want, &mut std::io::repeat(0).take(u64::MAX))
+        .unwrap_err();
+    assert!(err.to_string().contains("longer"), "{err}");
+    // a hash that is not a hash never reaches a path
+    for bad in [
+        "../../etc/passwd",
+        "AA",
+        "\u{e9}\u{e9}",
+        &"A".repeat(64),
+        "",
+    ] {
+        let w = BlobWant {
+            hash: bad.to_string(),
+            size: 1,
+        };
+        let err = s.ingest_blob(&w, &mut &b"x"[..]).unwrap_err();
+        assert!(err.to_string().contains("not a blob hash"), "{bad}: {err}");
+    }
+    // nothing is left behind in the scratch directory
+    assert_eq!(
+        std::fs::read_dir(s.root().join("tmp")).unwrap().count(),
+        0,
+        "scratch files left"
+    );
+}
+
+#[test]
+fn the_same_blob_arriving_from_many_connections_at_once_is_stored() {
+    let tmp = common::tempdir().unwrap();
+    let s = SourceStore::open(tmp.path()).unwrap();
+    let data = vec![7u8; 300 * 1024];
+    let want = BlobWant {
+        hash: {
+            use sha2::{Digest, Sha256};
+            Sha256::digest(&data)
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect()
+        },
+        size: data.len() as u64,
+    };
+    std::thread::scope(|sc| {
+        for _ in 0..8 {
+            sc.spawn(|| s.ingest_blob(&want, &mut &data[..]).unwrap());
+        }
+    });
+    assert!(s.has_blob(&want.hash));
+}
+
+#[test]
+fn the_bundle_is_planned_by_the_objects_and_publication_needs_the_commit() {
+    let f = fixture();
+    dirty(&f.dir);
+    let a = f.store();
+    let got = capture(&f.env(), &a, &f.worktree(), &CaptureParams::default()).unwrap();
+    let id = &got.manifest.ci_source_id;
+    let ci = a.manifest(id).unwrap().unwrap();
+    let r = recv(&f, "b");
+    for w in &a.plan_transfer(id, &r.peer()).unwrap().blobs {
+        r.store
+            .ingest_blob(w, &mut &a.read_blob(&w.hash).unwrap()[..])
+            .unwrap();
+    }
+    // the manifest cannot be published without its commit: not with objects
+    // that lack it, not with none
+    let err = r.store.publish_received(&ci, Some(&r.objects)).unwrap_err();
+    assert!(err.to_string().contains("not reachable"), "{err}");
+    assert!(r.store.publish_received(&ci, None).is_err());
+    assert!(manifests_in(&r.store).is_empty());
+    // the bundle goes whenever the objects lack the commit
+    assert!(a.plan_transfer(id, &r.peer()).unwrap().bundle);
+    send(&f, &a, &r, id);
+    assert!(!a.plan_transfer(id, &r.peer()).unwrap().bundle);
+    // a peer whose store has the manifest but whose objects do not (a fresh
+    // clone, or none) is sent the bundle again
+    let none = Peer {
+        store: &r.store,
+        objects: None,
+    };
+    assert!(a.plan_transfer(id, &none).unwrap().bundle);
+    let fresh = recv(&f, "c");
+    let other_objects = Peer {
+        store: &r.store,
+        objects: Some(&fresh.objects),
+    };
+    let plan = a.plan_transfer(id, &other_objects).unwrap();
+    assert!(plan.bundle && plan.manifests.is_empty() && plan.blobs.is_empty());
+}
+
+#[test]
+fn a_manifest_with_an_unsafe_start_directory_or_hash_is_refused() {
+    let f = fixture();
+    let a = f.store();
+    let got = capture(&f.env(), &a, &f.worktree(), &CaptureParams::default()).unwrap();
+    let ci = a.manifest(&got.manifest.ci_source_id).unwrap().unwrap();
+    let r = recv(&f, "b");
+    send(&f, &a, &r, &ci.source_id);
+    let b = &r.store;
+    for (name, cwd) in [
+        ("parent", "../x"),
+        ("absolute", "/tmp"),
+        ("git dir", ".git"),
+        ("below git dir", "sub dir/.GIT/x"),
+        ("dot", "./sub dir"),
+    ] {
+        let m = resealed(&ci, |m| {
+            m.cwd_relative = local_ci::source::RelPath::new(cwd)
+        });
+        let err = b.publish_received(&m, Some(&r.objects)).unwrap_err();
+        assert!(err.to_string().contains("refusing"), "{name}: {err}");
+    }
+    // a real directory of the tree, and the root, are fine to start in
+    for cwd in ["", "sub dir"] {
+        let m = resealed(&ci, |m| {
+            m.cwd_relative = local_ci::source::RelPath::new(cwd)
+        });
+        let dest = f.state.join(format!("ws-{}", cwd.len()));
+        a.materialize(&m, &dest).unwrap();
+    }
+    // ... and one that is not in the unpacked tree is not
+    for cwd in ["nowhere", "a.txt", "link"] {
+        let m = resealed(&ci, |m| {
+            m.cwd_relative = local_ci::source::RelPath::new(cwd)
+        });
+        let dest = f.state.join(format!("ws-bad-{cwd}"));
+        let err = a.materialize(&m, &dest).unwrap_err();
+        assert!(
+            err.to_string().contains("working directory"),
+            "{cwd}: {err}"
+        );
+    }
+    // a hash that is not 64 lowercase hex digits is never looked up
+    for (name, bad) in [
+        ("traversal", "../../../etc/passwd".to_string()),
+        ("short", "ab".to_string()),
+        ("upper", ci.object_manifest.entries[0].hash.to_uppercase()),
+        ("non-ascii", "\u{e9}".repeat(32)),
+    ] {
+        let m = resealed(&ci, |m| m.object_manifest.entries[0].hash = bad.clone());
+        let err = b.publish_received(&m, Some(&r.objects)).unwrap_err();
+        assert!(err.to_string().contains("not a blob hash"), "{name}: {err}");
+        assert!(
+            a.materialize(&m, &f.state.join("ws-hash")).is_err(),
+            "{name}"
+        );
+    }
+}
+
+#[test]
+fn paths_that_a_folding_file_system_merges_are_refused() {
+    let f = fixture();
+    let a = f.store();
+    let got = capture(&f.env(), &a, &f.worktree(), &CaptureParams::default()).unwrap();
+    let ci = a.manifest(&got.manifest.ci_source_id).unwrap().unwrap();
+    let r = recv(&f, "b");
+    send(&f, &a, &r, &ci.source_id);
+    // `link` is a symlink entry of the fixture
+    let nfd = "caf\u{65}\u{301}.txt";
+    let nfc = "caf\u{e9}.txt";
+    let cases: Vec<(&str, Vec<&str>, &str)> = vec![
+        ("case duplicate", vec!["Link"], "Duplicate"),
+        (
+            "through a symlink in another case",
+            vec!["LINK/x"],
+            "ThroughEntry",
+        ),
+        ("Unicode forms", vec![nfd, nfc], "Duplicate"),
+        ("dot git in another case", vec!["x/.GiT/hooks"], "GitDir"),
+    ];
+    for (name, add, why) in cases {
+        let m = resealed(&ci, |m| {
+            for p in &add {
+                let mut e = m.object_manifest.entries[0].clone();
+                e.path = local_ci::source::RelPath::new(p);
+                m.object_manifest.entries.push(e);
+            }
+        });
+        let err = r.store.publish_received(&m, Some(&r.objects)).unwrap_err();
+        assert!(err.to_string().contains(why), "{name}: {err}");
+        assert!(
+            a.materialize(&m, &f.state.join("ws-fold")).is_err(),
+            "{name}"
+        );
+    }
 }

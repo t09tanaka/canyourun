@@ -19,6 +19,21 @@
 //! | submodules / lfs      | `submodules`, `lfs`                    | same                  |
 //! | secret_files          | `secret_files` (path + HMAC only)      | same                  |
 //!
+//! What S6 fills and what it leaves:
+//!
+//! - `secret_files` is always empty here: S6 captures with no secret files
+//!   (chapter 22 brings them in by its own path, never through the manifest's
+//!   content; only path + HMAC are listed once that exists).
+//! - A commit capture runs through a scratch clone (a detached checkout of
+//!   the commit), so `branch` is `None` or what the scratch clone says, not
+//!   the original's branch, and `index_tree` is the tree of that checkout's
+//!   index (the commit's tree), not the original's index. `original_head` is
+//!   the commit itself.
+//! - `source_kind` is the kind that was asked for and is not part of the seal
+//!   (local-ci seals a commit capture as a worktree one). It is not
+//!   recovered on the receiving side: a received manifest says what local-ci
+//!   sealed, and the receiver does not need the kind.
+//!
 //! `canonical` (the settings that make Git's blobs out of the captured bytes)
 //! is not in the spec's table but a worker needs it, so it is carried too.
 

@@ -27,7 +27,9 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 pub use manifest::SourceManifest;
-pub use store::{Inventory, SourceStore, TransferPlan};
+pub use store::{
+    Inventory, ObjectsRepo, Peer, RequestSummary, RunRecord, SourceStore, TransferPlan,
+};
 
 /// What to capture.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -115,6 +117,7 @@ pub fn capture(
         }
         SourceRequest::Directory { dir } => capture_directory(&ctx, dir, &opts).map_err(ci_err)?,
     };
+    refuse_uninitialized_submodules(store, &snap.manifest)?;
     let manifest = SourceManifest::from_ci(&snap.manifest, request.kind()).ok_or_else(|| {
         ApiError::new(
             ErrorCode::Internal,
@@ -125,6 +128,43 @@ pub fn capture(
         manifest,
         warnings: snap.warnings,
     })
+}
+
+/// A submodule that was not initialized in the original has no files to
+/// capture, only a revision: a source made so would not hold what the
+/// repository holds, so it is refused, with the path. (The refused capture
+/// leaves its manifest in the store, unreferenced; nothing is bound to it.)
+fn refuse_uninitialized_submodules(
+    store: &SourceStore,
+    m: &local_ci::source::SourceManifest,
+) -> Result<(), ApiError> {
+    let internal = |e: anyhow::Error| classify::api_error_of(&e);
+    for s in store.closure(m).map_err(internal)? {
+        if let Some(sub) = s.submodules.iter().find(|x| x.source_id.is_none()) {
+            return Err(ApiError::new(
+                ErrorCode::InvalidInput,
+                format!(
+                    "submodule {} is not initialized (run `git submodule update --init` there): a source needs its files, not only its revision",
+                    sub.path.display()
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The part of a request that decides what is captured, for the run record.
+fn summarize(request: &SourceRequest, params: &CaptureParams) -> RequestSummary {
+    RequestSummary {
+        kind: request.kind(),
+        rev: match request {
+            SourceRequest::Commit { rev, .. } => Some(rev.clone()),
+            _ => None,
+        },
+        base: params.base.clone(),
+        include: params.include.clone(),
+        exclude: params.exclude.clone(),
+    }
 }
 
 /// The capture of a run: made once, then the same source for every later
@@ -139,32 +179,64 @@ pub fn capture_for_run(
     params: &CaptureParams,
 ) -> Result<Captured, ApiError> {
     let internal = |e: anyhow::Error| classify::api_error_of(&e);
-    if let Some(id) = store.source_of_run(run).map_err(internal)? {
-        if let Some(m) = store.manifest(&id).map_err(internal)? {
-            let manifest = SourceManifest::from_ci(&m, request.kind())
-                .ok_or_else(|| ApiError::new(ErrorCode::Internal, format!("bad source id {id}")))?;
-            return Ok(Captured {
-                manifest,
-                warnings: vec![],
-            });
+    let from_ci = |m: &local_ci::source::SourceManifest| {
+        SourceManifest::from_ci(m, request.kind()).ok_or_else(|| {
+            ApiError::new(
+                ErrorCode::Internal,
+                format!("bad source id {}", m.source_id),
+            )
+        })
+    };
+    // one capture of a run at a time, in this process and in others
+    let _lock = store.lock_run(run).map_err(internal)?;
+    let wanted = RunRecord {
+        ci_source_id: String::new(),
+        source_kind: request.kind(),
+        request: summarize(request, params),
+    };
+    if let Some(rec) = store.run_record(run).map_err(internal)? {
+        if rec.source_kind != wanted.source_kind || rec.request != wanted.request {
+            return Err(ApiError::new(
+                ErrorCode::Conflict,
+                format!(
+                    "run {run} already has a source ({}) captured for {:?}; this request is {:?}",
+                    rec.ci_source_id, rec.request, wanted.request
+                ),
+            ));
         }
+        // the record names the source: a manifest that is gone is damage, not
+        // a reason to capture again (the working tree may have moved on)
+        let m = store
+            .manifest(&rec.ci_source_id)
+            .map_err(internal)?
+            .ok_or_else(|| {
+                ApiError::new(
+                    ErrorCode::Internal,
+                    format!(
+                        "run {run} is bound to {}, whose manifest is missing from the store",
+                        rec.ci_source_id
+                    ),
+                )
+            })?;
+        return Ok(Captured {
+            manifest: from_ci(&m)?,
+            warnings: vec![],
+        });
     }
     let got = capture(env, store, request, params)?;
-    let bound = store
-        .bind_run(run, &got.manifest.ci_source_id)
-        .map_err(internal)?;
-    if bound != got.manifest.ci_source_id {
-        // another caller bound this run first: its source is the run's
-        let m = store
-            .manifest(&bound)
-            .map_err(internal)?
-            .ok_or_else(|| ApiError::new(ErrorCode::Internal, "bound source is missing"))?;
-        let manifest = SourceManifest::from_ci(&m, request.kind())
-            .ok_or_else(|| ApiError::new(ErrorCode::Internal, format!("bad source id {bound}")))?;
-        return Ok(Captured {
-            manifest,
-            warnings: got.warnings,
-        });
+    let record = RunRecord {
+        ci_source_id: got.manifest.ci_source_id.clone(),
+        ..wanted
+    };
+    let bound = store.bind_run(run, &record).map_err(internal)?;
+    if bound != record {
+        return Err(ApiError::new(
+            ErrorCode::Internal,
+            format!(
+                "run {run} was bound to {} while its capture was held",
+                bound.ci_source_id
+            ),
+        ));
     }
     Ok(got)
 }

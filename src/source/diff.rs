@@ -29,6 +29,12 @@ pub fn missing_blobs(entries: &[FileEntry], peer_has: impl Fn(&str) -> bool) -> 
         .collect()
 }
 
+/// Is `s` the name of a blob: 64 lowercase hex digits (SHA-256)? A hash from
+/// outside ends up in a path of the store, so nothing else is accepted.
+pub fn is_blob_hash(s: &str) -> bool {
+    s.len() == 64 && s.bytes().all(|c| matches!(c, b'0'..=b'9' | b'a'..=b'f'))
+}
+
 /// A blob that is not what was asked for.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BlobMismatch {
@@ -149,5 +155,22 @@ mod tests {
             check_blob(&w, "bb", 6),
             Err(BlobMismatch::Hash { .. })
         ));
+    }
+
+    #[test]
+    fn a_blob_name_is_sixty_four_lowercase_hex_digits() {
+        assert!(is_blob_hash(&"0123456789abcdef".repeat(4)));
+        for bad in [
+            "".to_string(),
+            "ab".to_string(),
+            "a".repeat(63),
+            "a".repeat(65),
+            "A".repeat(64),
+            "g".repeat(64),
+            format!("../{}", "a".repeat(61)),
+            format!("{}/", "a".repeat(63)),
+        ] {
+            assert!(!is_blob_hash(&bad), "{bad}");
+        }
     }
 }

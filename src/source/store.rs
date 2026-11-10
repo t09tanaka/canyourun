@@ -3,25 +3,30 @@
 //! (the per-run record, difference planning, and verified receiving).
 
 use super::classify::source_id_of_ci;
-use super::diff::{check_blob, missing_blobs, BlobWant};
+use super::commit::run as git_run;
+use super::diff::{check_blob, is_blob_hash, missing_blobs, BlobWant};
 use super::safety::{check_entries, check_rel_path};
 use crate::ids::RunId;
 use anyhow::{bail, Context, Result};
 use local_ci::source::{
-    export_from, materialize_from, seal_manifest, ObjectStore, SourceError,
-    SourceManifest as CiManifest, SCHEMA_VERSION,
+    export_from, import_objects, materialize_from, seal_manifest, ObjectStore, SourceError,
+    SourceKind, SourceManifest as CiManifest, SCHEMA_VERSION,
 };
 use local_ci::ExecContext;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::{Read, Write};
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 /// What a peer's store holds: the question a transfer plan asks of it.
 pub trait Inventory {
     fn has_blob(&self, hash: &str) -> bool;
     fn has_manifest(&self, ci_source_id: &str) -> bool;
+    /// Is the commit among the peer's Git objects (the repository the bundle
+    /// is unpacked into)? A manifest says nothing about this.
+    fn has_commit(&self, sha: &str) -> bool;
 }
 
 /// What to send so that a peer can hold `manifest` complete.
@@ -33,8 +38,10 @@ pub struct TransferPlan {
     pub manifests: Vec<String>,
     /// Blobs the peer lacks, over all those sources, each once.
     pub blobs: Vec<BlobWant>,
-    /// The requested source has Git objects (a bundle goes with it) and the
-    /// peer does not have the source yet.
+    /// The requested source has an execution commit and the peer's Git
+    /// objects do not hold it (a bundle goes with it). Decided on the
+    /// objects, not on whether the manifest is there: a manifest can arrive
+    /// without its commits.
     pub bundle: bool,
 }
 
@@ -43,12 +50,102 @@ pub struct SourceStore {
     inner: ObjectStore,
 }
 
-impl Inventory for SourceStore {
+/// A peer as a transfer sees it: its source store, and the Git repository the
+/// bundles are unpacked into (the worker's clone of the repository; none when
+/// the peer has none yet).
+pub struct Peer<'a> {
+    pub store: &'a SourceStore,
+    pub objects: Option<&'a ObjectsRepo>,
+}
+
+impl Inventory for Peer<'_> {
     fn has_blob(&self, hash: &str) -> bool {
-        self.inner.has(hash)
+        self.store.has_blob(hash)
     }
     fn has_manifest(&self, ci_source_id: &str) -> bool {
-        matches!(self.inner.load_manifest(ci_source_id), Ok(Some(_)))
+        matches!(self.store.inner.load_manifest(ci_source_id), Ok(Some(_)))
+    }
+    fn has_commit(&self, sha: &str) -> bool {
+        self.objects.is_some_and(|o| o.has_commit(sha))
+    }
+}
+
+fn is_hex40(s: &str) -> bool {
+    s.len() == 40 && s.bytes().all(|c| matches!(c, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// The Git repository on the receiving side that holds the objects of the
+/// sources it received: the worker's canonical clone of the repository. It has
+/// to have the merge base already (a bundle never carries it; nothing is
+/// fetched from the network).
+#[derive(Debug, Clone)]
+pub struct ObjectsRepo {
+    env: BTreeMap<String, String>,
+    dir: PathBuf,
+}
+
+impl ObjectsRepo {
+    pub fn new(env: BTreeMap<String, String>, dir: PathBuf) -> Self {
+        ObjectsRepo { env, dir }
+    }
+
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+
+    pub fn has_commit(&self, sha: &str) -> bool {
+        is_hex40(sha)
+            && git_run(
+                &self.env,
+                &self.dir,
+                &["cat-file", "-e", &format!("{sha}^{{commit}}")],
+            )
+            .is_ok()
+    }
+
+    /// Unpack the bundle of `m` into the repository, and check that the
+    /// execution commit is there with the recorded tree (local-ci's
+    /// `import_objects`; the manifest is verified first).
+    pub fn receive_bundle(&self, bundle: &Path, m: &CiManifest) -> Result<()> {
+        verify_manifest(m)?;
+        import_objects(&ExecContext::new(self.env.clone()), &self.dir, bundle, m)?;
+        Ok(())
+    }
+
+    /// The execution commit of `m` is reachable from the snapshot ref the
+    /// bundle was unpacked under, and has the recorded tree.
+    fn check_reachable(&self, m: &CiManifest) -> Result<()> {
+        let Some(commit) = &m.execution_commit else {
+            return Ok(());
+        };
+        if !is_hex40(commit) {
+            return Err(corrupt(format!("not a commit id: {commit:?}")));
+        }
+        let r = format!("refs/local-ci/snapshots/{}", m.source_id);
+        git_run(
+            &self.env,
+            &self.dir,
+            &["merge-base", "--is-ancestor", commit, &r],
+        )
+        .map_err(|e| {
+            corrupt(format!(
+                "{}: the execution commit {commit} is not reachable in the receiving objects ({e:#})",
+                m.source_id
+            ))
+        })?;
+        if let Some(tree) = &m.worktree_tree {
+            let got = git_run(
+                &self.env,
+                &self.dir,
+                &["rev-parse", &format!("{commit}^{{tree}}")],
+            )?;
+            if &got != tree {
+                return Err(corrupt(format!(
+                    "commit {commit} has tree {got}, the manifest says {tree}"
+                )));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -64,6 +161,11 @@ impl SourceStore {
         std::fs::create_dir_all(root.join("runs"))?;
         std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700))?;
         Ok(SourceStore { inner })
+    }
+
+    /// Is the blob in the store? (Only a well-formed hash can be.)
+    pub fn has_blob(&self, hash: &str) -> bool {
+        is_blob_hash(hash) && self.inner.has(hash)
     }
 
     pub fn object_store(&self) -> &ObjectStore {
@@ -126,7 +228,10 @@ impl SourceStore {
             entries.extend(s.object_manifest.entries.iter().cloned());
         }
         Ok(TransferPlan {
-            bundle: m.execution_commit.is_some() && manifests.contains(&m.source_id),
+            bundle: m
+                .execution_commit
+                .as_deref()
+                .is_some_and(|c| !peer.has_commit(c)),
             blobs: missing_blobs(&entries, |h| peer.has_blob(h)),
             manifests,
         })
@@ -139,53 +244,110 @@ impl SourceStore {
 
     /// Take in a blob that came from outside. It is stored only when its hash
     /// and size are what was asked for; the hash is computed here, not
-    /// believed.
+    /// believed, and no more than the announced size is read.
+    ///
+    /// This is where a blob is checked: a blob in the store is under the hash
+    /// of its own content, so `publish_received` only has to see that the
+    /// blobs a manifest names are there with the size it says (the same hash
+    /// cannot hold other content).
     pub fn ingest_blob(&self, want: &BlobWant, r: &mut impl Read) -> Result<()> {
+        if !is_blob_hash(&want.hash) {
+            return Err(corrupt(format!("not a blob hash: {:?}", want.hash)));
+        }
         // hash first, in a scratch copy: a wrong blob must not enter the store
-        let tmp = self.inner.root().join("tmp").join(format!(
-            ".recv.{}.{}",
-            std::process::id(),
-            &want.hash[..want.hash.len().min(16)]
-        ));
-        let res = (|| -> Result<()> {
-            let mut f = std::fs::OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .mode(0o600)
-                .open(&tmp)?;
-            let mut h = Sha256::new();
-            let mut n = 0u64;
-            let mut buf = vec![0u8; 64 * 1024];
-            loop {
-                let k = r.read(&mut buf)?;
-                if k == 0 {
-                    break;
-                }
-                h.update(&buf[..k]);
-                f.write_all(&buf[..k])?;
-                n += k as u64;
+        let mut tmp = tempfile::Builder::new()
+            .prefix(".recv.")
+            .tempfile_in(self.inner.root().join("tmp"))?;
+        let mut r = r.take(want.size.saturating_add(1));
+        let mut h = Sha256::new();
+        let mut n = 0u64;
+        let mut buf = vec![0u8; 64 * 1024];
+        loop {
+            let k = r.read(&mut buf)?;
+            if k == 0 {
+                break;
             }
-            f.sync_all()?;
-            let actual: String = h.finalize().iter().map(|b| format!("{b:02x}")).collect();
-            check_blob(want, &actual, n)?;
-            let (stored, _) = self.inner.put_reader(&mut std::fs::File::open(&tmp)?)?;
-            if stored != want.hash {
-                bail!("the store named {stored}, not {}", want.hash);
+            n += k as u64;
+            if n > want.size {
+                return Err(corrupt(format!(
+                    "blob {} is longer than the announced {} bytes",
+                    want.hash, want.size
+                )));
             }
-            Ok(())
-        })();
-        let _ = std::fs::remove_file(&tmp);
-        res
+            h.update(&buf[..k]);
+            tmp.write_all(&buf[..k])?;
+        }
+        tmp.as_file().sync_all()?;
+        let actual: String = h.finalize().iter().map(|b| format!("{b:02x}")).collect();
+        check_blob(want, &actual, n)?;
+        let (stored, _) = self
+            .inner
+            .put_reader(&mut std::fs::File::open(tmp.path())?)?;
+        if stored != want.hash {
+            bail!("the store named {stored}, not {}", want.hash);
+        }
+        Ok(())
     }
 
     /// Make a manifest that came from outside visible, after checking it: the
-    /// seal, every path and mode, and that everything it names (blobs of the
-    /// right size, the submodule captures) is already in the store. The
-    /// manifest file is written last, by rename, so a source that can be
-    /// loaded is complete; a transfer that stops earlier leaves nothing
-    /// visible and can be resumed with the same plan.
-    pub fn publish_received(&self, m: &CiManifest) -> Result<()> {
+    /// seal, every path, hash and mode, and that everything it names (blobs of
+    /// the right size, the submodule captures) is already in the store, and,
+    /// for a source with an execution commit, that the commit is reachable in
+    /// `objects` (the bundle has been unpacked; see
+    /// [`ObjectsRepo::receive_bundle`]). The manifest file is written last, by
+    /// rename, so a source that can be loaded is complete; a transfer that
+    /// stops earlier leaves nothing visible and can be resumed with the same
+    /// plan.
+    pub fn publish_received(&self, m: &CiManifest, objects: Option<&ObjectsRepo>) -> Result<()> {
+        verify_manifest(m)?;
+        if m.execution_commit.is_some() {
+            match objects {
+                Some(o) => o.check_reachable(m)?,
+                None => {
+                    return Err(corrupt(format!(
+                        "{}: no receiving objects to hold its execution commit",
+                        m.source_id
+                    )))
+                }
+            }
+        }
+        self.publish_checked(m)
+    }
+
+    /// `publish_received` for the sources of a transfer, in plan order (leaf
+    /// first, the requested source last). The objects are required for the
+    /// requested source and for the dirty submodules below it: the bundle
+    /// carries their commits. A clean submodule's capture has an execution
+    /// commit too, but the bundle does not carry it (its files are in the
+    /// blobs and its revision is in the parent's tree), so it is not asked
+    /// for.
+    pub fn publish_received_all(
+        &self,
+        manifests: &[CiManifest],
+        objects: Option<&ObjectsRepo>,
+    ) -> Result<()> {
+        let mut carried: BTreeSet<&str> = BTreeSet::new();
+        if let Some(last) = manifests.last() {
+            carried.insert(&last.source_id);
+        }
+        for m in manifests {
+            for sub in m.submodules.iter().filter(|s| s.dirty) {
+                if let Some(id) = &sub.source_id {
+                    carried.insert(id);
+                }
+            }
+        }
+        for m in manifests {
+            if carried.contains(m.source_id.as_str()) {
+                self.publish_received(m, objects)?;
+            } else {
+                self.publish_checked(m)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn publish_checked(&self, m: &CiManifest) -> Result<()> {
         verify_manifest(m)?;
         for e in &m.object_manifest.entries {
             let p = self.inner.object_path(&e.hash);
@@ -210,7 +372,7 @@ impl SourceStore {
         }
         for s in &m.submodules {
             if let Some(id) = &s.source_id {
-                if !self.has_manifest(id) {
+                if !self.inner_has_manifest(id) {
                     return Err(corrupt(format!(
                         "submodule {}: {id} is not in the store",
                         s.path.display()
@@ -219,27 +381,20 @@ impl SourceStore {
             }
         }
         let bytes = serde_json::to_vec_pretty(m)?;
-        let tmp = self.inner.root().join("tmp").join(format!(
-            ".manifest.{}.{}",
-            std::process::id(),
-            m.source_id
-        ));
-        let res = (|| -> Result<()> {
-            let mut f = std::fs::OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .mode(0o644)
-                .open(&tmp)?;
-            f.write_all(&bytes)?;
-            f.sync_all()?;
-            std::fs::rename(&tmp, self.inner.manifest_path(&m.source_id))?;
-            Ok(())
-        })();
-        if res.is_err() {
-            let _ = std::fs::remove_file(&tmp);
-        }
-        res
+        let mut tmp = tempfile::Builder::new()
+            .prefix(".manifest.")
+            .tempfile_in(self.inner.root().join("tmp"))?;
+        tmp.write_all(&bytes)?;
+        tmp.as_file()
+            .set_permissions(std::fs::Permissions::from_mode(0o644))?;
+        tmp.as_file().sync_all()?;
+        tmp.persist(self.inner.manifest_path(&m.source_id))
+            .map_err(|e| e.error)?;
+        Ok(())
+    }
+
+    fn inner_has_manifest(&self, ci_source_id: &str) -> bool {
+        matches!(self.inner.load_manifest(ci_source_id), Ok(Some(_)))
     }
 
     /// Unpack `m` into `dest` (absent or empty). The paths of every source it
@@ -249,7 +404,22 @@ impl SourceStore {
         for s in self.closure(m)? {
             verify_manifest(&s)?;
         }
-        materialize_from(&self.inner, m, dest)
+        materialize_from(&self.inner, m, dest)?;
+        // where the run starts has to be a real directory of the unpacked tree
+        let root = std::fs::canonicalize(dest)?;
+        let cwd = std::fs::canonicalize(dest.join(m.cwd_relative.to_path())).map_err(|_| {
+            corrupt(format!(
+                "the working directory {:?} is not in the unpacked source",
+                m.cwd_relative.display()
+            ))
+        })?;
+        if !cwd.starts_with(&root) || !cwd.is_dir() {
+            return Err(corrupt(format!(
+                "the working directory {:?} is not a directory inside the unpacked source",
+                m.cwd_relative.display()
+            )));
+        }
+        Ok(())
     }
 
     /// The `git bundle` that carries the Git objects of `m` (the synthetic
@@ -259,44 +429,83 @@ impl SourceStore {
         export_from(ctx, &self.inner, m)
     }
 
-    fn run_record(&self, run: &RunId) -> PathBuf {
+    fn run_record_path(&self, run: &RunId) -> PathBuf {
         self.inner.root().join("runs").join(run.as_str())
     }
 
-    /// The source a run already captured, if any (spec: one capture per run).
-    pub fn source_of_run(&self, run: &RunId) -> Result<Option<String>> {
-        match std::fs::read_to_string(self.run_record(run)) {
-            Ok(s) => Ok(Some(s.trim().to_string())),
+    /// Hold the capture of `run` for the life of the returned file: a second
+    /// caller (another thread or process) waits, then finds the record the
+    /// first one made.
+    pub fn lock_run(&self, run: &RunId) -> Result<std::fs::File> {
+        let f = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(self.inner.root().join("runs").join(format!("{run}.lock")))?;
+        f.lock()?;
+        Ok(f)
+    }
+
+    /// What a run captured, if anything (spec: one capture per run).
+    pub fn run_record(&self, run: &RunId) -> Result<Option<RunRecord>> {
+        match std::fs::read(self.run_record_path(run)) {
+            Ok(b) => Ok(Some(
+                serde_json::from_slice(&b).with_context(|| format!("the record of run {run}"))?,
+            )),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(e) => Err(e.into()),
         }
     }
 
-    /// Record the source of `run`, once. Returns the source the run is
-    /// bound to: `ci_source_id`, or the one an earlier (concurrent) call
-    /// recorded.
-    pub fn bind_run(&self, run: &RunId, ci_source_id: &str) -> Result<String> {
-        if source_id_of_ci(ci_source_id).is_none() {
-            bail!("not a source id: {ci_source_id}");
+    /// The source a run already captured, if any.
+    pub fn source_of_run(&self, run: &RunId) -> Result<Option<String>> {
+        Ok(self.run_record(run)?.map(|r| r.ci_source_id))
+    }
+
+    /// Record the capture of `run`, once. Returns the record the run is bound
+    /// to: `record`, or the one an earlier call wrote.
+    pub fn bind_run(&self, run: &RunId, record: &RunRecord) -> Result<RunRecord> {
+        if source_id_of_ci(&record.ci_source_id).is_none() {
+            bail!("not a source id: {}", record.ci_source_id);
         }
-        let dest = self.run_record(run);
-        let tmp =
-            self.inner
-                .root()
-                .join("tmp")
-                .join(format!(".run.{}.{}", std::process::id(), run));
-        std::fs::write(&tmp, ci_source_id)?;
+        let dest = self.run_record_path(run);
+        let mut tmp = tempfile::Builder::new()
+            .prefix(".run.")
+            .tempfile_in(self.inner.root().join("tmp"))?;
+        tmp.write_all(&serde_json::to_vec_pretty(record)?)?;
+        tmp.as_file().sync_all()?;
         // a hard link fails when the record exists: the first writer wins
-        let linked = std::fs::hard_link(&tmp, &dest);
-        let _ = std::fs::remove_file(&tmp);
-        match linked {
-            Ok(()) => Ok(ci_source_id.to_string()),
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => self
-                .source_of_run(run)?
-                .context("the run record disappeared"),
+        match std::fs::hard_link(tmp.path(), &dest) {
+            Ok(()) => Ok(record.clone()),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                self.run_record(run)?.context("the run record disappeared")
+            }
             Err(e) => Err(e.into()),
         }
     }
+}
+
+/// What a run's capture was, written next to the source it produced. A later
+/// call for the same run must ask for the same thing, or it is an error and
+/// not a silent reuse of another source.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RunRecord {
+    pub ci_source_id: String,
+    pub source_kind: SourceKind,
+    pub request: RequestSummary,
+}
+
+/// The parts of a capture request that decide what is captured. The
+/// directory is left out: the same repository can be named by different
+/// paths.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RequestSummary {
+    pub kind: SourceKind,
+    /// The commit asked for (`Commit` only).
+    pub rev: Option<String>,
+    pub base: Option<String>,
+    pub include: Vec<String>,
+    pub exclude: Vec<String>,
 }
 
 /// A manifest from outside is not taken for what it says: its schema, its
@@ -324,6 +533,26 @@ fn verify_manifest(m: &CiManifest) -> Result<()> {
         path: String::from_utf8_lossy(&v.path).into_owned(),
         why: format!("{:?}", v.why),
     })?;
+    // where the run starts: empty (the root) or a safe path
+    if !m.cwd_relative.is_empty() {
+        if let Err(why) = check_rel_path(&m.cwd_relative.0) {
+            return Err(SourceError::UnsafePath {
+                path: m.cwd_relative.display(),
+                why: format!("{why:?}"),
+            }
+            .into());
+        }
+    }
+    // a hash ends up in a path of the store
+    for e in &m.object_manifest.entries {
+        if !is_blob_hash(&e.hash) {
+            return Err(corrupt(format!(
+                "{}: {:?} is not a blob hash",
+                e.path.display(),
+                e.hash
+            )));
+        }
+    }
     let unsafe_path = |p: &[u8]| check_rel_path(p).err();
     for p in m
         .submodules

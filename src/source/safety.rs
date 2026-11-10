@@ -74,7 +74,7 @@ pub fn check_rel_path(p: &[u8]) -> Result<(), Violation> {
             b"" => return Err(Violation::EmptyComponent),
             b"." => return Err(Violation::CurrentDir),
             b".." => return Err(Violation::ParentDir),
-            _ if c.eq_ignore_ascii_case(b".git") => return Err(Violation::GitDir),
+            _ if names_git_dir(c) => return Err(Violation::GitDir),
             _ => {}
         }
     }
@@ -89,14 +89,46 @@ pub fn check_mode(mode: u32) -> Result<(), Violation> {
     }
 }
 
+/// The key two paths are compared by: what a case-folding, normalizing file
+/// system (macOS, Windows) would treat as the same name. Each component is
+/// put in Unicode NFC, lowercased, and stripped of the characters HFS+ ignores;
+/// a component that is not UTF-8 is only ASCII-lowercased.
+fn fold_component(c: &[u8]) -> Vec<u8> {
+    use unicode_normalization::UnicodeNormalization;
+    match std::str::from_utf8(c) {
+        Ok(s) => {
+            let nfc: String = s.nfc().collect();
+            nfc.to_lowercase()
+                .nfc()
+                .filter(|ch| {
+                    !matches!(*ch,
+                        '\u{200c}'..='\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{206a}'..='\u{206f}' | '\u{feff}')
+                })
+                .collect::<String>()
+                .into_bytes()
+        }
+        Err(_) => c.to_ascii_lowercase(),
+    }
+}
+
+/// Does `c` name Git's own directory on some file system (any case, any
+/// Unicode form, `GIT~1` as NTFS spells it)?
+fn names_git_dir(c: &[u8]) -> bool {
+    let k = fold_component(c);
+    k == b".git" || k == b"git~1"
+}
+
 /// Decide over all entries `(path, mode)` of a source: every path is safe,
 /// every mode is allowed, no path appears twice, and none lies below another
 /// entry (a file or a symlink, which would make the write go through it).
+/// "Twice" and "below" are decided on folded names (see [`fold_component`]):
+/// `Link` and `link`, or a name in NFC and in NFD, are one path on the file
+/// systems that fold.
 pub fn check_entries<'a>(
     entries: impl IntoIterator<Item = (&'a [u8], u32)>,
 ) -> Result<(), EntryViolation> {
     let all: Vec<(&[u8], u32)> = entries.into_iter().collect();
-    let mut seen: BTreeSet<&[u8]> = BTreeSet::new();
+    let mut seen: BTreeSet<Vec<u8>> = BTreeSet::new();
     for (p, mode) in &all {
         let fail = |why| EntryViolation {
             path: p.to_vec(),
@@ -104,21 +136,40 @@ pub fn check_entries<'a>(
         };
         check_rel_path(p).map_err(fail)?;
         check_mode(*mode).map_err(fail)?;
-        if !seen.insert(p) {
+        if !seen.insert(fold_path(p)) {
             return Err(fail(Violation::Duplicate));
         }
     }
     for (p, _) in &all {
-        for (i, b) in p.iter().enumerate() {
-            if *b == b'/' && seen.contains(&p[..i]) {
+        let mut key: Vec<u8> = vec![];
+        let mut end = 0;
+        let comps: Vec<&[u8]> = p.split(|b| *b == b'/').collect();
+        for c in &comps[..comps.len() - 1] {
+            if !key.is_empty() {
+                key.push(b'/');
+            }
+            key.extend(fold_component(c));
+            end += c.len() + usize::from(end > 0);
+            if seen.contains(&key) {
                 return Err(EntryViolation {
                     path: p.to_vec(),
-                    why: Violation::ThroughEntry(p[..i].to_vec()),
+                    why: Violation::ThroughEntry(p[..end].to_vec()),
                 });
             }
         }
     }
     Ok(())
+}
+
+fn fold_path(p: &[u8]) -> Vec<u8> {
+    let mut out: Vec<u8> = vec![];
+    for (i, c) in p.split(|b| *b == b'/').enumerate() {
+        if i > 0 {
+            out.push(b'/');
+        }
+        out.extend(fold_component(c));
+    }
+    out
 }
 
 #[cfg(test)]
@@ -162,6 +213,10 @@ mod tests {
         assert_eq!(rel("a/.git/hooks/x"), Err(Violation::GitDir));
         assert_eq!(rel(".GIT/config"), Err(Violation::GitDir));
         assert_eq!(rel("sub/.Git"), Err(Violation::GitDir));
+        // names HFS+ and NTFS fold to Git's directory
+        assert_eq!(rel(".g\u{200c}it/config"), Err(Violation::GitDir));
+        assert_eq!(rel("GIT~1/config"), Err(Violation::GitDir));
+        assert_eq!(rel(".gitx"), Ok(()));
     }
 
     #[test]
@@ -226,5 +281,38 @@ mod tests {
         // a sibling that merely shares a prefix is fine
         assert_eq!(entries(&[("ab", MODE_FILE), ("a/b", MODE_FILE)]), Ok(()));
         assert_eq!(entries(&[("a", MODE_FILE), ("a.b/c", MODE_FILE)]), Ok(()));
+    }
+
+    #[test]
+    fn names_that_a_folding_file_system_merges_are_one_path() {
+        // case
+        let e = entries(&[("Link", MODE_SYMLINK), ("link", MODE_FILE)]).unwrap_err();
+        assert_eq!(e.why, Violation::Duplicate);
+        // the classic: a symlink, then a file through it under another case
+        let e = entries(&[("Link", MODE_SYMLINK), ("link/x", MODE_FILE)]).unwrap_err();
+        assert_eq!(e.why, Violation::ThroughEntry(b"link".to_vec()));
+        let e = entries(&[
+            ("link/x", MODE_FILE),
+            ("d/Link", MODE_FILE),
+            ("LINK", MODE_FILE),
+        ])
+        .unwrap_err();
+        assert_eq!(e.why, Violation::ThroughEntry(b"link".to_vec()));
+        // Unicode form: "e" + combining acute against the precomposed letter
+        let nfd = "caf\u{65}\u{301}";
+        let nfc = "caf\u{e9}";
+        let e = entries(&[(nfd, MODE_FILE), (nfc, MODE_FILE)]).unwrap_err();
+        assert_eq!(e.why, Violation::Duplicate);
+        let e = entries(&[(nfd, MODE_SYMLINK), (&format!("{nfc}/x"), MODE_FILE)]).unwrap_err();
+        assert_eq!(e.why, Violation::ThroughEntry(nfc.as_bytes().to_vec()));
+        // both at once
+        let e = entries(&[("CAF\u{c9}", MODE_FILE), (nfc, MODE_FILE)]).unwrap_err();
+        assert_eq!(e.why, Violation::Duplicate);
+        // non-UTF-8 names are folded by ASCII case only, and never panic
+        let e =
+            check_entries([(&b"\xffA"[..], MODE_FILE), (&b"\xffa"[..], MODE_FILE)]).unwrap_err();
+        assert_eq!(e.why, Violation::Duplicate);
+        // different names stay different
+        assert_eq!(entries(&[("a", MODE_FILE), ("b/a", MODE_FILE)]), Ok(()));
     }
 }
