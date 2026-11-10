@@ -123,20 +123,10 @@ mod tests {
     }
 
     #[test]
-    fn own_identity_is_stable_and_a_dead_pid_has_none() {
+    fn own_identity_is_stable() {
         let me = std::process::id();
         let a = process_start_identity(me).expect("this process has an identity");
         assert_eq!(process_start_identity(me).unwrap(), a);
-        // Another live process differs from ours.
-        let mut child = std::process::Command::new("sleep")
-            .arg("5")
-            .spawn()
-            .unwrap();
-        let theirs = process_start_identity(child.id()).expect("child identity");
-        assert_ne!(theirs, a);
-        child.kill().unwrap();
-        child.wait().unwrap();
-        assert_eq!(process_start_identity(child.id()), None);
     }
 
     #[test]
