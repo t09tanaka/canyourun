@@ -17,6 +17,9 @@ want = {
     "src/config/parse.rs",
     "src/config/paths.rs",
     "src/config/resolve.rs",
+    "src/source/safety.rs",
+    "src/source/classify.rs",
+    "src/source/diff.rs",
 }
 seen = set()
 bad = []

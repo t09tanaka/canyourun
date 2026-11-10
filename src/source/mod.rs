@@ -13,12 +13,13 @@
 //! `spawn_blocking`.
 
 pub mod classify;
+mod commit;
 pub mod diff;
 pub mod manifest;
 pub mod safety;
 pub mod store;
 
-use crate::error::ApiError;
+use crate::error::{ApiError, ErrorCode};
 use crate::ids::RunId;
 use local_ci::source::{capture_directory, capture_source, CaptureOptions, Hook, SourceKind};
 use local_ci::ExecContext;
@@ -33,6 +34,8 @@ pub use store::{Inventory, SourceStore, TransferPlan};
 pub enum SourceRequest {
     /// The repository containing `dir`, as it is now (the default).
     Worktree { dir: PathBuf },
+    /// The commit `rev` of the repository containing `dir`, as committed.
+    Commit { dir: PathBuf, rev: String },
     /// A directory that is not a Git repository.
     Directory { dir: PathBuf },
 }
@@ -41,6 +44,7 @@ impl SourceRequest {
     pub fn kind(&self) -> SourceKind {
         match self {
             SourceRequest::Worktree { .. } => SourceKind::Worktree,
+            SourceRequest::Commit { .. } => SourceKind::Commit,
             SourceRequest::Directory { .. } => SourceKind::Directory,
         }
     }
@@ -90,14 +94,30 @@ pub fn capture(
         max_attempts: classify::attempt_budget(params.max_attempts),
         hook: params.hook.clone(),
     };
+    let ci_err = |e: anyhow::Error| classify::api_error_of(&e);
     let snap = match request {
-        SourceRequest::Worktree { dir } => capture_source(&ctx, dir, &opts),
-        SourceRequest::Directory { dir } => capture_directory(&ctx, dir, &opts),
-    }
-    .map_err(|e| classify::api_error_of(&e))?;
+        SourceRequest::Worktree { dir } => capture_source(&ctx, dir, &opts).map_err(ci_err)?,
+        SourceRequest::Commit { dir, rev } => {
+            let co = commit::checkout(
+                env,
+                &store.root().join("tmp"),
+                dir,
+                rev,
+                params.base.as_deref(),
+            )
+            .map_err(|e| ApiError::new(ErrorCode::InvalidInput, format!("{e:#}")))?;
+            // the scratch repository has the base as a commit, not as a ref
+            let o = CaptureOptions {
+                base: co.base.clone(),
+                ..opts
+            };
+            capture_source(&ctx, &co.cwd, &o).map_err(ci_err)?
+        }
+        SourceRequest::Directory { dir } => capture_directory(&ctx, dir, &opts).map_err(ci_err)?,
+    };
     let manifest = SourceManifest::from_ci(&snap.manifest, request.kind()).ok_or_else(|| {
         ApiError::new(
-            crate::error::ErrorCode::Internal,
+            ErrorCode::Internal,
             format!("unexpected source id {}", snap.manifest.source_id),
         )
     })?;
@@ -121,12 +141,8 @@ pub fn capture_for_run(
     let internal = |e: anyhow::Error| classify::api_error_of(&e);
     if let Some(id) = store.source_of_run(run).map_err(internal)? {
         if let Some(m) = store.manifest(&id).map_err(internal)? {
-            let manifest = SourceManifest::from_ci(&m, request.kind()).ok_or_else(|| {
-                ApiError::new(
-                    crate::error::ErrorCode::Internal,
-                    format!("bad source id {id}"),
-                )
-            })?;
+            let manifest = SourceManifest::from_ci(&m, request.kind())
+                .ok_or_else(|| ApiError::new(ErrorCode::Internal, format!("bad source id {id}")))?;
             return Ok(Captured {
                 manifest,
                 warnings: vec![],
@@ -139,15 +155,12 @@ pub fn capture_for_run(
         .map_err(internal)?;
     if bound != got.manifest.ci_source_id {
         // another caller bound this run first: its source is the run's
-        let m = store.manifest(&bound).map_err(internal)?.ok_or_else(|| {
-            ApiError::new(crate::error::ErrorCode::Internal, "bound source is missing")
-        })?;
-        let manifest = SourceManifest::from_ci(&m, request.kind()).ok_or_else(|| {
-            ApiError::new(
-                crate::error::ErrorCode::Internal,
-                format!("bad source id {bound}"),
-            )
-        })?;
+        let m = store
+            .manifest(&bound)
+            .map_err(internal)?
+            .ok_or_else(|| ApiError::new(ErrorCode::Internal, "bound source is missing"))?;
+        let manifest = SourceManifest::from_ci(&m, request.kind())
+            .ok_or_else(|| ApiError::new(ErrorCode::Internal, format!("bad source id {bound}")))?;
         return Ok(Captured {
             manifest,
             warnings: got.warnings,
