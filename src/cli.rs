@@ -3,15 +3,8 @@
 use clap::{Args, Parser, Subcommand};
 use serde::Serialize;
 
-/// Process exit codes. The single definition site.
-pub mod exit {
-    /// Success.
-    pub const SUCCESS: i32 = 0;
-    /// Invalid input (bad arguments); clap also exits with this code.
-    pub const INPUT_ERROR: i32 = 2;
-    /// The command is defined but not implemented yet.
-    pub const NOT_IMPLEMENTED: i32 = 70;
-}
+pub use crate::error::exit;
+use crate::error::ErrorCode;
 
 /// Version of the `--json` envelope.
 pub const SCHEMA_VERSION: u32 = 1;
@@ -173,7 +166,7 @@ pub struct WorkerArgs {
 
 #[derive(Debug, Serialize)]
 pub struct ErrorBody {
-    pub code: &'static str,
+    pub code: ErrorCode,
     pub message: String,
 }
 
@@ -191,7 +184,7 @@ impl Envelope {
             schema_version: SCHEMA_VERSION,
             ok: false,
             error: ErrorBody {
-                code: "NOT_IMPLEMENTED",
+                code: ErrorCode::NotImplemented,
                 message: "this command is not implemented yet".to_string(),
             },
         }
@@ -207,7 +200,7 @@ pub fn run(cli: Cli) -> i32 {
     } else {
         eprintln!("error: {}", envelope.error.message);
     }
-    exit::NOT_IMPLEMENTED
+    ErrorCode::NotImplemented.exit_code()
 }
 
 /// Entry point used by the binary: parse arguments, run, return the exit code.

@@ -52,13 +52,12 @@ jobs:
       - name: 100% line coverage on the listed pure modules
         run: ./scripts/coverage-gate.sh
 
-  # The target list is empty until pure modules exist; add files to PURE below
-  # (and to the coverage gate) as they land.
+  # Add files to PURE below (and to the coverage gate) as pure modules land.
   mutants-pure:
     name: mutation gate (pure modules)
     runs-on: ubuntu-latest
     env:
-      PURE: ""
+      PURE: "src/ids.rs src/state.rs src/error.rs src/wire.rs"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
