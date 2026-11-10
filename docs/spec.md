@@ -650,7 +650,7 @@ forecast responseの概念例：
     "execution_ms": 20000,
     "finish_in_ms": 50000,
     "confidence": "medium",
-    "runtime_source": "history",
+    "runtime_source": "measured",
     "conditional": true,
     "assumptions": ["no new external load"]
   }

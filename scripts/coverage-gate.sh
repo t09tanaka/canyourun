@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # 100% line coverage for the pure modules, measured over the whole test suite.
-# The list is empty for now; add a file here when a module becomes pure and tested.
+# Add a file to `want` when a module becomes pure and tested.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 cargo llvm-cov --json --output-path target/llvm-cov.json >/dev/null
@@ -8,7 +8,7 @@ python3 - <<'PY'
 import json, os, sys
 root = os.getcwd()
 data = json.load(open("target/llvm-cov.json"))
-want = set()  # e.g. "src/state.rs"
+want = {"src/ids.rs", "src/state.rs", "src/error.rs", "src/wire.rs"}
 seen = set()
 bad = []
 for f in data["data"][0]["files"]:
