@@ -377,8 +377,8 @@ impl Workspaces {
     /// files stay), and the index becomes the original's `index_tree`. When
     /// the clone has no such tree yet, the index is the original HEAD's tree
     /// instead and the result says so (`false`, with a warning). The bundle
-    /// carries `index_tree` once local-ci's source bundles do, after which this
-    /// is always `true`.
+    /// carries `index_tree` (local-ci 0.10), so this is `true` unless the
+    /// source predates that or the object is missing.
     fn reproduce_head(
         &self,
         repo: &ObjectsRepo,

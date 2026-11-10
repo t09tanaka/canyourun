@@ -10,7 +10,7 @@ use local_ci::source::SecretSpec;
 use proto::*;
 use remote_task_runner::error::{BlockedReason, ErrorCode};
 use remote_task_runner::ids::*;
-use remote_task_runner::secrets::capture::{capture_run, SecretInputs};
+use remote_task_runner::secrets::capture::{capture_run, run_bundle_path, SecretInputs};
 use remote_task_runner::secrets::key::ClusterKey;
 use remote_task_runner::secrets::place::WorkerSecrets;
 use remote_task_runner::secrets::plan::hex_encode;
@@ -477,14 +477,59 @@ fn assert_no_plaintext(dir: &Path) {
     assert!(files_holding(dir, hex_encode(TOK).as_bytes()).is_empty());
 }
 
-#[test]
-fn a_directory_capture_with_secret_files_is_refused_and_no_plaintext_reaches_the_snapshot() {
-    let tmp = common::tempdir().unwrap();
-    let state = tmp.path().join("state");
-    let dir = tmp.path().join("plain");
+/// A plain directory with a secret file and an ordinary one.
+fn plain_dir(tmp: &Path) -> PathBuf {
+    let dir = tmp.join("plain");
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(dir.join(".env"), ENV_TEXT).unwrap();
     std::fs::write(dir.join("code.txt"), "code\n").unwrap();
+    dir
+}
+
+#[test]
+fn a_directory_capture_keeps_declared_secret_files_out_of_the_snapshot_and_in_the_run_bundle() {
+    let tmp = common::tempdir().unwrap();
+    let state = tmp.path().join("state");
+    let dir = plain_dir(tmp.path());
+    let store = SourceStore::open(&state).unwrap();
+    let vault = Vault::open(&state).unwrap();
+    let key = ClusterKey::from_bytes(vec![5; 32]).unwrap();
+    let req = SourceRequest::Directory { dir: dir.clone() };
+    let run = RunId::generate();
+    let got = capture_run(
+        &plain_env(&state),
+        &store,
+        &vault,
+        &SecretInputs {
+            key: &key,
+            declared: &[spec(".env")],
+        },
+        &run,
+        &req,
+        &CaptureParams::default(),
+    )
+    .unwrap();
+    assert_eq!(paths(&got), vec![".env".to_string()]);
+    // not in the source objects, nor anywhere in the store
+    assert_no_plaintext(&state.join("sources"));
+    // in the run's bundle, which is the vault's copy only: the store's per-run
+    // file is gone once it is adopted
+    assert!(!run_bundle_path(&store, &run).exists());
+    let held = vault.load(&run, &got.manifest.secret_files, &key).unwrap();
+    assert_eq!(held.files.len(), 1);
+    // removed when the run is over
+    vault.erase(&run).unwrap();
+    assert!(!vault.has(&run));
+    assert_no_plaintext(&state);
+    // the original is untouched
+    assert_eq!(std::fs::read_to_string(dir.join(".env")).unwrap(), ENV_TEXT);
+}
+
+#[test]
+fn a_directory_capture_still_refuses_worktreeinclude_patterns_it_cannot_evaluate() {
+    let tmp = common::tempdir().unwrap();
+    let state = tmp.path().join("state");
+    let dir = plain_dir(tmp.path());
     let store = SourceStore::open(&state).unwrap();
     let vault = Vault::open(&state).unwrap();
     let key = ClusterKey::from_bytes(vec![5; 32]).unwrap();
@@ -503,60 +548,203 @@ fn a_directory_capture_with_secret_files_is_refused_and_no_plaintext_reaches_the
             &CaptureParams::default(),
         )
     };
-    // declared
-    let err = run(&[spec(".env")]).unwrap_err();
-    assert_eq!(err.code, ErrorCode::InvalidInput);
-    assert!(err.message.contains("not supported"), "{}", err.message);
-    // a .worktreeinclude with a pattern
     std::fs::write(dir.join(".worktreeinclude"), "# comment\n.env\n").unwrap();
     assert_eq!(run(&[]).unwrap_err().code, ErrorCode::InvalidInput);
     assert_no_plaintext(&state);
     // a .worktreeinclude with nothing in it names no file
     std::fs::write(dir.join(".worktreeinclude"), "# nothing\n\n").unwrap();
-    let ok = run(&[]).unwrap();
-    assert!(ok.manifest.secret_files.is_empty());
+    assert!(run(&[]).unwrap().manifest.secret_files.is_empty());
     // no declaration at all is the ordinary directory capture
     std::fs::remove_file(dir.join(".worktreeinclude")).unwrap();
     assert!(run(&[]).is_ok());
 }
 
 #[test]
-fn a_commit_capture_with_secret_files_is_refused_not_sent_without_them() {
+fn a_secret_file_over_the_limit_is_invalid_input_and_leaves_no_bundle() {
+    let tmp = common::tempdir().unwrap();
+    let state = tmp.path().join("state");
+    let dir = plain_dir(tmp.path());
+    std::fs::write(dir.join("big.env"), vec![b'a'; 2 * 1024 * 1024]).unwrap();
+    let store = SourceStore::open(&state).unwrap();
+    let vault = Vault::open(&state).unwrap();
+    let key = ClusterKey::from_bytes(vec![5; 32]).unwrap();
+    let run = RunId::generate();
+    let err = capture_run(
+        &plain_env(&state),
+        &store,
+        &vault,
+        &SecretInputs {
+            key: &key,
+            declared: &[spec(".env"), spec("big.env")],
+        },
+        &run,
+        &SourceRequest::Directory { dir },
+        &CaptureParams::default(),
+    )
+    .unwrap_err();
+    assert_eq!(err.code, ErrorCode::InvalidInput, "{}", err.message);
+    assert!(err.message.contains("big.env"), "{}", err.message);
+    assert!(!run_bundle_path(&store, &run).exists());
+    assert!(!vault.has(&run));
+    assert_no_plaintext(&state);
+}
+
+#[test]
+fn a_commit_capture_sends_the_secret_files_of_the_original_worktree() {
+    // .worktreeinclude matches .env; config/a.local is declared
     let fx = fixture(Some(".env\n"));
     let commit = SourceRequest::Commit {
         dir: fx.repo.clone(),
         rev: "HEAD".into(),
     };
-    // .worktreeinclude matches an ignored file in the original worktree
-    let err = capture_with(&fx, &RunId::generate(), &[], &commit).unwrap_err();
-    assert_eq!(err.code, ErrorCode::InvalidInput);
-    assert!(err.message.contains("not supported"), "{}", err.message);
-    // declared
+    let run = RunId::generate();
+    let got = capture_with(&fx, &run, &[spec("config/a.local")], &commit).unwrap();
+    let mut p = paths(&got);
+    p.sort();
+    assert_eq!(p, vec![".env".to_string(), "config/a.local".to_string()]);
+    assert_no_plaintext(&fx.state.join("sources"));
+    let vault = Vault::open(&fx.state).unwrap();
+    let held = vault
+        .load(&run, &got.manifest.secret_files, &fx.key)
+        .unwrap();
+    assert_eq!(held.files.len(), 2);
+    let store = SourceStore::open(&fx.state).unwrap();
+    assert!(!run_bundle_path(&store, &run).exists());
+    // removed when the run is over
+    vault.erase(&run).unwrap();
+    assert_no_plaintext(&fx.state);
+    // neither declared nor matched: an ordinary commit capture
     let fx2 = fixture(None);
     let commit2 = SourceRequest::Commit {
         dir: fx2.repo.clone(),
         rev: "HEAD".into(),
     };
-    let err = capture_with(&fx2, &RunId::generate(), &[spec(".env")], &commit2).unwrap_err();
-    assert_eq!(err.code, ErrorCode::InvalidInput);
-    // neither: an ordinary commit capture
     let ok = capture_with(&fx2, &RunId::generate(), &[], &commit2).unwrap();
     assert!(ok.manifest.secret_files.is_empty());
-    assert_no_plaintext(&fx.state);
     assert_no_plaintext(&fx2.state);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_commit_capture_refuses_a_symlinked_or_oversized_secret_in_the_original_worktree() {
+    let fx = fixture(Some(".env\n"));
+    let commit = SourceRequest::Commit {
+        dir: fx.repo.clone(),
+        rev: "HEAD".into(),
+    };
+    let store = SourceStore::open(&fx.state).unwrap();
+    // an oversized secret file
+    std::fs::write(fx.repo.join("big.env"), vec![b'a'; 2 * 1024 * 1024]).unwrap();
+    let run = RunId::generate();
+    let err = capture_with(&fx, &run, &[spec("big.env")], &commit).unwrap_err();
+    assert_eq!(err.code, ErrorCode::InvalidInput, "{}", err.message);
+    assert!(!run_bundle_path(&store, &run).exists());
+    assert_no_plaintext(&fx.state);
+    std::fs::remove_file(fx.repo.join("big.env")).unwrap();
+    // a symlink standing where a secret file is
+    std::fs::write(fx.repo.join("target.txt"), "x").unwrap();
+    std::os::unix::fs::symlink("target.txt", fx.repo.join("link.env")).unwrap();
+    let run = RunId::generate();
+    let err = capture_with(&fx, &run, &[spec("link.env")], &commit).unwrap_err();
+    assert_eq!(err.code, ErrorCode::InvalidInput, "{}", err.message);
+    assert!(!run_bundle_path(&store, &run).exists());
+    assert_no_plaintext(&fx.state);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_directory_capture_refuses_a_symlinked_secret_file() {
+    let tmp = common::tempdir().unwrap();
+    let state = tmp.path().join("state");
+    let dir = plain_dir(tmp.path());
+    // the undeclared .env would be an ordinary file of the snapshot
+    std::fs::remove_file(dir.join(".env")).unwrap();
+    std::os::unix::fs::symlink("code.txt", dir.join("link.env")).unwrap();
+    let store = SourceStore::open(&state).unwrap();
+    let vault = Vault::open(&state).unwrap();
+    let key = ClusterKey::from_bytes(vec![5; 32]).unwrap();
+    let run = RunId::generate();
+    let err = capture_run(
+        &plain_env(&state),
+        &store,
+        &vault,
+        &SecretInputs {
+            key: &key,
+            declared: &[spec("link.env")],
+        },
+        &run,
+        &SourceRequest::Directory { dir },
+        &CaptureParams::default(),
+    )
+    .unwrap_err();
+    assert_eq!(err.code, ErrorCode::InvalidInput, "{}", err.message);
+    assert!(!run_bundle_path(&store, &run).exists());
+    assert!(!vault.has(&run));
+    assert_no_plaintext(&state);
+}
+
+#[test]
+fn two_runs_of_one_commit_each_get_their_own_bundle_and_a_leftover_at_the_path_is_replaced() {
+    let fx = fixture(Some(".env\n"));
+    let commit = SourceRequest::Commit {
+        dir: fx.repo.clone(),
+        rev: "HEAD".into(),
+    };
+    let store = SourceStore::open(&fx.state).unwrap();
+    let (r1, r2) = (RunId::generate(), RunId::generate());
+    std::fs::create_dir_all(store.root().join("secrets")).unwrap();
+    // a crash left something at the second run's path
+    std::fs::write(run_bundle_path(&store, &r2), "leftover").unwrap();
+    let mk = |run: &RunId| CaptureParams {
+        secret_files: vec![spec(".env")],
+        secret_key: fx.key.as_bytes().to_vec(),
+        secret_bundle: Some(run_bundle_path(&store, run)),
+        ..CaptureParams::default()
+    };
+    let a = remote_task_runner::source::capture_for_run(&fx.env(), &store, &r1, &commit, &mk(&r1))
+        .unwrap();
+    let b = remote_task_runner::source::capture_for_run(&fx.env(), &store, &r2, &commit, &mk(&r2))
+        .unwrap();
+    assert_eq!(a.manifest.ci_source_id, b.manifest.ci_source_id);
+    let (pa, pb) = (a.secrets.unwrap(), b.secrets.unwrap());
+    assert_eq!(pa, run_bundle_path(&store, &r1));
+    assert_eq!(pb, run_bundle_path(&store, &r2));
+    let hex = hex_encode(TOK);
+    for p in [&pa, &pb] {
+        let text = std::fs::read_to_string(p).unwrap();
+        assert!(text.contains(&hex), "the bundle holds the secret");
+    }
+    // the source objects do not
+    assert_no_plaintext(&fx.state.join("sources/git"));
+}
+
+#[test]
+fn the_sweep_also_removes_the_temporary_files_of_a_killed_bundle_write() {
+    let fx = fixture(None);
+    let store = SourceStore::open(&fx.state).unwrap();
+    let dir = store.root().join("secrets");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join(".secrets.tmp-4242-1"), "plain secret").unwrap();
+    std::fs::write(dir.join("unrelated.txt"), "x").unwrap();
+    let n = remote_task_runner::secrets::capture::sweep_store_copies(&store, |_| true).unwrap();
+    assert_eq!(n, 1);
+    assert!(!dir.join(".secrets.tmp-4242-1").exists());
+    assert!(dir.join("unrelated.txt").exists());
 }
 
 #[test]
 fn a_bundle_the_run_could_not_adopt_is_adopted_by_the_next_call_after_its_hmac_is_checked() {
     let fx = fixture(Some(".env\n"));
     let store = SourceStore::open(&fx.state).unwrap();
+    let run = RunId::generate();
+    std::fs::create_dir_all(store.root().join("secrets")).unwrap();
     let params = CaptureParams {
         secret_files: vec![spec(".env")],
         secret_key: fx.key.as_bytes().to_vec(),
+        secret_bundle: Some(run_bundle_path(&store, &run)),
         ..CaptureParams::default()
     };
     // a capture that was bound to its run and then lost the process before the adoption
-    let run = RunId::generate();
     let left = remote_task_runner::source::capture_for_run(
         &fx.env(),
         &store,
@@ -583,6 +771,10 @@ fn a_bundle_the_run_could_not_adopt_is_adopted_by_the_next_call_after_its_hmac_i
 
     // the same, but the copy was changed: refused, and nothing stays anywhere
     let run2 = RunId::generate();
+    let params = CaptureParams {
+        secret_bundle: Some(run_bundle_path(&store, &run2)),
+        ..params
+    };
     let left = remote_task_runner::source::capture_for_run(
         &fx.env(),
         &store,

@@ -906,19 +906,16 @@ fn a14_unpushed_commits_travel_in_a_bundle_and_a_worker_never_fetches_origin() {
         ),
         "unpushed 2\nunpushed 1"
     );
-    // Known gap (L1b, local-ci's bundle): the index tree is not in the bundle,
-    // so a worker cannot reproduce `git diff --cached` from the bundle alone.
-    // This asserts the gap on purpose: when local-ci carries the index tree,
-    // this assert fails, and that is the signal to turn it into
-    // `assert!(reachable)` and to start using the index tree on the worker.
+    // local-ci 0.10 puts the index tree in the bundle (as a commit's tree), so
+    // a worker can reproduce `git diff --cached`
     let index_tree = m.index_tree.clone().unwrap();
     let reachable = git_cmd(&worker, &["cat-file", "-e", &index_tree])
         .status()
         .unwrap()
         .success();
     assert!(
-        !reachable,
-        "index_tree {index_tree} is now in the bundle: L1b is fixed, use it"
+        reachable,
+        "index_tree {index_tree} is not in the worker's clone after the bundle"
     );
 }
 

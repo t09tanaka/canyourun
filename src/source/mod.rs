@@ -72,6 +72,11 @@ pub struct CaptureParams {
     pub secret_files: Vec<SecretSpec>,
     /// The cluster key the secret files' HMACs are made with.
     pub secret_key: Vec<u8>,
+    /// Where local-ci writes the secret bundle: a path of the run, so that two
+    /// runs of the same source never share a file. Created, never replaced
+    /// (the directory must exist). `None`: the store's default, keyed by
+    /// source.
+    pub secret_bundle: Option<PathBuf>,
 }
 
 impl std::fmt::Debug for CaptureParams {
@@ -83,6 +88,7 @@ impl std::fmt::Debug for CaptureParams {
             .field("exclude", &self.exclude)
             .field("max_attempts", &self.max_attempts)
             .field("secret_files", &self.secret_files)
+            .field("secret_bundle", &self.secret_bundle)
             .field("secret_key", &"<redacted>")
             .finish_non_exhaustive()
     }
@@ -117,6 +123,8 @@ pub fn capture(
         exclude: params.exclude.clone(),
         secret_files: params.secret_files.clone(),
         secret_key: params.secret_key.clone(),
+        secret_root: None,
+        secret_bundle: params.secret_bundle.clone(),
         max_attempts: classify::attempt_budget(params.max_attempts),
         hook: params.hook.clone(),
     };
@@ -133,8 +141,11 @@ pub fn capture(
             )
             .map_err(|e| ApiError::new(ErrorCode::InvalidInput, format!("{e:#}")))?;
             // the scratch repository has the base as a commit, not as a ref
+            // the clean checkout has no ignored files: the secret files are
+            // chosen and read in the worktree the commit came from
             let o = CaptureOptions {
                 base: co.base.clone(),
+                secret_root: Some(dir.clone()),
                 ..opts
             };
             capture_source(&ctx, &co.cwd, &o).map_err(ci_err)?
@@ -268,6 +279,20 @@ pub fn capture_for_run(
             secrets: None,
             warnings: vec![],
         });
+    }
+    // no record binds the run yet, so a bundle at its path is the leftover of
+    // a capture that did not get to bind: local-ci creates the file and never
+    // replaces one
+    if let Some(p) = &params.secret_bundle {
+        match std::fs::remove_file(p) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+                return Err(ApiError::new(
+                    ErrorCode::Internal,
+                    format!("secret bundle {}: {e}", p.display()),
+                ))
+            }
+            _ => {}
+        }
     }
     let got = capture(env, store, request, params)?;
     let record = RunRecord {
