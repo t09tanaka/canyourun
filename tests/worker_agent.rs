@@ -1061,7 +1061,9 @@ fn startup_runs_every_sweep_in_order_before_any_attempt_is_prepared() {
     );
 
     // One agent per state directory.
-    let second = Agent::start(f.cfg("boot-a"), f.host.clone());
+    let mut cfg = f.cfg("boot-a");
+    cfg.lock_wait_ms = 300;
+    let second = Agent::start(cfg, f.host.clone());
     assert_eq!(second.err().unwrap().code, ErrorCode::Conflict);
     // The refused start changed nothing: the sweeps did not run again.
     assert_eq!(f.host.count("store_copies"), 1);

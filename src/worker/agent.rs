@@ -72,6 +72,11 @@ pub struct AgentConfig {
     pub secret_wait_ms: u64,
     /// Pause before a supervisor that could not settle is started again.
     pub retry_ms: u64,
+    /// How long a start waits for the agent lock. A process that was forked
+    /// by the previous agent holds the lock's descriptor until its `exec`,
+    /// so the lock of an agent that just went away can look held for a
+    /// moment; a living agent holds it for good and the start is refused.
+    pub lock_wait_ms: u64,
     /// Files of ended attempts are kept this long (spec 13: seven days).
     pub retention_ms: u64,
     /// Without `ack_collected`, the protection ends this long after the end.
@@ -103,6 +108,7 @@ impl AgentConfig {
             retire_wait_ms: 2_000,
             secret_wait_ms: 60_000,
             retry_ms: 5_000,
+            lock_wait_ms: 2_000,
             retention_ms: crate::storage::DEFAULT_ACK_WAIT_MS,
             ack_wait_ms: crate::storage::DEFAULT_ACK_WAIT_MS,
         }
@@ -209,9 +215,7 @@ impl Agent {
                         .map_err(|e| internal("attempts directory", e))?;
                 }
                 Step::CoreDumps => host.disable_core_dumps()?,
-                Step::Lock => {
-                    lock = Some(ProcessLock::acquire(&cfg.state_dir, "agent.lock").map_err(api)?)
-                }
+                Step::Lock => lock = Some(acquire_lock(&cfg)?),
                 Step::Store => {
                     let s = WorkerStore::open(&cfg.state_dir, &cfg.worker_id).map_err(api)?;
                     let e = s.start_agent(now()).map_err(api)?;
@@ -1088,6 +1092,19 @@ impl Agent {
             disk_free_bytes: disk,
             draining: false,
         })
+    }
+}
+
+fn acquire_lock(cfg: &AgentConfig) -> Result<ProcessLock, ApiError> {
+    let mut waited = 0;
+    loop {
+        match ProcessLock::acquire(&cfg.state_dir, "agent.lock") {
+            Err(StorageError::Locked(_)) if waited < cfg.lock_wait_ms => {
+                std::thread::sleep(Duration::from_millis(50));
+                waited += 50;
+            }
+            other => return other.map_err(api),
+        }
     }
 }
 
