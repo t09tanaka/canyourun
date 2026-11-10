@@ -176,25 +176,25 @@ pub fn payload_hash<T: Serialize>(value: &T) -> Result<PayloadHash, CanonicalErr
 /// * `blob_put`: `data` is dropped; `digest`, `offset` and `total_size` stay.
 ///   Chunk bytes are verified against the blob digest, not by this hash.
 fn content_hash_input(request: &Request) -> Result<String, CanonicalError> {
-    let mut v = serde_json::to_value(request)?;
-    if let Value::Object(map) = &mut v {
-        map.remove("request_id");
-        match request {
-            Request::BlobPut(_) => {
-                map.remove("data");
-            }
-            Request::SecretBundlePut(r) => {
-                let files = r
-                    .files
-                    .iter()
-                    .map(|f| json!({"path": f.path, "hmac_digest": f.hmac_digest}))
-                    .collect();
-                map.insert("files".to_string(), Value::Array(files));
-            }
-            _ => {}
+    // every request serializes to a JSON object (tagged by `op`)
+    let mut map: serde_json::Map<String, Value> =
+        serde_json::from_value(serde_json::to_value(request)?)?;
+    map.remove("request_id");
+    match request {
+        Request::BlobPut(_) => {
+            map.remove("data");
         }
+        Request::SecretBundlePut(r) => {
+            let files = r
+                .files
+                .iter()
+                .map(|f| json!({"path": f.path, "hmac_digest": f.hmac_digest}))
+                .collect();
+            map.insert("files".to_string(), Value::Array(files));
+        }
+        _ => {}
     }
-    canonical_json(&v)
+    canonical_json(&Value::Object(map))
 }
 
 /// Hash of a request's content with the top-level `request_id` removed, so a
@@ -2556,11 +2556,8 @@ mod tests {
 
     #[test]
     fn get_result_carries_a_validated_termination() {
-        let resp = match responses().remove(11) {
-            Response::GetResult(r) => r,
-            other => panic!("{other:?}"),
-        };
-        let mut v = serde_json::to_value(&resp).unwrap();
+        let mut v = serde_json::to_value(&responses()[11]).unwrap();
+        assert_eq!(v["op"], "get_result");
         assert_eq!(v["termination"]["outcome"], "timed_out");
         assert!(v.get("outcome").is_none() && v.get("exit_code").is_none());
         v["termination"] = json!({"outcome": "timed_out"});
@@ -2625,10 +2622,8 @@ mod tests {
             k(3, 0).extends(applied),
             "a new epoch restarts the sequence"
         );
-        let req = match &requests()[6] {
-            Request::RenewLease(r) => r.clone(),
-            other => panic!("{other:?}"),
-        };
+        let v = serde_json::to_value(&requests()[6]).unwrap();
+        let req: RenewLeaseRequest = serde_json::from_value(v).unwrap();
         assert_eq!(req.key(), k(3, 7));
         let v = serde_json::to_value(k(3, 7)).unwrap();
         assert_eq!(v, json!({"coordinator_epoch": 3, "lease_seq": 7}));
