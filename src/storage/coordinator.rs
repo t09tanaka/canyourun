@@ -1,4 +1,4 @@
-//! The coordinator database: cluster and epoch, runs, homework, attempts,
+//! The coordinator database: cluster and epoch, runs, task, attempts,
 //! placement, retire tombstones, matrix permits, the event journal, artifact
 //! receipts and the references GC works on.
 
@@ -10,8 +10,8 @@ use super::{
     StorageError, DEFAULT_GC_BATCH,
 };
 use crate::ids::{
-    AttemptId, ClusterId, CoordinatorEpoch, CoordinatorId, Digest, Generation, HomeworkId, IdError,
-    ManifestDigest, PayloadHash, PermitId, RunId, SourceId, WorkerId,
+    AttemptId, ClusterId, CoordinatorEpoch, CoordinatorId, Digest, Generation, IdError,
+    ManifestDigest, PayloadHash, PermitId, RunId, SourceId, TaskId, WorkerId,
 };
 use crate::state::{AttemptState, Collection, Observation, Receipt, Receipts, Termination};
 use rusqlite::{params, Connection, OptionalExtension, Row};
@@ -29,7 +29,7 @@ fn id<T>(what: &str, r: std::result::Result<T, IdError>) -> Result<T> {
 #[derive(Debug, Clone)]
 pub struct NewAttempt {
     pub attempt_id: AttemptId,
-    pub homework_id: HomeworkId,
+    pub task_id: TaskId,
     pub worker_id: WorkerId,
     pub payload_hash: PayloadHash,
     /// A matrix permit to bind to this attempt in the same commit.
@@ -39,7 +39,7 @@ pub struct NewAttempt {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AttemptRecord {
     pub attempt_id: AttemptId,
-    pub homework_id: HomeworkId,
+    pub task_id: TaskId,
     pub worker_id: WorkerId,
     pub generation: Generation,
     pub payload_hash: PayloadHash,
@@ -59,7 +59,7 @@ pub struct AttemptRecord {
     pub terminal_at_ms: Option<u64>,
 }
 
-const ATTEMPT_COLS: &str = "attempt_id, homework_id, worker_id, generation, payload_hash,
+const ATTEMPT_COLS: &str = "attempt_id, task_id, worker_id, generation, payload_hash,
     coordinator_epoch, permit_id, state, termination_json, receipts_json, observation,
     cancel_requested_at_ms, retired, created_at_ms, terminal_at_ms, retired_at_ms,
     collection_failed_at_ms";
@@ -92,7 +92,7 @@ fn attempt_from_row(r: &Row<'_>) -> Result<AttemptRecord> {
         .map_err(|e| StorageError::Corrupt(e.to_string()))?;
     Ok(AttemptRecord {
         attempt_id: id("attempt_id", AttemptId::parse(&r.get::<_, String>(0)?))?,
-        homework_id: id("homework_id", HomeworkId::parse(&r.get::<_, String>(1)?))?,
+        task_id: id("task_id", TaskId::parse(&r.get::<_, String>(1)?))?,
         worker_id: id("worker_id", WorkerId::parse(&r.get::<_, String>(2)?))?,
         generation: Generation(to_u64(r.get(3)?)?),
         payload_hash: id("payload_hash", PayloadHash::parse(&r.get::<_, String>(4)?))?,
@@ -127,7 +127,7 @@ fn load_attempt(conn: &Connection, attempt_id: &str) -> Result<Option<AttemptRec
 fn run_of(conn: &Connection, attempt_id: &str) -> Result<Option<String>> {
     Ok(conn
         .query_row(
-            "SELECT h.run_id FROM attempt a JOIN homework h USING (homework_id)
+            "SELECT h.run_id FROM attempt a JOIN task h USING (task_id)
              WHERE a.attempt_id = ?1",
             [attempt_id],
             |r| r.get(0),
@@ -152,7 +152,7 @@ pub struct Permit {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Placement {
     pub placement_id: u64,
-    pub homework_id: HomeworkId,
+    pub task_id: TaskId,
     pub worker_id: WorkerId,
     pub attempt_id: Option<AttemptId>,
     pub demand: Value,
@@ -367,23 +367,19 @@ impl CoordinatorStore {
         })
     }
 
-    pub fn create_homework(
+    pub fn create_task(
         &self,
-        homework_id: &HomeworkId,
+        task_id: &TaskId,
         run_id: &RunId,
         spec: &Value,
         at_ms: u64,
     ) -> Result<()> {
-        let (hw, run, spec) = (
-            homework_id.to_string(),
-            run_id.to_string(),
-            spec.to_string(),
-        );
+        let (task, run, spec) = (task_id.to_string(), run_id.to_string(), spec.to_string());
         self.db.write(move |tx| {
             tx.execute(
-                "INSERT INTO homework (homework_id, run_id, spec_json, created_at_ms)
+                "INSERT INTO task (task_id, run_id, spec_json, created_at_ms)
                  VALUES (?1,?2,?3,?4)",
-                params![hw, run, spec, to_i64(at_ms)?],
+                params![task, run, spec, to_i64(at_ms)?],
             )?;
             Ok(())
         })
@@ -391,27 +387,25 @@ impl CoordinatorStore {
 
     // ------------------------------------------------------------- attempts
 
-    /// Create the next attempt of a homework in `Accepted`, with the
+    /// Create the next attempt of a task in `Accepted`, with the
     /// `coordinator accepted` receipt. Fails with `LiveAttemptExists` while an
-    /// earlier attempt of the same homework is neither terminal nor confirmed
+    /// earlier attempt of the same task is neither terminal nor confirmed
     /// retired: a new attempt needs the old one's end (or retire) first.
     pub fn create_attempt(&self, new: NewAttempt, at_ms: u64) -> Result<AttemptRecord> {
         let epoch = self.epoch;
         self.db.write(move |tx| {
-            let hw = new.homework_id.to_string();
+            let task = new.task_id.to_string();
             let run = tx
-                .query_row(
-                    "SELECT run_id FROM homework WHERE homework_id = ?1",
-                    [&hw],
-                    |r| r.get::<_, String>(0),
-                )
+                .query_row("SELECT run_id FROM task WHERE task_id = ?1", [&task], |r| {
+                    r.get::<_, String>(0)
+                })
                 .optional()?
-                .ok_or_else(|| not_found(format!("homework {hw}")))?;
+                .ok_or_else(|| not_found(format!("task {task}")))?;
             let live: Option<String> = tx
                 .query_row(
                     "SELECT attempt_id FROM attempt
-                     WHERE homework_id = ?1 AND state <> 'terminal' AND retired = 0",
-                    [&hw],
+                     WHERE task_id = ?1 AND state <> 'terminal' AND retired = 0",
+                    [&task],
                     |r| r.get(0),
                 )
                 .optional()?;
@@ -419,20 +413,20 @@ impl CoordinatorStore {
                 return Err(StorageError::LiveAttemptExists(live));
             }
             let generation: i64 = tx.query_row(
-                "SELECT COALESCE(MAX(generation), 0) + 1 FROM attempt WHERE homework_id = ?1",
-                [&hw],
+                "SELECT COALESCE(MAX(generation), 0) + 1 FROM attempt WHERE task_id = ?1",
+                [&task],
                 |r| r.get(0),
             )?;
             let mut receipts = Receipts::default();
             receipts.mark(Receipt::CoordinatorAccepted, at_ms);
             let aid = new.attempt_id.to_string();
             tx.execute(
-                "INSERT INTO attempt (attempt_id, homework_id, worker_id, generation, payload_hash,
+                "INSERT INTO attempt (attempt_id, task_id, worker_id, generation, payload_hash,
                     coordinator_epoch, permit_id, state, receipts_json, created_at_ms)
                  VALUES (?1,?2,?3,?4,?5,?6,?7,'accepted',?8,?9)",
                 params![
                     aid,
-                    hw,
+                    task,
                     new.worker_id.as_str(),
                     generation,
                     new.payload_hash.as_str(),
@@ -594,7 +588,7 @@ impl CoordinatorStore {
     }
 
     /// The worker confirmed the attempt never started or has stopped. Needs
-    /// the tombstone from [`Self::begin_retire`]; frees the homework for a new
+    /// the tombstone from [`Self::begin_retire`]; frees the task for a new
     /// attempt. The tombstone itself stays.
     pub fn confirm_retire(&self, attempt_id: &AttemptId, at_ms: u64) -> Result<()> {
         let aid = attempt_id.to_string();
@@ -646,20 +640,20 @@ impl CoordinatorStore {
     /// until the worker's acceptance is acknowledged.
     pub fn record_placement(
         &self,
-        homework_id: &HomeworkId,
+        task_id: &TaskId,
         worker_id: &WorkerId,
         attempt_id: Option<&AttemptId>,
         demand: &Value,
         at_ms: u64,
     ) -> Result<u64> {
-        let (hw, w) = (homework_id.to_string(), worker_id.to_string());
+        let (task, w) = (task_id.to_string(), worker_id.to_string());
         let a = attempt_id.map(ToString::to_string);
         let demand = demand.to_string();
         self.db.write(move |tx| {
             tx.execute(
-                "INSERT INTO placement (homework_id, worker_id, attempt_id, demand_json, created_at_ms)
+                "INSERT INTO placement (task_id, worker_id, attempt_id, demand_json, created_at_ms)
                  VALUES (?1,?2,?3,?4,?5)",
-                params![hw, w, a, demand, to_i64(at_ms)?],
+                params![task, w, a, demand, to_i64(at_ms)?],
             )?;
             to_u64(tx.last_insert_rowid())
         })
@@ -682,7 +676,7 @@ impl CoordinatorStore {
     pub fn unacked_demand(&self) -> Result<Vec<Placement>> {
         self.db.call(|c| {
             let mut s = c.prepare(
-                "SELECT placement_id, homework_id, worker_id, attempt_id, demand_json,
+                "SELECT placement_id, task_id, worker_id, attempt_id, demand_json,
                         created_at_ms, acked_at_ms
                  FROM placement WHERE acked_at_ms IS NULL ORDER BY placement_id",
             )?;
@@ -699,10 +693,10 @@ impl CoordinatorStore {
             })?;
             let mut out = Vec::new();
             for row in rows {
-                let (pid, hw, w, a, d, created, acked) = row?;
+                let (pid, task, w, a, d, created, acked) = row?;
                 out.push(Placement {
                     placement_id: to_u64(pid)?,
-                    homework_id: id("homework_id", HomeworkId::parse(&hw))?,
+                    task_id: id("task_id", TaskId::parse(&task))?,
                     worker_id: id("worker_id", WorkerId::parse(&w))?,
                     attempt_id: a
                         .map(|a| id("attempt_id", AttemptId::parse(&a)))

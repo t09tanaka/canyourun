@@ -30,7 +30,7 @@ pub struct Coordinator {
     pub stale_seconds: Option<u64>,
     pub lease_seconds: Option<u64>,
     pub term_grace_seconds: Option<u64>,
-    pub max_active_homework: Option<u32>,
+    pub max_active_task: Option<u32>,
     pub log_spool_limit_bytes: Option<u64>,
     pub retention_days: Option<u32>,
 }

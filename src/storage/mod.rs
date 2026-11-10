@@ -87,7 +87,7 @@ pub enum StorageError {
         got: CoordinatorEpoch,
         current: CoordinatorEpoch,
     },
-    #[error("homework already has a live attempt ({0})")]
+    #[error("task already has a live attempt ({0})")]
     LiveAttemptExists(String),
     #[error("lease for {0} cannot be renewed")]
     LeaseNotRenewable(AttemptId),

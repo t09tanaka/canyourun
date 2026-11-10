@@ -200,7 +200,7 @@ fn defaults_apply_without_any_file() {
     assert_eq!(r.stale_seconds, v(15, d.clone()));
     assert_eq!(r.lease_seconds, v(60, d.clone()));
     assert_eq!(r.term_grace_seconds, v(10, d.clone()));
-    assert_eq!(r.max_active_homework, v(2, d.clone()));
+    assert_eq!(r.max_active_task, v(2, d.clone()));
     assert_eq!(r.log_spool_limit_bytes, v(1 << 30, d.clone()));
     assert_eq!(r.retention_days, v(7, d.clone()));
     assert_eq!(r.strategy, v(Strategy::EarliestFinish, d.clone()));
@@ -331,7 +331,7 @@ fn entries_list_every_value_with_its_origin() {
     assert_eq!(get2("execution.timeout_seconds"), "(none)");
     assert_eq!(get2("coordinator.local_worker"), "true");
     assert_eq!(get2("coordinator.term_grace_seconds"), "10");
-    assert_eq!(get2("coordinator.max_active_homework"), "2");
+    assert_eq!(get2("coordinator.max_active_task"), "2");
     assert_eq!(get2("coordinator.log_spool_limit_bytes"), "1073741824");
     assert_eq!(get2("coordinator.retention_days"), "7");
     assert_eq!(get2("scheduler.forecast_ttl_ms"), "2000");
@@ -459,7 +459,7 @@ fn zero_values_are_errors() {
         "lease_seconds = 0",
         "term_grace_seconds = 0",
         "log_spool_limit_bytes = 0",
-        "max_active_homework = 0",
+        "max_active_task = 0",
         "retention_days = 0",
     ];
     for c in cases {

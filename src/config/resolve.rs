@@ -23,7 +23,7 @@ pub const DEFAULT_LEASE_SECONDS: u64 = 60;
 pub const DEFAULT_TERM_GRACE_SECONDS: u64 = 10;
 pub const DEFAULT_FORECAST_TTL_MS: u64 = 2000;
 pub const DEFAULT_PREFETCH_PER_WORKER: u32 = 1;
-pub const DEFAULT_MAX_ACTIVE_HOMEWORK: u32 = 2;
+pub const DEFAULT_MAX_ACTIVE_TASK: u32 = 2;
 pub const DEFAULT_LOG_SPOOL_LIMIT_BYTES: u64 = 1 << 30;
 pub const DEFAULT_RETENTION_DAYS: u32 = 7;
 pub const DEFAULT_PRIORITY: i64 = 0;
@@ -120,7 +120,7 @@ pub struct ResolvedConfig {
     pub stale_seconds: Value<u64>,
     pub lease_seconds: Value<u64>,
     pub term_grace_seconds: Value<u64>,
-    pub max_active_homework: Value<u32>,
+    pub max_active_task: Value<u32>,
     pub log_spool_limit_bytes: Value<u64>,
     pub retention_days: Value<u32>,
     pub strategy: Value<Strategy>,
@@ -205,11 +205,9 @@ impl ResolvedConfig {
                 &self.term_grace_seconds,
                 |v| v.to_string(),
             ),
-            e(
-                "coordinator.max_active_homework",
-                &self.max_active_homework,
-                |v| v.to_string(),
-            ),
+            e("coordinator.max_active_task", &self.max_active_task, |v| {
+                v.to_string()
+            }),
             e(
                 "coordinator.log_spool_limit_bytes",
                 &self.log_spool_limit_bytes,
@@ -448,9 +446,9 @@ fn check_timing(r: &ResolvedConfig, problems: &mut Vec<String>) {
     );
     check_nonzero(
         problems,
-        "max_active_homework",
-        u64::from(r.max_active_homework.value),
-        &r.max_active_homework.origin,
+        "max_active_task",
+        u64::from(r.max_active_task.value),
+        &r.max_active_task.origin,
     );
     check_nonzero(
         problems,
@@ -759,13 +757,13 @@ pub fn resolve(inp: &Inputs<'_>) -> Result<ResolvedConfig, ConfigError> {
             coord.term_grace_seconds,
             DEFAULT_TERM_GRACE_SECONDS,
         ),
-        max_active_homework: pick(
+        max_active_task: pick(
             &layers,
             None,
             None,
             None,
-            coord.max_active_homework,
-            DEFAULT_MAX_ACTIVE_HOMEWORK,
+            coord.max_active_task,
+            DEFAULT_MAX_ACTIVE_TASK,
         ),
         log_spool_limit_bytes: pick(
             &layers,

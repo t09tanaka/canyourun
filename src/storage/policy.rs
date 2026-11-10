@@ -5,7 +5,7 @@
 //! (inside the transaction that acts on them) and these functions decide. They
 //! are under the coverage gate and the mutation gate.
 
-use crate::ids::{Generation, HomeworkId, PayloadHash, RunId};
+use crate::ids::{Generation, PayloadHash, RunId, TaskId};
 use crate::state::AttemptState;
 use crate::wire::LeaseKey;
 
@@ -111,7 +111,7 @@ pub fn plan_schema(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SubmitKey<'a> {
     pub run_id: &'a RunId,
-    pub homework_id: &'a HomeworkId,
+    pub task_id: &'a TaskId,
     pub generation: Generation,
     pub payload_hash: &'a PayloadHash,
 }
@@ -129,7 +129,7 @@ pub enum SubmitDecision {
     Insert,
     /// Same attempt, same request: answer with the existing state.
     Existing,
-    /// Same attempt id, but the payload, run, homework or generation differs.
+    /// Same attempt id, but the payload, run, task or generation differs.
     Conflict,
     /// A tombstone exists: the attempt must not start.
     Retired,
@@ -415,20 +415,20 @@ mod tests {
 
     struct Ids {
         run: RunId,
-        hw: HomeworkId,
+        task: TaskId,
     }
 
     fn ids() -> Ids {
         Ids {
             run: RunId::generate(),
-            hw: HomeworkId::generate(),
+            task: TaskId::generate(),
         }
     }
 
     fn sk<'a>(i: &'a Ids, g: u64, hash: &'a PayloadHash) -> SubmitKey<'a> {
         SubmitKey {
             run_id: &i.run,
-            homework_id: &i.hw,
+            task_id: &i.task,
             generation: Generation(g),
             payload_hash: hash,
         }
@@ -475,7 +475,7 @@ mod tests {
     }
 
     #[test]
-    fn a_resend_with_another_run_homework_or_generation_is_a_conflict() {
+    fn a_resend_with_another_run_task_or_generation_is_a_conflict() {
         let a = h('a');
         let i = ids();
         let existing = || {
@@ -490,18 +490,18 @@ mod tests {
         );
         let other_run = Ids {
             run: RunId::generate(),
-            hw: i.hw.clone(),
+            task: i.task.clone(),
         };
         assert_eq!(
             decide_submit(existing(), false, sk(&other_run, 1, &a)),
             SubmitDecision::Conflict
         );
-        let other_hw = Ids {
+        let other_task = Ids {
             run: i.run.clone(),
-            hw: HomeworkId::generate(),
+            task: TaskId::generate(),
         };
         assert_eq!(
-            decide_submit(existing(), false, sk(&other_hw, 1, &a)),
+            decide_submit(existing(), false, sk(&other_task, 1, &a)),
             SubmitDecision::Conflict
         );
         // A different key beats a tombstone and a retired record.

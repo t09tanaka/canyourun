@@ -16,8 +16,8 @@ use super::{
     StorageError, DEFAULT_GC_BATCH,
 };
 use crate::ids::{
-    AgentEpoch, AttemptId, CoordinatorEpoch, Generation, HomeworkId, IdError, NodeId, PayloadHash,
-    RunId, WorkerBootId, WorkerId,
+    AgentEpoch, AttemptId, CoordinatorEpoch, Generation, IdError, NodeId, PayloadHash, RunId,
+    TaskId, WorkerBootId, WorkerId,
 };
 use crate::state::{AttemptState, Receipt, Receipts, Termination};
 use crate::wire::{canonical_json, LeaseKey};
@@ -41,7 +41,7 @@ fn id<T>(what: &str, r: std::result::Result<T, IdError>) -> Result<T> {
 pub struct NewAcceptance {
     pub attempt_id: AttemptId,
     pub run_id: RunId,
-    pub homework_id: HomeworkId,
+    pub task_id: TaskId,
     pub generation: Generation,
     pub payload_hash: PayloadHash,
     pub coordinator_epoch: CoordinatorEpoch,
@@ -52,7 +52,7 @@ pub struct NewAcceptance {
 pub struct AcceptedAttempt {
     pub attempt_id: AttemptId,
     pub run_id: RunId,
-    pub homework_id: HomeworkId,
+    pub task_id: TaskId,
     pub generation: Generation,
     pub payload_hash: PayloadHash,
     pub coordinator_epoch: CoordinatorEpoch,
@@ -124,7 +124,7 @@ impl LogPosition {
     }
 }
 
-const COLS: &str = "attempt_id, run_id, homework_id, generation, payload_hash, coordinator_epoch,
+const COLS: &str = "attempt_id, run_id, task_id, generation, payload_hash, coordinator_epoch,
     spec_json, state, termination_json, receipts_json, cancel_requested_at_ms, retired,
     accepted_at_ms, terminal_at_ms, acked_at_ms";
 
@@ -140,7 +140,7 @@ fn from_row(r: &Row<'_>) -> Result<AcceptedAttempt> {
     Ok(AcceptedAttempt {
         attempt_id: id("attempt_id", AttemptId::parse(&r.get::<_, String>(0)?))?,
         run_id: id("run_id", RunId::parse(&r.get::<_, String>(1)?))?,
-        homework_id: id("homework_id", HomeworkId::parse(&r.get::<_, String>(2)?))?,
+        task_id: id("task_id", TaskId::parse(&r.get::<_, String>(2)?))?,
         generation: Generation(to_u64(r.get(3)?)?),
         payload_hash: id("payload_hash", PayloadHash::parse(&r.get::<_, String>(4)?))?,
         coordinator_epoch: CoordinatorEpoch(to_u64(r.get(5)?)?),
@@ -317,10 +317,10 @@ impl WorkerStore {
     // -------------------------------------------------------------- accept
 
     /// Persist an attempt before answering. The same attempt id with the same
-    /// payload, run, homework and generation returns the existing record; any
+    /// payload, run, task and generation returns the existing record; any
     /// difference in those is a conflict; an attempt
     /// with a tombstone (a cancel or retire arrived first, or it was retired)
-    /// is refused with `Retired`. A homework that has an attempt which is not
+    /// is refused with `Retired`. A task that has an attempt which is not
     /// terminal refuses another one (`LiveAttemptExists`), a retired attempt
     /// included: it counts until it is confirmed stopped (terminal). Nothing
     /// here starts a command.
@@ -340,7 +340,7 @@ impl WorkerStore {
                 existing.as_ref().map(|e| ExistingAttempt {
                     key: SubmitKey {
                         run_id: &e.run_id,
-                        homework_id: &e.homework_id,
+                        task_id: &e.task_id,
                         generation: e.generation,
                         payload_hash: &e.payload_hash,
                     },
@@ -349,7 +349,7 @@ impl WorkerStore {
                 tombstoned,
                 SubmitKey {
                     run_id: &new.run_id,
-                    homework_id: &new.homework_id,
+                    task_id: &new.task_id,
                     generation: new.generation,
                     payload_hash: &new.payload_hash,
                 },
@@ -359,12 +359,12 @@ impl WorkerStore {
                 (SubmitDecision::Conflict, _) => Err(StorageError::PayloadConflict(new.attempt_id)),
                 (SubmitDecision::Retired, _) => Err(StorageError::Retired(new.attempt_id)),
                 (SubmitDecision::Insert, _) | (SubmitDecision::Existing, None) => {
-                    let hw = new.homework_id.to_string();
+                    let task = new.task_id.to_string();
                     let live: Option<String> = tx
                         .query_row(
                             "SELECT attempt_id FROM worker_attempt
-                             WHERE homework_id = ?1 AND state <> 'terminal'",
-                            [&hw],
+                             WHERE task_id = ?1 AND state <> 'terminal'",
+                            [&task],
                             |r| r.get(0),
                         )
                         .optional()?;
@@ -374,14 +374,14 @@ impl WorkerStore {
                     let mut receipts = Receipts::default();
                     receipts.mark(Receipt::WorkerAccepted, at_ms);
                     tx.execute(
-                        "INSERT INTO worker_attempt (attempt_id, run_id, homework_id, generation,
+                        "INSERT INTO worker_attempt (attempt_id, run_id, task_id, generation,
                             payload_hash, coordinator_epoch, spec_json, state, receipts_json,
                             accepted_at_ms)
                          VALUES (?1,?2,?3,?4,?5,?6,?7,'accepted',?8,?9)",
                         params![
                             aid,
                             new.run_id.as_str(),
-                            hw,
+                            task,
                             to_i64(new.generation.0)?,
                             new.payload_hash.as_str(),
                             to_i64(new.coordinator_epoch.0)?,
