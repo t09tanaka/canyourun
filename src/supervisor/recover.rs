@@ -10,6 +10,15 @@
 //! investigated through task-traffic-controller and, when that cannot rule a
 //! process out, the attempt stays unresolved.
 //!
+//! The attempt is settled through its log spool like a run that ended
+//! normally: the spool is resumed, closed and described in the result. What
+//! the command wrote while no supervisor was alive is not in it. A spool the
+//! lost supervisor had closed already is settled from its final positions,
+//! and an attempt it had made terminal without storing the result gets the
+//! result ([`super::run::complete_terminal`]). The exit the lost supervisor
+//! saw is not known here: unless the termination was fixed, the attempt is
+//! `interrupted` (or `cancelled`), whatever the command did.
+//!
 //! A leader that is gone does not mean its group is: descendants can outlive
 //! it. So the group (from the pgid task-traffic-controller recorded, else the
 //! leader's pid) is stopped when it still has members and the leader is the
@@ -20,13 +29,16 @@
 
 use super::error::Result;
 use super::identity::{verdict, Verdict};
-use super::run::{finalize, sidecar_child, stop_confirmed, unresolved_report, Report, Traffic};
+use super::run::{
+    complete_terminal, open_spool, remove_fifos, settle, settle_without_spool, sidecar_child,
+    stop_confirmed, unresolved_report, Report, Traffic,
+};
 use super::spec::{command_id, SuperviseSpec};
 use super::stop::{group_alive, StopResult, StopTarget};
 use super::termination::{termination, StopReason};
 use crate::platform;
 use crate::state::AttemptState;
-use crate::storage::{Finalized, WorkerStore};
+use crate::storage::WorkerStore;
 use serde_json::json;
 use task_traffic_controller::managed;
 
@@ -37,6 +49,16 @@ pub fn recover(spec: &SuperviseSpec, store: &WorkerStore) -> Result<Report> {
             "attempt {attempt} is unknown"
         )));
     };
+    if let Some(t) = rec.termination {
+        // Nothing is left to stop: only a result the crash kept back.
+        complete_terminal(spec, store, t)?;
+        return Ok(Report {
+            termination: Some(t),
+            finalized_here: false,
+            unresolved: None,
+            sleep_inhibit: "not held".into(),
+        });
+    }
     let traffic = Traffic::open(spec)?;
     let boot = platform::boot_id();
     let mut unresolved: Vec<String> = Vec::new();
@@ -119,9 +141,16 @@ pub fn recover(spec: &SuperviseSpec, store: &WorkerStore) -> Result<Report> {
     if reason.is_some() && rec.state != AttemptState::Cancelling {
         let _ = store.transition(attempt, AttemptState::Cancelling, platform::wall_ms());
     }
-    let (t, here) = match finalize(store, attempt, termination(reason, None))? {
-        Finalized::Won(t) => (t, true),
-        Finalized::AlreadyTerminal(t) => (t, false),
+    // Whatever the spool holds of the lost supervisor's output is closed
+    // with the attempt; a spool that cannot be resumed is a spool failure.
+    let term = termination(reason, None);
+    let root = spec.spool_dir();
+    // No command of the attempt is alive any more: the FIFOs the lost
+    // supervisor made for them have no writer and no reader.
+    remove_fifos(spec);
+    let (t, here) = match open_spool(spec, store)? {
+        Ok(spool) => settle(store, &root, attempt, spool.end(), term)?,
+        Err(e) => settle_without_spool(store, &root, attempt, "open", &e.to_string(), term)?,
     };
     Ok(Report {
         termination: Some(t),

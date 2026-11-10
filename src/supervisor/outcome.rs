@@ -252,6 +252,9 @@ fn file_digest(path: &Path) -> Result<(Digest, u64)> {
 pub struct Recorded {
     pub result: Value,
     pub fresh: bool,
+    /// This call fixed the attempt's termination (otherwise it was fixed
+    /// before: by an earlier call, or by a competing writer).
+    pub finalized: bool,
 }
 
 fn summary(s: StreamStatus) -> StreamSummary {
@@ -270,7 +273,7 @@ pub(super) fn is_duplicate(e: &StorageError) -> bool {
             if f.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_PRIMARYKEY))
 }
 
-fn add_ref(
+pub(super) fn add_ref(
     store: &WorkerStore,
     attempt: &AttemptId,
     ref_id: String,
@@ -395,9 +398,36 @@ pub fn sync_log_position(
     ))
 }
 
+/// The attempt's spool as [`finish_attempt`] takes it: the open one, which it
+/// closes, or the final positions of one that an earlier call (of a
+/// supervisor that crashed right after) closed already.
+#[derive(Debug, Clone, Copy)]
+pub enum SpoolEnd<'a> {
+    Open(&'a AttemptSpool),
+    /// `(stdout, stderr)` as the closed spool's index publishes them
+    /// ([`super::spool::closed_status`]).
+    Closed(StreamStatus, StreamStatus),
+}
+
+impl<'a> From<&'a AttemptSpool> for SpoolEnd<'a> {
+    fn from(s: &'a AttemptSpool) -> Self {
+        SpoolEnd::Open(s)
+    }
+}
+
+impl SpoolEnd<'_> {
+    fn close(&self) -> std::result::Result<(StreamStatus, StreamStatus), SpoolError> {
+        match self {
+            SpoolEnd::Open(s) => s.finish(),
+            SpoolEnd::Closed(out, err) => Ok((*out, *err)),
+        }
+    }
+}
+
 /// Close the attempt's spool, reference its files, fix its termination and
 /// store its result: in that order, so a crash at any point leaves a state
-/// that calling this again completes. The termination in the result is the
+/// that calling this again completes, also from another process: that one
+/// finds the spool closed and passes [`SpoolEnd::Closed`]. The termination in the result is the
 /// one that won (a cancel may have fixed it first). `artifacts` are checked
 /// first (names, clashes, and the files against their records under `root`).
 /// A result that is already stored is returned as is (`fresh == false`) after
@@ -411,28 +441,30 @@ pub fn sync_log_position(
 /// If the spool cannot be completed (an earlier write failed), this returns
 /// [`OutcomeError::SpoolFailed`] before recording anything: the attempt's
 /// result is then S9a's (the supervisor's) decision, not this module's.
-pub fn finish_attempt(
+pub fn finish_attempt<'a>(
     store: &WorkerStore,
     root: &Path,
     attempt: &AttemptId,
-    spool: &AttemptSpool,
+    spool: impl Into<SpoolEnd<'a>>,
     termination: Termination,
     artifacts: &[ArtifactRecord],
     at_ms: u64,
 ) -> Result<Recorded> {
+    let spool = spool.into();
     if let Some(existing) = store.get_result(attempt)? {
         if !result_has_artifacts(&existing, artifacts) {
             return Err(StorageError::Immutable(format!("artifacts of {attempt}")).into());
         }
-        spool.finish().map_err(OutcomeError::SpoolFailed)?;
+        spool.close().map_err(OutcomeError::SpoolFailed)?;
         ensure_truncation_events(store, attempt, &existing, at_ms)?;
         return Ok(Recorded {
             result: existing,
             fresh: false,
+            finalized: false,
         });
     }
     check_artifacts(root, attempt, artifacts)?;
-    let (out, err) = spool.finish().map_err(OutcomeError::SpoolFailed)?;
+    let (out, err) = spool.close().map_err(OutcomeError::SpoolFailed)?;
     store.update_log_position(attempt, "stdout", out.into())?;
     store.update_log_position(attempt, "stderr", err.into())?;
     add_ref(
@@ -453,14 +485,19 @@ pub fn finish_attempt(
             at_ms,
         )?;
     }
-    let fixed = store.finalize(attempt, termination, at_ms)?.termination();
+    let fin = store.finalize(attempt, termination, at_ms)?;
+    let fixed = fin.termination();
     let result = result_json(&fixed, artifacts, summary(out), summary(err));
     let fresh = store.record_result(attempt, &result)?;
     // The stored result is the truth, whichever call stored it: a crash
     // between storing it and the events is repaired by the next call, which
     // writes the events the result implies and the journal lacks.
     ensure_truncation_events(store, attempt, &result, at_ms)?;
-    Ok(Recorded { result, fresh })
+    Ok(Recorded {
+        result,
+        fresh,
+        finalized: fin.won(),
+    })
 }
 
 /// Write `log_truncated` for each stream the result says dropped bytes, unless

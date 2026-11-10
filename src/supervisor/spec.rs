@@ -4,14 +4,19 @@
 use super::error::{Result, SupervisorError};
 use super::timeouts::TimeoutPolicy;
 use crate::ids::{AttemptId, NodeId, WorkerId};
+use crate::secrets::mask::Masker;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
+use std::io::Read;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 /// Spec chapter 12 defaults.
 pub const DEFAULT_LEASE_MS: u64 = 60_000;
 pub const DEFAULT_TERM_GRACE_MS: u64 = 10_000;
+/// The spec's default cap on the log bytes one task may store on a worker.
+pub const DEFAULT_LOG_LIMIT_BYTES: u64 = 1 << 30;
 const DEFAULT_KILL_WAIT_MS: u64 = 10_000;
 const DEFAULT_POLL_MS: u64 = 200;
 
@@ -30,9 +35,14 @@ fn d_poll() -> u64 {
 fn d_true() -> bool {
     true
 }
+fn d_log_limit() -> u64 {
+    DEFAULT_LOG_LIMIT_BYTES
+}
 
-/// One command of the attempt (a step, a setup builder, ...).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// One command of the attempt (a step, a setup builder, ...). Its stdout and
+/// stderr go to the attempt's log spool (stdin is `/dev/null`). `Debug` shows
+/// the names of `env` only: its values may be secrets.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NodeSpec {
     pub node_id: NodeId,
     pub argv: Vec<String>,
@@ -41,13 +51,40 @@ pub struct NodeSpec {
     /// environment is inherited.
     #[serde(default)]
     pub env: BTreeMap<String, String>,
-    /// Where the command's stdout and stderr are appended (stdin is
-    /// `/dev/null`). The log spool reads from here. `None` inherits the
-    /// supervisor's own, which is the null device when it runs detached.
-    #[serde(default)]
-    pub stdout_log: Option<PathBuf>,
     #[serde(default)]
     pub weight: Option<u32>,
+}
+
+impl std::fmt::Debug for NodeSpec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NodeSpec")
+            .field("node_id", &self.node_id)
+            .field("argv", &self.argv)
+            .field("cwd", &self.cwd)
+            .field("env", &self.env.keys().collect::<Vec<_>>())
+            .field("weight", &self.weight)
+            .finish()
+    }
+}
+
+/// The secret values to replace in everything the supervisor stores of the
+/// commands' output. They are secrets themselves: `Debug` shows only how
+/// many there are, and the spec file that carries them must be readable by
+/// the worker's user alone and removed by whoever wrote it.
+#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct MaskValues(pub Vec<String>);
+
+impl std::fmt::Debug for MaskValues {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "MaskValues({} values)", self.0.len())
+    }
+}
+
+impl MaskValues {
+    pub fn masker(&self) -> Masker {
+        Masker::new(self.0.iter().map(|v| v.clone().into_bytes()))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -85,6 +122,23 @@ pub struct SuperviseSpec {
     /// Hold an idle-sleep inhibition while running.
     #[serde(default = "d_true")]
     pub inhibit_sleep: bool,
+    /// The root of the worker's log spool and artifact store: the output of
+    /// every node is stored under `<spool_root>/<attempt>/logs`. Default
+    /// `<state_dir>/attempts`.
+    #[serde(default)]
+    pub spool_root: Option<PathBuf>,
+    /// The cap on the log bytes the task may store on this worker, all its
+    /// attempts together. This attempt gets what the others left.
+    #[serde(default = "d_log_limit")]
+    pub log_limit_bytes: u64,
+    /// What the workspace creation could not do (`Workspace.warnings`); the
+    /// supervisor writes them to the event journal when it starts.
+    #[serde(default)]
+    pub workspace_warnings: Vec<String>,
+    /// Secret values masked in the commands' output before it is stored, and
+    /// in the workspace warnings. Required, so that a writer who forgot it is
+    /// told; an explicit empty list means nothing is masked.
+    pub mask: MaskValues,
 }
 
 impl SuperviseSpec {
@@ -106,6 +160,11 @@ impl SuperviseSpec {
         {
             return bad("a timeout of zero is not a timeout");
         }
+        if self.spool_root.as_ref().is_some_and(|r| !r.is_absolute()) {
+            // A relative root would follow whatever directory the supervisor
+            // happens to run in.
+            return bad("spool_root must be an absolute path");
+        }
         let mut seen = std::collections::BTreeSet::new();
         for n in &self.nodes {
             if n.argv.is_empty() || n.argv[0].is_empty() {
@@ -126,19 +185,48 @@ impl SuperviseSpec {
         }
     }
 
+    /// The root of the log spool and artifact store.
+    pub fn spool_dir(&self) -> PathBuf {
+        self.spool_root
+            .clone()
+            .unwrap_or_else(|| self.state_dir.join("attempts"))
+    }
+
     pub fn traffic_config_path(&self) -> PathBuf {
         self.traffic_config
             .clone()
             .unwrap_or_else(|| self.traffic_state_dir.join("config.toml"))
     }
 
+    /// Read and validate the spec at `path`. It carries secrets (`mask`,
+    /// `env`), so a file that is not the current user's own, or that its
+    /// group or others can reach (any permission bit of theirs), is refused:
+    /// write it with mode 0600. The check is made on the opened file, which
+    /// is the one read.
     pub fn from_file(path: &Path) -> Result<Self> {
-        let text = std::fs::read_to_string(path)?;
+        let mut file = std::fs::File::open(path)?;
+        let meta = file.metadata()?;
+        // SAFETY: `geteuid` has no preconditions and cannot fail.
+        let me = unsafe { libc::geteuid() };
+        if !private_to(meta.uid(), meta.mode(), me) {
+            return Err(SupervisorError::Spec(format!(
+                "{} must belong to the current user and be closed to group and others (mode 0600)",
+                path.display()
+            )));
+        }
+        let mut text = String::new();
+        file.read_to_string(&mut text)?;
         let spec: SuperviseSpec =
             serde_json::from_str(&text).map_err(|e| SupervisorError::Spec(e.to_string()))?;
         spec.validate()?;
         Ok(spec)
     }
+}
+
+/// A file of `owner` with `mode` is `user`'s own and no one else's to read,
+/// write or execute.
+fn private_to(owner: u32, mode: u32, user: u32) -> bool {
+    owner == user && mode & 0o077 == 0
 }
 
 /// The task-traffic-controller command id of node `index` of an attempt. The
@@ -172,7 +260,6 @@ mod tests {
             argv: vec!["true".into()],
             cwd: "/".into(),
             env: BTreeMap::new(),
-            stdout_log: None,
             weight: None,
         }
     }
@@ -193,6 +280,10 @@ mod tests {
             resource_wait_timeout_ms: None,
             deadline_ms: None,
             inhibit_sleep: false,
+            spool_root: Some("/spool".into()),
+            log_limit_bytes: DEFAULT_LOG_LIMIT_BYTES,
+            workspace_warnings: vec![],
+            mask: MaskValues::default(),
         }
     }
 
@@ -207,11 +298,36 @@ mod tests {
             "state_dir": "/s", "worker_id": "w", "attempt_id": s.attempt_id,
             "traffic_state_dir": "/t",
             "nodes": [{"node_id": "a", "argv": ["true"], "cwd": "/"}],
+            "mask": [],
         });
+        // A spec that does not say what to mask is refused, not read as
+        // "nothing to mask".
+        let mut forgot = minimal.clone();
+        forgot.as_object_mut().unwrap().remove("mask");
+        let e = serde_json::from_value::<SuperviseSpec>(forgot).unwrap_err();
+        assert!(e.to_string().contains("mask"), "{e}");
         let m: SuperviseSpec = serde_json::from_value(minimal).unwrap();
         assert_eq!(m.lease_ms, 60_000);
         assert_eq!(m.term_grace_ms, 10_000);
         assert!(m.inhibit_sleep);
+        assert_eq!(m.log_limit_bytes, 1 << 30);
+        assert!(m.workspace_warnings.is_empty());
+        assert_eq!(m.spool_dir(), PathBuf::from("/s/attempts"));
+        assert_eq!(s.spool_dir(), PathBuf::from("/spool"));
+        assert!(m.mask.masker().is_empty());
+        // The values to mask never show in a debug print of the spec.
+        let mut secret = spec();
+        secret.mask = MaskValues(vec!["hunter2-value".into()]);
+        secret.nodes[0]
+            .env
+            .insert("API_TOKEN".into(), "hunter2-in-env".into());
+        let shown = format!("{secret:?}");
+        assert!(!shown.contains("hunter2"), "{shown}");
+        assert!(shown.contains("API_TOKEN"), "{shown}");
+        assert_eq!(secret.mask.masker().mask(b"a hunter2-value b"), b"a *** b");
+        let back: SuperviseSpec =
+            serde_json::from_str(&serde_json::to_string(&secret).unwrap()).unwrap();
+        assert_eq!(back, secret);
         assert_eq!(m.traffic_config_path(), PathBuf::from("/t/config.toml"));
     }
 
@@ -219,6 +335,9 @@ mod tests {
     fn bad_specs_are_refused() {
         let mut s = spec();
         s.nodes.clear();
+        assert!(s.validate().is_err());
+        let mut s = spec();
+        s.spool_root = Some("spool".into());
         assert!(s.validate().is_err());
         let mut s = spec();
         s.lease_ms = 0;
@@ -286,21 +405,59 @@ mod tests {
         assert!(spec_digest(&a).starts_with("sha256:"));
     }
 
+    fn write_private(p: &Path, text: &str) {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let _ = std::fs::remove_file(p);
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(p)
+            .unwrap();
+        f.write_all(text.as_bytes()).unwrap();
+    }
+
     #[test]
     fn from_file_reads_and_validates() {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path().join("spec.json");
-        std::fs::write(&p, serde_json::to_string(&spec()).unwrap()).unwrap();
+        write_private(&p, &serde_json::to_string(&spec()).unwrap());
         assert!(SuperviseSpec::from_file(&p).is_ok());
-        std::fs::write(&p, "{").unwrap();
+        write_private(&p, "{");
         assert!(matches!(
             SuperviseSpec::from_file(&p),
             Err(SupervisorError::Spec(_))
         ));
         let mut bad = spec();
         bad.nodes.clear();
-        std::fs::write(&p, serde_json::to_string(&bad).unwrap()).unwrap();
+        write_private(&p, &serde_json::to_string(&bad).unwrap());
         assert!(SuperviseSpec::from_file(&p).is_err());
         assert!(SuperviseSpec::from_file(&dir.path().join("none.json")).is_err());
+    }
+
+    #[test]
+    fn a_spec_file_others_can_reach_is_refused() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("spec.json");
+        write_private(&p, &serde_json::to_string(&spec()).unwrap());
+        for mode in [0o640, 0o604, 0o620, 0o602, 0o610, 0o601, 0o644] {
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(mode)).unwrap();
+            let e = SuperviseSpec::from_file(&p).unwrap_err();
+            assert!(
+                matches!(&e, SupervisorError::Spec(m) if m.contains("0600")),
+                "{mode:o}: {e}"
+            );
+        }
+        for mode in [0o600, 0o400, 0o700] {
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(mode)).unwrap();
+            assert!(SuperviseSpec::from_file(&p).is_ok(), "{mode:o}");
+        }
+        // Another user's file is refused whatever its mode.
+        assert!(private_to(501, 0o100600, 501));
+        assert!(!private_to(0, 0o100600, 501));
+        assert!(!private_to(501, 0o100600, 0));
+        assert!(!private_to(501, 0o100640, 501));
     }
 }

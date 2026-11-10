@@ -552,6 +552,19 @@ workerはstdout／stderrをdiskへspoolし、network速度でcommandの出力を
 
 local spoolの既定上限はtaskごと1 GiBとする。到達した場合もpipeをdrainし、保存しなかったbytes数と `log_truncated` を必ず記録する。必要なら上限を変更できる。disk不足や結果保存失敗を成功で隠さない。
 
+上限はtaskのattemptで共有する。attemptは、spoolを開いた時点で他のattemptが保存済みのbytes数を上限から引いた残りを使う。回収が済みGCがlog参照を外したattemptのbytesは数えない。同じtaskの複数のattemptが同時に走る場合、互いに開いた時点の値しか見ないため、合計が上限を超えうる（超過は、同時に走るattempt 1つにつき最大で上限1つ分）。attemptは通常は順に走るので、これは既知の近似とする。
+
+**既知の逸脱（stdoutとstderrの合流）**: 現在のsupervisorは、commandのstdoutとstderrを1本のpipeで受け、両方を `stdout` streamとして保存する。`stderr` streamは常に空である。task-traffic-controllerがstderrの出力先を別に受け取れるようになった時点（task-traffic-controller側の変更が先）でstreamを分ける。それまで、streamごとのoffsetと `log_truncated` は合流後の1本について成り立つ。
+
+spoolに関してsupervisorがevent journalへ書くeventは次のとおりである。
+
+| event | 意味 | payload |
+|---|---|---|
+| `spool_failed` | spoolへ出力を保存できなかった。attemptは成功にならない（`interrupted`、cancel済みなら `cancelled`） | `stage`（`open`・`pipe`・`write`・`finish`）、`error`。同じ `stage` は1回だけ書く |
+| `workspace_warning` | workspaceの用意で出た警告。supervisorの開始時に書く | `index`（0始まりの位置、文字列）、`message`（maskしてから4096 bytesで切る）。最大64件で、超えた分は件数を伝える1行にまとめる |
+
+`stage` が `open` または `finish` の `spool_failed` を持つattemptは、spoolを使わずに確定しており、resultを持たない。spoolのdirectoryはlogとして参照され、最後に公開された位置が保存されるので、GCが他のattemptと同じく回収する。それ以外でterminalなのにresultが無いattemptは、supervisorが確定の途中で落ちたものであり、次のsupervisorの起動または回復が、閉じたspoolの最終位置からresultを補う。`workspace_warning` は位置（`index`）で重複を除くので、mask後に同じ文面になる別の警告も1件ずつ残る。
+
 artifactにはname、relative path、size、content digest、source ID、plan digest、attempt ID、profile fingerprintを記録する。親の受取後にhashを検証し、atomicに公開する。必須artifactが揃うまでrunをsuccessにしない。回収失敗で計算済みcommandをやり直さない。
 
 親は検証と永続commit後に冪等な `ack_collected` を送る。workerはそのACKを受理してから回収待ちのGC保護を解除する。単なるdownload完了やSSH正常終了を保存確認には使わない。
