@@ -315,9 +315,9 @@ impl WorkerSecrets {
                         SecretError::io(format!("secret file {p}"), errno_io(e))
                     }
                 })?;
-            let regular =
-                FileType::from_raw_mode(st.st_mode as rustix::fs::RawMode) == FileType::RegularFile;
-            if !regular || u32::from(st.st_mode) & 0o777 != 0o600 {
+            let raw = st.st_mode as rustix::fs::RawMode;
+            let regular = FileType::from_raw_mode(raw) == FileType::RegularFile;
+            if !regular || Mode::from_raw_mode(raw).bits() & 0o777 != 0o600 {
                 return Err(placement(format!(
                     "{p} is not a regular file with mode 0600"
                 )));
