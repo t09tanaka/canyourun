@@ -1,0 +1,29 @@
+[package]
+name = "remote-task-runner"
+version = "0.0.0"
+edition = "2021"
+rust-version = "1.89"
+description = "Distribute CI and heavy commands across your own machines"
+license = "MIT"
+repository = "https://github.com/t09tanaka/remote-task-runner"
+readme = "README.md"
+
+[lib]
+name = "remote_task_runner"
+path = "src/lib.rs"
+
+[[bin]]
+name = "remote-task-runner"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+local-ci = "0.9"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+task-traffic-controller = "0.5"
+thiserror = "2"
+
+[dev-dependencies]
+assert_cmd = "2"
