@@ -1,6 +1,8 @@
 //! Serde types for the two config files. Every table rejects unknown keys.
 
-use serde::Deserialize;
+use serde::de::{self, MapAccess, Visitor};
+use serde::{Deserialize, Deserializer};
+use std::fmt;
 
 pub const SCHEMA_VERSION: u32 = 1;
 
@@ -95,19 +97,50 @@ pub struct Source {
 }
 
 /// `"glob"` or `{ glob = "...", required = true }`, as in `.local-ci.toml`.
-#[derive(Debug, Clone, PartialEq, Deserialize)]
-#[serde(untagged)]
+///
+/// Deserialize is written by hand: with `#[serde(untagged)]` a typo inside the
+/// table would only say "did not match any variant", losing the key name.
+#[derive(Debug, Clone, PartialEq)]
 pub enum SecretFile {
     Glob(String),
-    Full {
-        glob: String,
-        #[serde(default)]
-        required: bool,
-    },
+    Full(SecretFileFull),
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SecretFileFull {
+    pub glob: String,
+    #[serde(default)]
+    pub required: bool,
+}
+
+struct SecretFileVisitor;
+
+impl<'de> Visitor<'de> for SecretFileVisitor {
+    type Value = SecretFile;
+
+    fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("a glob string or a table { glob = \"...\", required = true }")
+    }
+
+    fn visit_str<E: de::Error>(self, v: &str) -> Result<SecretFile, E> {
+        Ok(SecretFile::Glob(v.to_string()))
+    }
+
+    fn visit_map<A: MapAccess<'de>>(self, map: A) -> Result<SecretFile, A::Error> {
+        SecretFileFull::deserialize(de::value::MapAccessDeserializer::new(map))
+            .map(SecretFile::Full)
+    }
+}
+
+impl<'de> Deserialize<'de> for SecretFile {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        d.deserialize_any(SecretFileVisitor)
+    }
 }
 
 /// A `secret_files` entry, normalised.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct SecretSpec {
     pub glob: String,
     pub required: bool,
@@ -149,6 +182,9 @@ pub enum ToolchainMatch {
 #[serde(deny_unknown_fields)]
 pub struct Ci {
     pub workflows_dirs: Option<Vec<String>>,
+    /// Workflows (`ci.yml`) or jobs (`ci.yml:e2e`) whose results are never
+    /// reused. Same format as `no-cache` in `.local-ci.toml`.
+    pub no_cache: Option<Vec<String>>,
     pub status_context: Option<String>,
     pub unsupported: Option<Unsupported>,
 }

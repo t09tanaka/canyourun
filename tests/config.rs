@@ -318,7 +318,8 @@ fn entries_list_every_value_with_its_origin() {
     assert_eq!(get("execution.timeout_seconds").value, "3600");
     assert_eq!(get("toolchain.match").value, "exact");
     assert_eq!(get("ci.unsupported").value, "error");
-    assert_eq!(e.len(), 23);
+    assert_eq!(e.len(), 24);
+    assert_eq!(get("ci.no_cache").value, "[]");
     let none = run(None, None, None, &Overlay::default())
         .unwrap()
         .entries();
@@ -740,14 +741,13 @@ fn legacy_mapping_table_covers_the_shared_keys() {
             "workflows-dirs",
             "[source] include",
             "[source] exclude",
-            "[source] secret_files"
+            "[source] secret_files",
+            "no-cache"
         ]
     );
+    assert_eq!(MAPPING[4].rtr, "[ci] no_cache");
     assert_eq!(MAPPING[0].rtr, "[ci] workflows_dirs");
-    assert_eq!(
-        UNMAPPED,
-        ["no-cache", "link-node-modules", "[setup] ignore-env"]
-    );
+    assert_eq!(UNMAPPED, ["link-node-modules", "[setup] ignore-env"]);
 }
 
 #[test]
@@ -766,6 +766,7 @@ fn legacy_values_fill_in_when_the_project_is_silent() {
     assert_eq!(r.secret_files.origin, origin);
     assert_eq!(r.secret_files.value.len(), 2);
     assert!(r.secret_files.value[1].required);
+    assert_eq!(r.no_cache, v(s(&["ci.yml"]), origin.clone()));
     // other keys are untouched by the legacy file
     assert_eq!(r.status_context.origin, Origin::Default);
 }
@@ -974,4 +975,153 @@ fn invalid_error_lists_every_problem() {
         problems: vec!["a".into(), "b".into()],
     };
     assert_eq!(e.to_string(), "invalid configuration:\n  - a\n  - b");
+}
+
+// ---- review fixes ----------------------------------------------------------
+
+#[test]
+fn secret_files_typo_inside_a_table_names_key_and_line() {
+    let t =
+        "schema_version = 1\n[source]\nsecret_files = [{ glob = \".env.test\", requird = true }]\n";
+    let m = parse_project("cfg.toml", t).unwrap_err().to_string();
+    assert!(m.starts_with("cfg.toml: "), "{m}");
+    assert!(m.contains("requird"), "{m}");
+    assert!(m.contains("line 3"), "{m}");
+    // a wrong type is still an error, and the message says what is allowed
+    let m = parse_project("c", "schema_version = 1\n[source]\nsecret_files = [1]\n")
+        .unwrap_err()
+        .to_string();
+    assert!(m.contains("glob string or a table"), "{m}");
+    // a table without glob is an error
+    assert!(parse_project(
+        "c",
+        "schema_version = 1\n[source]\nsecret_files = [{ required = true }]\n"
+    )
+    .is_err());
+}
+
+#[test]
+fn no_cache_in_the_project_file_and_its_origin() {
+    let p = "schema_version = 1\n[ci]\nno_cache = [\"ci.yml\", \"e2e.yml:browser\"]\n";
+    let r = run(None, Some(p), None, &Overlay::default()).unwrap();
+    assert_eq!(
+        r.no_cache,
+        v(
+            s(&["ci.yml", "e2e.yml:browser"]),
+            Origin::Project("/r/.remote-task-runner.toml".into())
+        )
+    );
+    let e = r.entries();
+    assert_eq!(
+        e.iter().find(|x| x.key == "ci.no_cache").unwrap().value,
+        "[ci.yml, e2e.yml:browser]"
+    );
+    let p = "schema_version = 1\n[ci]\nno_cache = [\"ci.yml\", \" \"]\n";
+    let m = problems(run(None, Some(p), None, &Overlay::default()));
+    assert_eq!(m.len(), 1, "{m:?}");
+    assert!(
+        m[0].contains("[ci] no_cache: give a workflow file"),
+        "{m:?}"
+    );
+}
+
+#[test]
+fn legacy_no_cache_maps_and_conflicts() {
+    let l = "no-cache = [\"ci.yml\"]\n";
+    let r = run(None, None, Some(l), &Overlay::default()).unwrap();
+    assert_eq!(
+        r.no_cache,
+        v(
+            s(&["ci.yml"]),
+            Origin::LegacyLocalCi("/r/.local-ci.toml".into())
+        )
+    );
+    let p = "schema_version = 1\n[ci]\nno_cache = [\"other.yml\"]\n";
+    let m = problems(run(None, Some(p), Some(l), &Overlay::default()));
+    assert_eq!(m.len(), 1, "{m:?}");
+    assert!(m[0].contains("[ci] no_cache = [\"other.yml\"] conflicts with /r/.local-ci.toml no-cache = [\"ci.yml\"]"), "{m:?}");
+    // an empty legacy list is "not set"
+    let r = run(None, Some(p), Some("no-cache = []\n"), &Overlay::default()).unwrap();
+    assert_eq!(r.no_cache.value, s(&["other.yml"]));
+}
+
+#[test]
+fn list_conflicts_compare_as_sets() {
+    let l = r#"
+workflows-dirs = ["a", "b"]
+no-cache = ["x.yml", "y.yml:job"]
+[source]
+include = ["i1", "i2"]
+exclude = ["e1", "e2"]
+secret_files = [".env", { glob = "x/.env", required = true }]
+"#;
+    let p = r#"
+schema_version = 1
+[ci]
+workflows_dirs = ["b", "a"]
+no_cache = ["y.yml:job", "x.yml", "x.yml"]
+[source]
+include = ["i2", "i1"]
+exclude = ["e2", "e1"]
+secret_files = [{ glob = "x/.env", required = true }, ".env"]
+"#;
+    let r = run(None, Some(p), Some(l), &Overlay::default()).unwrap();
+    // the project's own order is kept, and it wins the origin
+    assert_eq!(r.include.value, s(&["i2", "i1"]));
+    assert!(matches!(r.include.origin, Origin::Project(_)));
+    assert_eq!(r.no_cache.value, s(&["y.yml:job", "x.yml", "x.yml"]));
+    // a genuinely different set still conflicts, per key
+    let p2 = p.replace("\"e2\", \"e1\"", "\"e2\", \"e3\"");
+    let m = problems(run(None, Some(&p2), Some(l), &Overlay::default()));
+    assert_eq!(m.len(), 1, "{m:?}");
+    assert!(m[0].contains("[source] exclude"), "{m:?}");
+    let p3 = p.replace("\"y.yml:job\", \"x.yml\", \"x.yml\"", "\"y.yml:job\"");
+    let m = problems(run(None, Some(&p3), Some(l), &Overlay::default()));
+    assert_eq!(m.len(), 1, "{m:?}");
+    assert!(m[0].contains("no_cache"), "{m:?}");
+}
+
+#[test]
+fn unsupported_legacy_keys_become_notices_only_when_set() {
+    let r = run(None, None, Some(LEGACY_FULL), &Overlay::default()).unwrap();
+    let keys: Vec<(&str, &str)> = r.notices.iter().map(|n| (n.key, n.file.as_str())).collect();
+    assert_eq!(
+        keys,
+        [
+            ("link-node-modules", "/r/.local-ci.toml"),
+            ("[setup] ignore-env", "/r/.local-ci.toml")
+        ]
+    );
+    assert!(r.notices[0].reason.contains("[[clone]]"), "{:?}", r.notices);
+    assert!(r.notices[0].reason.contains("not supported"));
+    for l in [
+        "",
+        "link-node-modules = false\n",
+        "[setup]\nignore-env = []\n",
+    ] {
+        let r = run(None, None, Some(l), &Overlay::default()).unwrap();
+        assert!(r.notices.is_empty(), "{l:?}: {:?}", r.notices);
+    }
+    let r = run(
+        None,
+        None,
+        Some("link-node-modules = true\n"),
+        &Overlay::default(),
+    )
+    .unwrap();
+    assert_eq!(r.notices.len(), 1);
+    assert_eq!(r.notices[0].key, "link-node-modules");
+    let r = run(
+        None,
+        None,
+        Some("[setup]\nignore-env = [\"CI\"]\n"),
+        &Overlay::default(),
+    )
+    .unwrap();
+    assert_eq!(r.notices.len(), 1);
+    assert_eq!(r.notices[0].key, "[setup] ignore-env");
+    assert!(run(None, None, None, &Overlay::default())
+        .unwrap()
+        .notices
+        .is_empty());
 }

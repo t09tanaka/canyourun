@@ -6,9 +6,10 @@
 //! | `[source] include`        | `[source] include`          |
 //! | `[source] exclude`        | `[source] exclude`          |
 //! | `[source] secret_files`   | `[source] secret_files`     |
+//! | `no-cache`                | `[ci] no_cache`             |
 //!
-//! `no-cache`, `link-node-modules` and `[setup] ignore-env` have no counterpart
-//! (see [`UNMAPPED`]); they stay with local-ci. The file is validated by
+//! `link-node-modules` and `[setup] ignore-env` have no counterpart (see
+//! [`UNMAPPED`]); a value in either is reported as a notice, not applied. The file is validated by
 //! local-ci's own parser, so a typo is rejected exactly as local-ci rejects it.
 //! An empty list in the legacy file counts as "not set" (local-ci cannot tell
 //! the two apart either).
@@ -40,10 +41,14 @@ pub const MAPPING: &[Mapping] = &[
         local_ci: "[source] secret_files",
         rtr: "[source] secret_files",
     },
+    Mapping {
+        local_ci: "no-cache",
+        rtr: "[ci] no_cache",
+    },
 ];
 
 /// local-ci keys with no counterpart here.
-pub const UNMAPPED: &[&str] = &["no-cache", "link-node-modules", "[setup] ignore-env"];
+pub const UNMAPPED: &[&str] = &["link-node-modules", "[setup] ignore-env"];
 
 /// The mapped values of a `.local-ci.toml`. `None` means the key is absent
 /// (or an empty list).
@@ -54,6 +59,10 @@ pub struct Fallback {
     pub include: Option<Vec<String>>,
     pub exclude: Option<Vec<String>>,
     pub secret_files: Option<Vec<SecretSpec>>,
+    pub no_cache: Option<Vec<String>>,
+    /// Unsupported keys, kept only to be reported (see `resolve::Notice`).
+    pub link_node_modules: bool,
+    pub ignore_env: Vec<String>,
 }
 
 fn non_empty<T>(v: Vec<T>) -> Option<Vec<T>> {
@@ -84,6 +93,9 @@ pub fn from_text(path: &str, text: &str) -> Result<Fallback, ConfigError> {
         include: non_empty(c.source.include),
         exclude: non_empty(c.source.exclude),
         secret_files: non_empty(secrets),
+        no_cache: non_empty(c.no_cache),
+        link_node_modules: c.link_node_modules,
+        ignore_env: c.ignore_env,
     })
 }
 
@@ -94,9 +106,9 @@ pub fn secret_spec(s: &SecretFile) -> SecretSpec {
             glob: g.clone(),
             required: false,
         },
-        SecretFile::Full { glob, required } => SecretSpec {
-            glob: glob.clone(),
-            required: *required,
+        SecretFile::Full(f) => SecretSpec {
+            glob: f.glob.clone(),
+            required: f.required,
         },
     }
 }

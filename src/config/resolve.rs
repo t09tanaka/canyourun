@@ -129,11 +129,25 @@ pub struct ResolvedConfig {
     pub timeout_seconds: Value<Option<u64>>,
     pub toolchain_match: Value<ToolchainMatch>,
     pub workflows_dirs: Value<Vec<String>>,
+    /// `[ci] no_cache`: workflows (`ci.yml`) or jobs (`ci.yml:e2e`) whose
+    /// results are never reused. Loaded here; acted on by the template layer.
+    pub no_cache: Value<Vec<String>>,
     pub status_context: Value<String>,
     pub unsupported: Value<Unsupported>,
     pub outputs: Vec<OutputSpec>,
     /// `[prepare] commands`; empty when the project has none.
     pub prepare_commands: Vec<Vec<String>>,
+    /// Settings that were present but are not applied. `ci plan` and `doctor`
+    /// show them.
+    pub notices: Vec<Notice>,
+}
+
+/// A setting that was read and deliberately not applied.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Notice {
+    pub key: &'static str,
+    pub file: String,
+    pub reason: String,
 }
 
 /// One line of a "show the effective config" listing.
@@ -221,6 +235,7 @@ impl ResolvedConfig {
                 toolchain_str(*v).to_string()
             }),
             e("ci.workflows_dirs", &self.workflows_dirs, |v| list(v)),
+            e("ci.no_cache", &self.no_cache, |v| list(v)),
             e("ci.status_context", &self.status_context, |v| v.clone()),
             e("ci.unsupported", &self.unsupported, |v| {
                 unsupported_str(*v).to_string()
@@ -337,16 +352,18 @@ fn normalize_dirs(dirs: &[String], problems: &mut Vec<String>, origin: &str) -> 
 }
 
 /// A conflict between the project file and the legacy file on one mapped key.
-fn conflict<T: PartialEq>(
+fn conflict<T>(
     problems: &mut Vec<String>,
     mapping_index: usize,
-    project: &Option<T>,
-    legacy: &Option<T>,
+    project: &Option<Vec<T>>,
+    legacy: &Option<Vec<T>>,
     paths: (&str, &str),
-    show: impl Fn(&T) -> String,
-) {
+    show: impl Fn(&Vec<T>) -> String,
+) where
+    T: Ord,
+{
     if let (Some(p), Some(l)) = (project, legacy) {
-        if p != l {
+        if !same_set(p, l) {
             let m = MAPPING[mapping_index];
             problems.push(format!(
                 "{} {} = {} conflicts with {} {} = {}; make them agree or remove one",
@@ -359,6 +376,11 @@ fn conflict<T: PartialEq>(
             ));
         }
     }
+}
+
+/// Lists compare as sets: order and repeats are not a contradiction.
+fn same_set<T: Ord>(a: &[T], b: &[T]) -> bool {
+    a.iter().collect::<BTreeSet<_>>() == b.iter().collect::<BTreeSet<_>>()
 }
 
 fn strs(v: &[String]) -> String {
@@ -528,6 +550,29 @@ fn check_prepare(project: &ProjectConfig, problems: &mut Vec<String>) -> Vec<Vec
     cmds
 }
 
+const NOTICE_REASON: &str =
+    "not supported by remote-task-runner; dependencies are prepared by fast-worktree's [[clone]]";
+
+/// Unsupported `.local-ci.toml` keys that actually carry a value.
+fn legacy_notices(legacy: &Fallback) -> Vec<Notice> {
+    let mut out = Vec::new();
+    if legacy.link_node_modules {
+        out.push(Notice {
+            key: "link-node-modules",
+            file: legacy.path.clone(),
+            reason: NOTICE_REASON.to_string(),
+        });
+    }
+    if !legacy.ignore_env.is_empty() {
+        out.push(Notice {
+            key: "[setup] ignore-env",
+            file: legacy.path.clone(),
+            reason: NOTICE_REASON.to_string(),
+        });
+    }
+    out
+}
+
 /// Merge the layers. Returns every problem found, not only the first.
 pub fn resolve(inp: &Inputs<'_>) -> Result<ResolvedConfig, ConfigError> {
     let mut problems: Vec<String> = Vec::new();
@@ -602,6 +647,23 @@ pub fn resolve(inp: &Inputs<'_>) -> Result<ResolvedConfig, ConfigError> {
         |v| secrets_show(v),
     );
 
+    conflict(
+        &mut problems,
+        4,
+        &ci.no_cache,
+        &legacy.no_cache,
+        paths,
+        |v| strs(v),
+    );
+    if let Some(n) = &ci.no_cache {
+        if n.iter().any(|e| e.trim().is_empty()) {
+            problems.push(format!(
+                "{project_path}: [ci] no_cache: give a workflow file (`ci.yml`) or a job (`ci.yml:e2e`)"
+            ));
+        }
+    }
+
+    let notices = legacy_notices(&legacy);
     let some = |v: Option<String>| v.map(Some);
     let r = ResolvedConfig {
         local_worker: pick(&layers, None, None, None, coord.local_worker, true),
@@ -745,6 +807,14 @@ pub fn resolve(inp: &Inputs<'_>) -> Result<ResolvedConfig, ConfigError> {
             None,
             vec![DEFAULT_WORKFLOWS_DIR.to_string()],
         ),
+        no_cache: pick(
+            &layers,
+            None,
+            ci.no_cache.clone(),
+            legacy.no_cache.clone(),
+            None,
+            Vec::new(),
+        ),
         status_context: pick(
             &layers,
             None,
@@ -763,6 +833,7 @@ pub fn resolve(inp: &Inputs<'_>) -> Result<ResolvedConfig, ConfigError> {
         ),
         outputs: check_outputs(project, &mut problems),
         prepare_commands: check_prepare(project, &mut problems),
+        notices,
     };
 
     check_timing(&r, &mut problems);
