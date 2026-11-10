@@ -39,7 +39,7 @@
 7. 切断・ACK消失・親やworker agentの再起動で二重実行を起こさない。
 8. 未開始・実行中の仕事を取り消せる。停止確認前に停止済みと表示しない。
 9. 必須成果物と終了結果を検証して回収でき、回収だけを再開できる。
-10. 既存の `local-ci` と `canirun` のCLI互換を維持し、同一ホストの資源予算を二重に作らない。共有scopeでの保証には、後述するcanirun runtime更新を必要とする。
+10. 既存の `local-ci` と `task-traffic-controller` のCLI互換を維持し、同一ホストの資源予算を二重に作らない。共有scopeでの保証には、後述するtask-traffic-controller runtime更新を必要とする。
 11. `needs` を保持したJob DAGと独立Shardを複数workerへ配置できる。長時間テストの自動shardingも初回実用版の対象とする。
 12. 実際の2台以上のMacと障害注入で、後述の受入条件を満たす。
 13. worker間のツール版・入力ファイルの差を検出し、自動で揃えられるものは揃え、揃えられないものは理由と手順を示す（第22章）。
@@ -56,11 +56,11 @@
 | attempt supervisor | 1つのattemptの寿命、lease、step・サービスの管理 | SSHセッションの寿命に従属しない |
 | command supervisor | 1つの重いcommandのadmission、起動、計測、停止 | worker全体のsignal handlerを共有しない |
 | local-ci-core | workflow解析、Job DAG、実行可能Task／Shardへの分割、CI実行・結果 | ネットワーク配置を所有しない |
-| canirun-core | 1ホスト内の資源計画、キュー、開始判定、見積もり、計測 | ネットワークや分散リーダーを管理しない |
+| task-traffic-controller-core | 1ホスト内の資源計画、キュー、開始判定、見積もり、計測 | ネットワークや分散リーダーを管理しない |
 
-`canirun` に分散システム全体を入れない。ホスト内の資源制御を再利用可能にし、その情報を `remote-task-runner` が配置判断に使う。
+`task-traffic-controller` に分散システム全体を入れない。ホスト内の資源制御を再利用可能にし、その情報を `remote-task-runner` が配置判断に使う。
 
-配布物は原則として1つの `remote-task-runner` バイナリとする。通常利用で `local-ci` や `canirun` の別インストールを要求しない。既存リポジトリから `local-ci-core` と `canirun-core` を抽出し、既存CLIもそのcoreを使う薄いadapterとして維持する。依存version・protocol・cache schemaは固定し、配布物に元のライセンス表記を含める。
+配布物は原則として1つの `remote-task-runner` バイナリとする。通常利用で `local-ci` や `task-traffic-controller` の別インストールを要求しない。既存リポジトリから `local-ci-core` と `task-traffic-controller-core` を抽出し、既存CLIもそのcoreを使う薄いadapterとして維持する。依存version・protocol・cache schemaは固定し、配布物に元のライセンス表記を含める。
 
 workerには待受プロセスを置く。ただしLANへ独自の未認証TCPポートを開ける構成を既定にはしない。親がSSH接続を張り、`remote-task-runner worker --stdio` をUnix socketへのbridgeとして起動する。agentとsupervisorはSSHから独立して動く。親のlocal workerも同じ実行経路を使い、通信部分だけUnix socket直結とする。
 
@@ -257,7 +257,7 @@ Git外のgeneric execにはdirectory snapshotを提供する。sourceが不要�
 
 **未配置のJob／Shardは動的に配置できる。配置された実行セッション（workspace・service・step状態を持つ単位）は開始後、同じhostに固定する。** `needs` の先行Jobが別hostで完了しても、結果と必要artifactが親で確定した時点で後続Jobを別workerへ配置できる。同一Jobの任意の連続stepを、workspaceの状態転送なしで別hostへ移動しない。受理済みだが未開始のattemptを再配置する場合も、元workerのretireと停止確認を要する。
 
-run開始時に全Unitをworkerへ押し込まない。親に未配置backlogを残し、workerごとの先行受理枠を制限する。既定の `prefetch_per_worker = 1` は、実行セッション開始前の先行homeworkを1件に制限する値であり、実行中step数やCPU budgetとは別である。実際のstep並列数はcanirunのadmissionとCIのconcurrency規則に従う。
+run開始時に全Unitをworkerへ押し込まない。親に未配置backlogを残し、workerごとの先行受理枠を制限する。既定の `prefetch_per_worker = 1` は、実行セッション開始前の先行homeworkを1件に制限する値であり、実行中step数やCPU budgetとは別である。実際のstep並列数はtask-traffic-controllerのadmissionとCIのconcurrency規則に従う。
 
 ### 分割モデルと決定規則
 
@@ -297,7 +297,7 @@ Shardの結果は `job_id / shard_id / test_identity` で集約し、assertion�
 
 template keyには、source digest、順序付きsetup recipe、working directory、解決済みshell、workflow／job／stepを合成した実効env、toolchain・OS・arch・profile、cache schema、reuse scope、freshness policyを含める。scopeは `run / persistent` を区別し、run scopeではrun IDもkeyへ含める。コマンド文字列だけが同じでも準備の同一性を認めない。
 
-同じtemplateの生成はworker内でsingleflightにし、複数Unitで待てる。builderは独立した `builder_id` とdurableなconsumer参照集合を持つ。1つのUnitのcancelや再配置で、他Unitが必要とするbuilderを止めない。最後の有効参照がなくなった場合にだけbuilder停止を判断する。setupも重いcommandとしてcanirunに登録し、builder IDに対するbudget chargeとforecast上の需要は1つだけ保持する。
+同じtemplateの生成はworker内でsingleflightにし、複数Unitで待てる。builderは独立した `builder_id` とdurableなconsumer参照集合を持つ。1つのUnitのcancelや再配置で、他Unitが必要とするbuilderを止めない。最後の有効参照がなくなった場合にだけbuilder停止を判断する。setupも重いcommandとしてtask-traffic-controllerに登録し、builder IDに対するbudget chargeとforecast上の需要は1つだけ保持する。
 
 完成templateはimmutableとし、Unitごとにcopyまたはwrite-isolatedなcloneを作る。書込み可能なhardlinkの共有は禁止する。新しいrequirementsを既存templateへ追加実行して上書きせず、別keyで構築する。forecastでは共有builderの負荷を1回だけ数え、各Unitの依存として参照する。
 
@@ -325,7 +325,7 @@ coordinator内の1つのscheduler actorが、配置のcommitを直列化する�
 
 最短の予測完了時間を基本とし、同程度なら待機の少なさ、cache状態、転送量、既存affinity、stable worker IDで決める。これは推定に基づく配置であり、全体の最適解や完了時刻の保証ではない。
 
-workerはactive homework数と未開始prefetch数の両方を制限する。既定は `max_active_homework = 2`、`prefetch_per_worker = 1` とし、設定で調整できる。resource待ちのactive homeworkもactive枠を使う。セッションだけを大量に開始して親のbacklogを消費する実装を避ける。step単位のCPU・メモリ制御は別途canirunが行う。
+workerはactive homework数と未開始prefetch数の両方を制限する。既定は `max_active_homework = 2`、`prefetch_per_worker = 1` とし、設定で調整できる。resource待ちのactive homeworkもactive枠を使う。セッションだけを大量に開始して親のbacklogを消費する実装を避ける。step単位のCPU・メモリ制御は別途task-traffic-controllerが行う。
 
 ## 必要なのは仕事ごとの予測
 
@@ -344,7 +344,7 @@ setupがCPUを使うcommandなら、単なる準備遅延へ隠さず資源を�
 
 ## WorkloadPlan
 
-canirun-coreへ渡す計画はCI非依存の構造とする。
+task-traffic-controller-coreへ渡す計画はCI非依存の構造とする。
 
 | 要素 | 内容 |
 | - | - |
@@ -392,7 +392,7 @@ APIは `measured / fallback / unknown` の出所、履歴件数、条件付き�
 | node_id | setup・step等の実行node |
 | request_id / payload_hash | 冪等な要求と同一内容の確認 |
 
-親と各workerは、それぞれローカルdiskのSQLiteを正本とする。WALを使用し、受理・配置・terminal確定等の重要transactionは永続commit後に応答する。LAN共有directory上のSQLiteや、canirun ledgerを分散DBとして使用しない。
+親と各workerは、それぞれローカルdiskのSQLiteを正本とする。WALを使用し、受理・配置・terminal確定等の重要transactionは永続commit後に応答する。LAN共有directory上のSQLiteや、task-traffic-controller ledgerを分散DBとして使用しない。
 
 同じhomeworkに非terminalの実行attemptを複数持たない。新attemptは旧attemptのterminal／retiredが確認されてから作る。coordinator epochで古い制御要求を拒否するが、世代を増やしただけで古いプロセスが停止したとは扱わない。結果はattempt ID、generation、payload hashで採否を決める。再起動後にadoptした同じattemptの永続結果は、生成時のcoordinator epochが古くても回収する。
 
@@ -521,9 +521,9 @@ secret bundleの内容はartifact・outputs・ログspoolのいずれにも含�
 
 workerは専用または指定された非root userで実行する。各hostのHOME、TMPDIR、PATH、shellとprofileを使い、親の環境変数を丸ごと転送しない。通常envは、profileのbase、投入時にcaptureしたpass-through、project、workflow、job、前stepのGITHUB_ENV、現在stepのenvの順に合成し、後の値を優先する。pass-throughの非secret値はretry時にも取り直さない。portool等の自動defaultsはworkflowより前に入れる。
 
-GITHUB_WORKSPACE、attempt identity、CANIRUN_LEASE、内部socket・state path等の予約値はruntimeが最後に設定し、設定による上書きをerrorにする。PATHはprofileのbaseに正当なGITHUB_PATH更新を適用する。HOME／TMPDIRはprofileとworkspace方針が決め、親の同名envを暗黙転送しない。
+GITHUB_WORKSPACE、attempt identity、TASK_TRAFFIC_CONTROLLER_LEASE、内部socket・state path等の予約値はruntimeが最後に設定し、設定による上書きをerrorにする。PATHはprofileのbaseに正当なGITHUB_PATH更新を適用する。HOME／TMPDIRはprofileとworkspace方針が決め、親の同名envを暗黙転送しない。
 
-新しいworker／top-level supervisorへ、親の `CANIRUN_LEASE` は持ち込まない。各command supervisorが自分のleaseを取得し、そのcommandの子だけに継承する。既にadmission済みstepの内部で呼ばれる正当なnested canirunは、同じscopeのleaseを検証して継承し、二重課金を避ける。
+新しいworker／top-level supervisorへ、親の `TASK_TRAFFIC_CONTROLLER_LEASE` は持ち込まない。各command supervisorが自分のleaseを取得し、そのcommandの子だけに継承する。既にadmission済みstepの内部で呼ばれる正当なnested task-traffic-controllerは、同じscopeのleaseを検証して継承し、二重課金を避ける。
 
 secretはprojectが名前で参照する、worker側profileのsecret providerまたは明示転送で解決する。永続spec、CLI引数、source manifestに平文secretを埋め込まない。転送する場合は認証済みSSH経由で実行時に渡し、再起動後はproviderから再解決する。値はlogからmaskするが、任意commandが加工した値まで完全に秘匿できる保証はしない。
 
@@ -533,9 +533,9 @@ providerのversion／revisionを実行契約へ結び付ける。同じ参照を
 
 repo lock、port、container slotは実行host内の資源として扱う。parentのport割当をそのまま子へ渡さない。複数workerが同一のremote Docker engine等を使う場合は同じresource domainのlockを共有する。初回版でそのdomainを管理できない構成はdoctorで不適合とし、同一engineを独立資源として二重計上しない。
 
-同一OS userの互換canirun CLIとremote-task-runnerは同じledger・lock・leaseの資源scopeを使う。共存保証の対象は、本仕様のreaper修正を含む更新後のcanirun runtimeとする。未修正v0.4.2 binaryの同時使用まで無条件には保証しない。複数OS userでそれぞれ全CPU budgetを持つ構成にはしない。複数userを運用する場合は管理者が合計予算を分割するか、単一実行userへ集約する。
+同一OS userの互換task-traffic-controller CLIとremote-task-runnerは同じledger・lock・leaseの資源scopeを使う。共存保証の対象は、本仕様のreaper修正を含む更新後のtask-traffic-controller runtimeとする。未修正v0.4.2 binaryの同時使用まで無条件には保証しない。複数OS userでそれぞれ全CPU budgetを持つ構成にはしない。複数userを運用する場合は管理者が合計予算を分割するか、単一実行userへ集約する。
 
-同じledgerに加え、scopeのeffective policyも一致させる。budgetやguardをworkerだけの別configで上書きしない。共通configを正本とし、必要なpolicy変更はdrainまたは協調更新で行う。doctorは旧CLIとworkerのstate path・policy digestを確認する。nested canirunにも同じscopeを明示し、HOME／XDG系の偶然の違いで別budgetを作らない。
+同じledgerに加え、scopeのeffective policyも一致させる。budgetやguardをworkerだけの別configで上書きしない。共通configを正本とし、必要なpolicy変更はdrainまたは協調更新で行う。doctorは旧CLIとworkerのstate path・policy digestを確認する。nested task-traffic-controllerにも同じscopeを明示し、HOME／XDG系の偶然の違いで別budgetを作らない。
 
 # 15. 親からの導入とMacの常駐方式
 
@@ -549,9 +549,9 @@ system-user modeではlogin shell、GUI Keychain、Docker Desktop等が利用で
 
 バイナリはversion別directoryへ配置し、実行中supervisorのファイルを上書きしない。更新はdrain、配置、互換検査、service切替、health check、resumeの順に行う。失敗時は元versionへ戻せる。古いattemptの結果とspoolを読み取れるmigrationを含める。
 
-# 16. canirunに必要な仕様変更
+# 16. task-traffic-controllerに必要な仕様変更
 
-基準実装は `canirun v0.4.2`、commit `8fdeb83ecd8b68efcd87ddd1d52ef9d643b79713` とする。lib化（第23章）後の基準は main `7f095ad` とする。
+基準実装は `task-traffic-controller v0.4.2`、commit `8fdeb83ecd8b68efcd87ddd1d52ef9d643b79713` とする。lib化（第23章）後の基準は main `7f095ad` とする。
 
 ## 現状との差分
 
@@ -560,7 +560,7 @@ system-user modeではlogin shell、GUI Keychain、Docker Desktop等が利用で
 | `status --json` は主にledgerのserialize | 既存出力を維持し、version付きのinspectとforecastを追加 |
 | ETAは既にqueueにあるIDを対象とし、履歴なしに60秒を使い、live guardを予測しない | 未投入command／WorkloadPlanを予測し、fallback・unknown・条件付きETAを区別 |
 | `submit` は5秒で登録確認できなくてもwarningとIDを返せる | durable accepted、registered、runningのreceiptを分離 |
-| liveな `CANIRUN_LEASE` を継承するとnested実行のadmission・計測を省略 | Unitを外側の普通のleaseで包まず、step単位で取得 |
+| liveな `TASK_TRAFFIC_CONTROLLER_LEASE` を継承するとnested実行のadmission・計測を省略 | Unitを外側の普通のleaseで包まず、step単位で取得 |
 | runnerがprocess-globalなsignal処理を使う | workerの並列threadへ直結せず、専用supervisorへ分離 |
 | jobはwaiter不在でorphan停止する経路を持つ | remote-task-runnerではdurable lifecycleとleaseを使い、SSH切断をwaiter消失にしない |
 | ledger entryの除去とjob終了記録が別処理 | durableなterminal記録を先に確定してから資源登録を解放 |
@@ -583,7 +583,7 @@ system-user modeではlogin shell、GUI Keychain、Docker Desktop等が利用で
 
 coreにstate directory、config、history、Clock、計測provider、実行contextを明示的に渡す。並列処理のためにプロセス全体のcwdやenvを一時変更するAPIにはしない。libraryから `process::exit` せず、旧CLIのexit code・signal再送はadapterが再現する。
 
-新しいCLI入口として `canirun inspect --json`、`canirun estimate --json -- <command>` を追加する。remote-task-runnerはCLIの表示を解析せずcore APIを利用する。
+新しいCLI入口として `task-traffic-controller inspect --json`、`task-traffic-controller estimate --json -- <command>` を追加する。remote-task-runnerはCLIの表示を解析せずcore APIを利用する。
 
 forecast responseの概念例：
 
@@ -636,15 +636,15 @@ CPU weightやRSSはadmissionと予測のための値であり、OSの強制CPU�
 
 OSのprocess spawnとDB commitを1つのatomic transactionにはできない。child実行前のhandshakeとlaunch intentを使い、crash後に起動の有無が不明なら再spawnせず調査・停止・interrupted確定へ進む。履歴書込み失敗だけで仕事を再実行しない。
 
-supervisorがSIGKILLされた場合、flockの消失だけでbudgetを解放してはならない。managed entryのreaperはruntime metadata、boot ID、process identity、所有serviceを照合し、子孫の停止を確認するまでquarantine中の資源chargeを保持する。metadataが読めない場合も空き扱いしない。新coreを使うcanirun CLIも同じreaper規則を使う。
+supervisorがSIGKILLされた場合、flockの消失だけでbudgetを解放してはならない。managed entryのreaperはruntime metadata、boot ID、process identity、所有serviceを照合し、子孫の停止を確認するまでquarantine中の資源chargeを保持する。metadataが読めない場合も空き扱いしない。新coreを使うtask-traffic-controller CLIも同じreaper規則を使う。
 
 ## 既存stateとの互換
 
 旧 `status --json` と既存CLIの契約を維持する。既存ledger v1へ、旧binaryの保存処理で消える重要な新fieldを混在させない。correlation、accepted、managed ownership、event、log offsetはremote-task-runner storeのsidecarとして管理し、更新後のreaperが参照する。
 
-CLIの互換維持と、未修正binaryとの同時互換は分ける。v0.4.2のreaperはmanaged ownershipを理解しないため、共有scopeでは修正版への更新を必須とする。doctorとbootstrapは実行中process、解決されるcanirun binary、scopeのruntime compatibilityを検査し、未対応ならdrain・更新の必要を表示してmanaged dispatchを開始しない。旧単独jobを動かしたままstateを破壊する移行は行わない。
+CLIの互換維持と、未修正binaryとの同時互換は分ける。v0.4.2のreaperはmanaged ownershipを理解しないため、共有scopeでは修正版への更新を必須とする。doctorとbootstrapは実行中process、解決されるtask-traffic-controller binary、scopeのruntime compatibilityを検査し、未対応ならdrain・更新の必要を表示してmanaged dispatchを開始しない。旧単独jobを動かしたままstateを破壊する移行は行わない。
 
-snapshot digestはcanonical ledger・policy・参照履歴・overlayから計算し、後付けrevision fieldだけには依存しない。旧entryのUTCから推定したageは `legacy_clock` と明記する。旧canirunと同じuser・state scopeで同じlock／leaseを使い、別budgetによる過剰実行を避ける。
+snapshot digestはcanonical ledger・policy・参照履歴・overlayから計算し、後付けrevision fieldだけには依存しない。旧entryのUTCから推定したageは `legacy_clock` と明記する。旧task-traffic-controllerと同じuser・state scopeで同じlock／leaseを使い、別budgetによる過剰実行を避ける。
 
 変更対象は `src/main.rs`、`cmd/exec.rs`、`cmd/status.rs`、`cmd/job.rs`、`admit.rs`、`eta.rs`、`runner.rs`、`ledger.rs`、`lock.rs`、`jobs.rs`、`key.rs`、`gitctx.rs`、history／paths周辺と、抽出した `lib.rs` である。
 
@@ -657,7 +657,7 @@ snapshot digestはcanonical ledger・policy・参照履歴・overlayから計算
 | CLI内でrevision・branch・filterを決めて実行 | plannerとexecutorをlibraryへ分離し、FrozenPlanをwire化 |
 | needs等でUnitをまとめる | Job DAGとして依存辺を保持し、Job単位で独立配置。さらにrunner対応のテストTask／Shardを自動分割 |
 | 全体でsetupをhoistし、global判定で元stepをskip | 元stepsを保持し、Task／ShardごとのSetupRecipeと成功receiptで置換 |
-| shell stepをcanirun経由で実行する一方、setupに別経路がある | 全重いstep・setupを同じcommand supervisorへ流す |
+| shell stepをtask-traffic-controller経由で実行する一方、setupに別経路がある | 全重いstep・setupを同じcommand supervisorへ流す |
 | 絶対pathのtools・worktree・node_modulesを使う | symbolic planとhost固有materializationを分離 |
 | 既存のworktree dirty検出はuntrackedを含めない | 新snapshot APIで未追跡を含む入力を固定 |
 | cache keyにhost環境の十分な区別がない | OS・arch・toolchain・profile・source・planを明示する |
@@ -705,7 +705,7 @@ runの結果にはsource digestと元HEADを併記する。入力が一致する
 | service | launchd、SSH bootstrap、更新・rollback、doctor |
 | storage | schema migration、transaction、tombstone、event journal |
 
-既存のcanirunを利用中なら、そのstate scopeを検出し、旧jobをdrainして必要なruntime更新を行ったうえで同じbudgetを使う。別scopeへ移す必要がある場合も移行を明示する。履歴が取り込めなくてもcold startとして動作させ、履歴欠落を資源不足や0秒予測に変換しない。
+既存のtask-traffic-controllerを利用中なら、そのstate scopeを検出し、旧jobをdrainして必要なruntime更新を行ったうえで同じbudgetを使う。別scopeへ移す必要がある場合も移行を明示する。履歴が取り込めなくてもcold startとして動作させ、履歴欠落を資源不足や0秒予測に変換しない。
 
 既存 `.local-ci.toml` とworkflowは読み込み、`remote-task-runner ci plan` で互換性・分散単位・必要profileを表示する。1台だけでも全く同じcoordinator／worker経路を通し、子が増えたときだけ別実装へ切り替わる構造にしない。
 
@@ -721,7 +721,7 @@ protocol／storage migrationは互換表を持ち、未知versionをその場で
 | A02 | 途中からworker追加 | 親の未配置backlogを新workerが実際に引き取る |
 | A03 | busy workerとcold worker | queue、setup、転送を含む判断理由が説明できる |
 | A04 | 複数CLIの同時submit | 未ACK需要を含め、競合する配置commitを直列化する |
-| A05 | 互換canirun CLIとの同時利用 | 更新後coreで同じbudget・policyを共有。未修正binaryをdoctorが不適合とする |
+| A05 | 互換task-traffic-controller CLIとの同時利用 | 更新後coreで同じbudget・policyを共有。未修正binaryをdoctorが不適合とする |
 | A06 | estimateを100回実行 | ledger entry、lease、job、受理予約を増やさない |
 | A07 | ready遅延10秒、queue30秒、runtime20秒 | 回収を除く単一commandのfinishを50秒と計算する |
 | A08 | acceptedからregisteredへの遷移 | future demandの欠落・二重計上がない |
@@ -760,7 +760,7 @@ protocol／storage migrationは互換表を持ち、未知versionをその場で
 | A41 | shardの不適合・サービス依存・失敗 | 分割不可を説明し、適切に単一Jobへ戻す。fail-fast／retry／reportが正しい |
 | A42 | 版指定のtoolがworkerに無い／版が違う | 自動導入できるものは導入後に実行し、導入不能ならblockedと手順を示す。導入中の負荷をforecastに含める |
 | A43 | secret_filesを持つrunをworkerで実行 | attempt workspaceに同じ内容・0600で存在し、terminal後にworkerから消える。object store・cache・template・log・artifactに残らない。worker再起動後は親から再送される |
-| A44 | `workers diff`／`sync` | 親とworkerのtool版・PATH上のtool・portool／canirun／local-ci版・Docker可否の差を正しく示し、syncが自動導入可能な差だけを解消する |
+| A44 | `workers diff`／`sync` | 親とworkerのtool版・PATH上のtool・portool／task-traffic-controller／local-ci版・Docker可否の差を正しく示し、syncが自動導入可能な差だけを解消する |
 
 A37では、実行時間を準備・転送・資源待ち・計算・回収に分けて記録する。小さいjobは転送で遅くなる場合もあるため、全jobの一律speedupを保証値にしない。対象CIの分散可能な並列幅、cold／warm、親単独との差を報告し、目標の負荷が1台へ集中したままなら完成としない。
 
@@ -781,7 +781,7 @@ CI自体のpassには、必要なhomeworkが仕様どおり成功または許容
 
 完了報告には、実装commit、対応version、検証したMac・OS・profile、受入結果、既知の互換制限、運用手順を添える。未実装の必須項目を「将来対応」と記載して実用版完成とはしない。
 
-この仕様で中心となる判断は、**入口をremote-task-runnerに一本化し、local-ciのCI知識とcanirunのホスト内資源制御を維持しながら、分散と永続実行をremote-task-runnerが所有すること**である。利用者は `remote-task-runner ci` または `remote-task-runner exec` で投入し、実行先の選択と復旧は同じ仕組みへ任せる。
+この仕様で中心となる判断は、**入口をremote-task-runnerに一本化し、local-ciのCI知識とtask-traffic-controllerのホスト内資源制御を維持しながら、分散と永続実行をremote-task-runnerが所有すること**である。利用者は `remote-task-runner ci` または `remote-task-runner exec` で投入し、実行先の選択と復旧は同じ仕組みへ任せる。
 
 # 21. 調査基準と参照
 
@@ -790,9 +790,9 @@ CI自体のpassには、必要なhomeworkが仕様どおり成功または許容
 | 対象 | 基準 |
 | - | - |
 | local-ci | v0.6.2 / `873b4a72cc1e4f30d1e538cbfabd6c821682d08f`（lib化後 main `7deff5e`） |
-| canirun | v0.4.2 / `8fdeb83ecd8b68efcd87ddd1d52ef9d643b79713`（lib化後 main `7f095ad`） |
+| task-traffic-controller | v0.4.2 / `8fdeb83ecd8b68efcd87ddd1d52ef9d643b79713`（lib化後 main `7f095ad`） |
 
-既存挙動の根拠は第16・17章のcommit固定source linksを参照する。特に [local-ciのsetup計画](https://github.com/t09tanaka/local-ci/blob/873b4a72cc1e4f30d1e538cbfabd6c821682d08f/src/plan.rs)、[canirunのadmission](https://github.com/t09tanaka/canirun/blob/8fdeb83ecd8b68efcd87ddd1d52ef9d643b79713/src/admit.rs)、[canirunのlocal lease](https://github.com/t09tanaka/canirun/blob/8fdeb83ecd8b68efcd87ddd1d52ef9d643b79713/src/lock.rs)が統合の重要な境界である。
+既存挙動の根拠は第16・17章のcommit固定source linksを参照する。特に [local-ciのsetup計画](https://github.com/t09tanaka/local-ci/blob/873b4a72cc1e4f30d1e538cbfabd6c821682d08f/src/plan.rs)、[task-traffic-controllerのadmission](https://github.com/t09tanaka/canirun/blob/8fdeb83ecd8b68efcd87ddd1d52ef9d643b79713/src/admit.rs)、[task-traffic-controllerのlocal lease](https://github.com/t09tanaka/canirun/blob/8fdeb83ecd8b68efcd87ddd1d52ef9d643b79713/src/lock.rs)が統合の重要な境界である。
 
 Macのservice運用、SSH、Git転送の根拠は次の一次資料とする。ここからremote-task-runner固有のlease・state machine・再配置方針が自動的に得られるわけではなく、それらは本仕様の設計判断である。
 
@@ -822,13 +822,13 @@ plannerは、source snapshotに含まれる版指定を読み、実行要件の 
 
 版指定ファイルの無いtoolで、workflowやprofileが必要とするもの（例: 版を固定していないFlutter・Xcode）は、親でcapture時に解決された版を、そのrunの `toolchain_baseline` として記録する。照合規則はプロジェクト設定 `[toolchain] match = "exact" | "minor" | "major" | "any"` で選び、既定は `exact` とする。baselineと合わないworkerは候補から外すか、自動導入できるなら導入する。
 
-workerのprofileは版管理ツールadapter（nodenv、rustup、mise、fvm、corepack）を持つ。adapterは `detect`（導入済み版の列挙）、`resolve`（要件を具体版へ）、`install`、`activate`（そのattemptのPATH・envへの反映）を備える。不足版の導入は、第8章のsetupと同じ経路（canirunのadmission、worker内singleflight、導入済み版のworker内再利用）で行い、導入にかかる時間と負荷をforecastの準備時間に含める。導入はattemptのworkspaceではなくworkerのtool領域に行い、同じ版の並行導入を1回にまとめる。
+workerのprofileは版管理ツールadapter（nodenv、rustup、mise、fvm、corepack）を持つ。adapterは `detect`（導入済み版の列挙）、`resolve`（要件を具体版へ）、`install`、`activate`（そのattemptのPATH・envへの反映）を備える。不足版の導入は、第8章のsetupと同じ経路（task-traffic-controllerのadmission、worker内singleflight、導入済み版のworker内再利用）で行い、導入にかかる時間と負荷をforecastの準備時間に含める。導入はattemptのworkspaceではなくworkerのtool領域に行い、同じ版の並行導入を1回にまとめる。
 
 管理者権限・ライセンス同意・GUI操作が必要なもの（Xcode本体の導入とライセンス同意、Docker Desktop、Homebrewのsystem package、macOSの権限）は自動導入しない。`blocked: environment_mismatch` とし、不足内容と実行すべき手順を示す。自動導入に失敗した場合も同じとし、成功扱いや別版での実行に切り替えない。
 
 ## 22.2 `workers diff` と `workers sync`
 
-`remote-task-runner workers diff [<worker>] [--json]` は、親（local worker）と対象workerのprofile実効環境の差を示す。対象は、各toolの版（版管理ツールに導入済みの版一覧を含む）、PATH上の必要tool、portool・canirun runtime・local-ci core・remote-task-runner自身の版、Docker実行可否、利用可能disk、profile digest、canirun policy digestとする。項目ごとに `same / differs / missing / auto_installable / manual_required` を示す。`doctor` はこの結果を含む。
+`remote-task-runner workers diff [<worker>] [--json]` は、親（local worker）と対象workerのprofile実効環境の差を示す。対象は、各toolの版（版管理ツールに導入済みの版一覧を含む）、PATH上の必要tool、portool・task-traffic-controller runtime・local-ci core・remote-task-runner自身の版、Docker実行可否、利用可能disk、profile digest、task-traffic-controller policy digestとする。項目ごとに `same / differs / missing / auto_installable / manual_required` を示す。`doctor` はこの結果を含む。
 
 `remote-task-runner workers sync <worker> [--project <dir>]` は、対象workerに対し、自動導入可能な差を事前に解消する（ウォームアップ）。`--project` を付けた場合は、そのプロジェクトの版指定・baselineを基準にする。手動対応が必要な差は導入せず、手順を表示する。sync中もworkerは新規配置を受けられるが、導入対象の版を要する配置はsingleflightで導入完了を待つ。
 
@@ -847,13 +847,13 @@ workerのprofileは版管理ツールadapter（nodenv、rustup、mise、fvm、co
 
 ## 22.4 worker上の周辺tool
 
-canirun runtimeとlocal-ci coreはremote-task-runnerバイナリに含める（第3章）。portoolなど別配布のtoolは、profileの必要toolとして22.1と同じく検査し、22.2の差分に表示する。自動導入できる配布経路（例: `cargo install` の固定版）がprofileに設定されていれば導入し、無ければmanual_requiredとする。
+task-traffic-controller runtimeとlocal-ci coreはremote-task-runnerバイナリに含める（第3章）。portoolなど別配布のtoolは、profileの必要toolとして22.1と同じく検査し、22.2の差分に表示する。自動導入できる配布経路（例: `cargo install` の固定版）がprofileに設定されていれば導入し、無ければmanual_requiredとする。
 
 # 23. 設計判断と基準実装の更新（2026-11-09）
 
 工程1のlib化で分かった事実に基づき、次を決める。
 
-1. **supervisorは別プロセス**: attempt supervisor（とその配下のcommand supervisor）は、attemptごとに同じ `remote-task-runner` バイナリを別プロセスとして起動する。local-ci coreとcanirun coreは「1プロセスで1 attempt」として呼ぶ。理由は、lib化後も両coreにprocess-globalな状態が残っていること（local-ciのkill追跡とworkflows dir既定値、canirunでは `wait4` が割り込まれるのがsignalを受けたスレッドだけであることと、ledgerのpidが `std::process::id()` であること）。ただし第17章のとおり、local-ciのkill追跡はattempt所有へ置き換える。プロセス分離はその上での二重の安全策とする。
-2. **lib化後の基準**: local-ci main `7deff5e`（v0.7.0 + PR #21 によるlib化）、canirun main `7f095ad`（v0.4.2 + PR #14 によるlib化）。
+1. **supervisorは別プロセス**: attempt supervisor（とその配下のcommand supervisor）は、attemptごとに同じ `remote-task-runner` バイナリを別プロセスとして起動する。local-ci coreとtask-traffic-controller coreは「1プロセスで1 attempt」として呼ぶ。理由は、lib化後も両coreにprocess-globalな状態が残っていること（local-ciのkill追跡とworkflows dir既定値、task-traffic-controllerでは `wait4` が割り込まれるのがsignalを受けたスレッドだけであることと、ledgerのpidが `std::process::id()` であること）。ただし第17章のとおり、local-ciのkill追跡はattempt所有へ置き換える。プロセス分離はその上での二重の安全策とする。
+2. **lib化後の基準**: local-ci main `7deff5e`（v0.7.0 + PR #21 によるlib化）、task-traffic-controller main `7f095ad`（v0.4.2 + PR #14 によるlib化）。
 3. **待ち時間の分離**: local-ci v0.7.0は、jobごとに資源待ちを実行時間と分けて記録する。第9章の実行時間には、この待ちを除いた値を使う。
-4. **canirunの既知の窓**: PR #14の後、待ち中のrunnerがSIGTERMを2回続けて受けると、exit fileを書かずに終了し、jobがlostに見える短い窓がある。C3（受理段階のreceiptと終了順序）で、signal handlerを既定へ戻す時点をCLIの再送の直前へ移して閉じる。
+4. **task-traffic-controllerの既知の窓**: PR #14の後、待ち中のrunnerがSIGTERMを2回続けて受けると、exit fileを書かずに終了し、jobがlostに見える短い窓がある。C3（受理段階のreceiptと終了順序）で、signal handlerを既定へ戻す時点をCLIの再送の直前へ移して閉じる。
