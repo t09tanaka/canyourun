@@ -131,7 +131,11 @@ impl WorkerSecrets {
         check_limits(&sizes).map_err(SecretError::Limit)?;
         check_paths(files.iter().map(|f| f.path.as_str())).map_err(SecretError::BadPath)?;
         for f in files {
-            let want = secret_digest(key.as_bytes(), &RelPath(f.path.clone().into_bytes()), &f.content.0);
+            let want = secret_digest(
+                key.as_bytes(),
+                &RelPath(f.path.clone().into_bytes()),
+                &f.content.0,
+            );
             let want = to_wire_digest(&want)
                 .ok_or_else(|| SecretError::Format("unexpected digest form".into()))?;
             if !ct_eq(want.as_str().as_bytes(), f.hmac_digest.as_str().as_bytes()) {
@@ -223,9 +227,8 @@ impl WorkerSecrets {
     /// theirs. A pass never stops at the first failure.
     pub fn reconcile(&self, should_erase: impl Fn(&AttemptId) -> bool) -> Result<ReconcileReport> {
         let mut report = ReconcileReport::default();
-        let rd = fs::read_dir(&self.index_dir).map_err(|e| {
-            SecretError::io(format!("directory {}", self.index_dir.display()), e)
-        })?;
+        let rd = fs::read_dir(&self.index_dir)
+            .map_err(|e| SecretError::io(format!("directory {}", self.index_dir.display()), e))?;
         let mut names: Vec<String> = Vec::new();
         for entry in rd {
             let entry = entry.map_err(|e| {
@@ -298,7 +301,9 @@ fn place_one(root: &Path, rel: &str, content: &[u8], ours_already: bool) -> Resu
         Ok(mut f) => {
             let r = f
                 .write_all(content)
-                .and_then(|()| f.set_permissions(std::os::unix::fs::PermissionsExt::from_mode(0o600)))
+                .and_then(|()| {
+                    f.set_permissions(std::os::unix::fs::PermissionsExt::from_mode(0o600))
+                })
                 .and_then(|()| f.sync_all());
             drop(f);
             let inside = fs::canonicalize(&cur).is_ok_and(|p| p.starts_with(root));
@@ -427,7 +432,10 @@ mod tests {
             file(&e.key, "pkg/a/.env.test", "X=yyyy-9999\n"),
         ];
         assert_eq!(e.ws_secrets.place(&e.key, &a, &e.ws, &files).unwrap(), 2);
-        assert_eq!(fs::read_to_string(e.ws.join(".env")).unwrap(), "TOKEN=abc-123456\n");
+        assert_eq!(
+            fs::read_to_string(e.ws.join(".env")).unwrap(),
+            "TOKEN=abc-123456\n"
+        );
         assert_eq!(mode(&e.ws.join(".env")), 0o600);
         assert_eq!(mode(&e.ws.join("pkg/a/.env.test")), 0o600);
         // the index lists paths, holds no content, and is private
@@ -450,7 +458,10 @@ mod tests {
         assert!(matches!(err, SecretError::Tampered { ref path } if path == "b.env"));
         assert!(!err.to_string().contains("changed"));
         assert_eq!(fs::read_dir(&e.ws).unwrap().count(), 0);
-        assert_eq!(fs::read_dir(e.state.join("secret-index")).unwrap().count(), 0);
+        assert_eq!(
+            fs::read_dir(e.state.join("secret-index")).unwrap().count(),
+            0
+        );
         // another cluster's key is the same refusal
         let other = ClusterKey::from_bytes(vec![9; 32]).unwrap();
         let good = [file(&e.key, "a.env", "A=aaaa-1111")];
@@ -471,19 +482,35 @@ mod tests {
     fn paths_that_leave_the_workspace_or_repeat_are_refused_before_writing() {
         let e = env();
         let a = AttemptId::generate();
-        for bad in ["../x.env", "/abs.env", "a/../../x", ".git/hooks/pre-commit", ""] {
+        for bad in [
+            "../x.env",
+            "/abs.env",
+            "a/../../x",
+            ".git/hooks/pre-commit",
+            "",
+        ] {
             let f = file(&e.key, bad, "V=vvvv-0000");
             assert!(
-                matches!(e.ws_secrets.place(&e.key, &a, &e.ws, &[f]), Err(SecretError::BadPath(_))),
+                matches!(
+                    e.ws_secrets.place(&e.key, &a, &e.ws, &[f]),
+                    Err(SecretError::BadPath(_))
+                ),
                 "{bad}"
             );
         }
-        let dup = [file(&e.key, "d.env", "V=1111-1111"), file(&e.key, "d.env", "V=1111-1111")];
+        let dup = [
+            file(&e.key, "d.env", "V=1111-1111"),
+            file(&e.key, "d.env", "V=1111-1111"),
+        ];
         assert!(matches!(
             e.ws_secrets.place(&e.key, &a, &e.ws, &dup),
             Err(SecretError::BadPath(_))
         ));
-        let big = file(&e.key, "big.env", &"x".repeat(super::super::plan::MAX_FILE_BYTES + 1));
+        let big = file(
+            &e.key,
+            "big.env",
+            &"x".repeat(super::super::plan::MAX_FILE_BYTES + 1),
+        );
         assert!(matches!(
             e.ws_secrets.place(&e.key, &a, &e.ws, &[big]),
             Err(SecretError::Limit(_))
@@ -499,7 +526,12 @@ mod tests {
         symlink(&e.outside, e.ws.join("linked")).unwrap();
         let err = e
             .ws_secrets
-            .place(&e.key, &a, &e.ws, &[file(&e.key, "linked/.env", "S=ssss-0000")])
+            .place(
+                &e.key,
+                &a,
+                &e.ws,
+                &[file(&e.key, "linked/.env", "S=ssss-0000")],
+            )
             .unwrap_err();
         assert!(matches!(err, SecretError::Placement(_)), "{err}");
         assert_eq!(fs::read_dir(&e.outside).unwrap().count(), 0);
@@ -507,14 +539,24 @@ mod tests {
         fs::write(e.ws.join("plain"), b"x").unwrap();
         assert!(e
             .ws_secrets
-            .place(&e.key, &a, &e.ws, &[file(&e.key, "plain/.env", "S=ssss-0000")])
+            .place(
+                &e.key,
+                &a,
+                &e.ws,
+                &[file(&e.key, "plain/.env", "S=ssss-0000")]
+            )
             .is_err());
         // a symlinked directory deeper in the path
         fs::create_dir(e.ws.join("d")).unwrap();
         symlink(&e.outside, e.ws.join("d/deep")).unwrap();
         assert!(e
             .ws_secrets
-            .place(&e.key, &a, &e.ws, &[file(&e.key, "d/deep/.env", "S=ssss-0000")])
+            .place(
+                &e.key,
+                &a,
+                &e.ws,
+                &[file(&e.key, "d/deep/.env", "S=ssss-0000")]
+            )
             .is_err());
         assert_eq!(fs::read_dir(&e.outside).unwrap().count(), 0);
     }
@@ -548,7 +590,10 @@ mod tests {
         let link = e.state.join("wslink");
         symlink(&e.ws, &link).unwrap();
         let f = [file(&e.key, ".env", "S=ssss-0000")];
-        assert!(matches!(e.ws_secrets.place(&e.key, &a, &link, &f), Err(SecretError::Placement(_))));
+        assert!(matches!(
+            e.ws_secrets.place(&e.key, &a, &link, &f),
+            Err(SecretError::Placement(_))
+        ));
         assert!(matches!(
             e.ws_secrets.place(&e.key, &a, &e.state.join("none"), &f),
             Err(SecretError::Io { .. })
@@ -561,7 +606,10 @@ mod tests {
         let e = env();
         let a = AttemptId::generate();
         fs::write(e.ws.join("b.env"), b"mine").unwrap();
-        let files = [file(&e.key, "a.env", "A=aaaa-1111"), file(&e.key, "b.env", "B=bbbb-2222")];
+        let files = [
+            file(&e.key, "a.env", "A=aaaa-1111"),
+            file(&e.key, "b.env", "B=bbbb-2222"),
+        ];
         let err = e.ws_secrets.place(&e.key, &a, &e.ws, &files).unwrap_err();
         assert!(matches!(err, SecretError::Placement(_)));
         assert_eq!(fs::read(e.ws.join("b.env")).unwrap(), b"mine");
@@ -592,12 +640,17 @@ mod tests {
     fn batches_for_one_attempt_add_up_and_stay_in_one_workspace() {
         let e = env();
         let a = AttemptId::generate();
-        e.ws_secrets.place(&e.key, &a, &e.ws, &[file(&e.key, "1.env", "A=aaaa-1111")]).unwrap();
-        e.ws_secrets.place(&e.key, &a, &e.ws, &[file(&e.key, "2.env", "B=bbbb-2222")]).unwrap();
+        e.ws_secrets
+            .place(&e.key, &a, &e.ws, &[file(&e.key, "1.env", "A=aaaa-1111")])
+            .unwrap();
+        e.ws_secrets
+            .place(&e.key, &a, &e.ws, &[file(&e.key, "2.env", "B=bbbb-2222")])
+            .unwrap();
         let other = e.state.join("ws2");
         fs::create_dir(&other).unwrap();
         assert!(matches!(
-            e.ws_secrets.place(&e.key, &a, &other, &[file(&e.key, "3.env", "C=cccc-3333")]),
+            e.ws_secrets
+                .place(&e.key, &a, &other, &[file(&e.key, "3.env", "C=cccc-3333")]),
             Err(SecretError::Placement(_))
         ));
         let r = e.ws_secrets.erase(&a).unwrap();
@@ -610,13 +663,25 @@ mod tests {
         let e = env();
         let a = AttemptId::generate();
         e.ws_secrets
-            .place(&e.key, &a, &e.ws, &[file(&e.key, "x/.env", "A=aaaa-1111"), file(&e.key, ".env", "B=bbbb-2222")])
+            .place(
+                &e.key,
+                &a,
+                &e.ws,
+                &[
+                    file(&e.key, "x/.env", "A=aaaa-1111"),
+                    file(&e.key, ".env", "B=bbbb-2222"),
+                ],
+            )
             .unwrap();
         let r = e.ws_secrets.erase(&a).unwrap();
         assert_eq!(r.removed.len(), 2);
         assert!(r.gone.is_empty() && r.unreachable.is_empty());
         assert!(!e.ws.join(".env").exists() && !e.ws.join("x/.env").exists());
-        assert!(!e.state.join("secret-index").join(format!("{a}.json")).exists());
+        assert!(!e
+            .state
+            .join("secret-index")
+            .join(format!("{a}.json"))
+            .exists());
         assert_eq!(e.ws_secrets.erase(&a).unwrap(), EraseReport::default());
     }
 
@@ -625,7 +690,16 @@ mod tests {
         let e = env();
         let a = AttemptId::generate();
         e.ws_secrets
-            .place(&e.key, &a, &e.ws, &[file(&e.key, "d/.env", "A=aaaa-1111"), file(&e.key, ".env", "B=bbbb-2222"), file(&e.key, "gone.env", "C=cccc-3333")])
+            .place(
+                &e.key,
+                &a,
+                &e.ws,
+                &[
+                    file(&e.key, "d/.env", "A=aaaa-1111"),
+                    file(&e.key, ".env", "B=bbbb-2222"),
+                    file(&e.key, "gone.env", "C=cccc-3333"),
+                ],
+            )
             .unwrap();
         // the parent directory is swapped for a link to a directory outside
         let victim = e.outside.join(".env");
@@ -651,13 +725,17 @@ mod tests {
     fn erase_copes_with_a_missing_or_replaced_workspace_and_a_directory_in_the_way() {
         let e = env();
         let a = AttemptId::generate();
-        e.ws_secrets.place(&e.key, &a, &e.ws, &[file(&e.key, ".env", "A=aaaa-1111")]).unwrap();
+        e.ws_secrets
+            .place(&e.key, &a, &e.ws, &[file(&e.key, ".env", "A=aaaa-1111")])
+            .unwrap();
         fs::remove_dir_all(&e.ws).unwrap();
         assert_eq!(e.ws_secrets.erase(&a).unwrap().gone, [".env"]);
         // the workspace path became a link
         let b = AttemptId::generate();
         fs::create_dir(&e.ws).unwrap();
-        e.ws_secrets.place(&e.key, &b, &e.ws, &[file(&e.key, ".env", "A=aaaa-1111")]).unwrap();
+        e.ws_secrets
+            .place(&e.key, &b, &e.ws, &[file(&e.key, ".env", "A=aaaa-1111")])
+            .unwrap();
         let moved = e.state.join("moved");
         fs::rename(&e.ws, &moved).unwrap();
         symlink(&moved, &e.ws).unwrap();
@@ -667,7 +745,9 @@ mod tests {
         let c = AttemptId::generate();
         let ws3 = e.state.join("ws3");
         fs::create_dir(&ws3).unwrap();
-        e.ws_secrets.place(&e.key, &c, &ws3, &[file(&e.key, ".env", "A=aaaa-1111")]).unwrap();
+        e.ws_secrets
+            .place(&e.key, &c, &ws3, &[file(&e.key, ".env", "A=aaaa-1111")])
+            .unwrap();
         fs::remove_file(ws3.join(".env")).unwrap();
         fs::create_dir(ws3.join(".env")).unwrap();
         assert_eq!(e.ws_secrets.erase(&c).unwrap().unreachable, [".env"]);
@@ -676,11 +756,17 @@ mod tests {
     #[test]
     fn reconcile_erases_terminal_attempts_and_keeps_the_others() {
         let e = env();
-        let (t, r, u) = (AttemptId::generate(), AttemptId::generate(), AttemptId::generate());
+        let (t, r, u) = (
+            AttemptId::generate(),
+            AttemptId::generate(),
+            AttemptId::generate(),
+        );
         for (i, a) in [&t, &r, &u].into_iter().enumerate() {
             let ws = e.state.join(format!("ws{i}"));
             fs::create_dir(&ws).unwrap();
-            e.ws_secrets.place(&e.key, a, &ws, &[file(&e.key, ".env", "A=aaaa-1111")]).unwrap();
+            e.ws_secrets
+                .place(&e.key, a, &ws, &[file(&e.key, ".env", "A=aaaa-1111")])
+                .unwrap();
         }
         // a file that is not an attempt's record, and one that is not a record
         fs::write(e.state.join("secret-index/junk.json"), b"{}").unwrap();
@@ -709,13 +795,19 @@ mod tests {
         let idx = e.state.join("secret-index").join(format!("{a}.json"));
         fs::write(&idx, b"not json").unwrap();
         fs::set_permissions(&idx, fs::Permissions::from_mode(0o600)).unwrap();
-        assert!(matches!(e.ws_secrets.erase(&a), Err(SecretError::Format(_))));
+        assert!(matches!(
+            e.ws_secrets.erase(&a),
+            Err(SecretError::Format(_))
+        ));
         let rep = e.ws_secrets.reconcile(|_| true).unwrap();
         assert_eq!(rep.failed.len(), 1);
         assert!(idx.exists());
         // an index others can read is refused as well
         fs::set_permissions(&idx, fs::Permissions::from_mode(0o644)).unwrap();
-        assert!(matches!(e.ws_secrets.erase(&a), Err(SecretError::Insecure { .. })));
+        assert!(matches!(
+            e.ws_secrets.erase(&a),
+            Err(SecretError::Insecure { .. })
+        ));
     }
 
     #[test]
@@ -724,17 +816,33 @@ mod tests {
         let d = tmp.path().join("secret-index");
         fs::create_dir(&d).unwrap();
         fs::set_permissions(&d, fs::Permissions::from_mode(0o755)).unwrap();
-        assert!(matches!(WorkerSecrets::open(tmp.path()), Err(SecretError::Insecure { .. })));
+        assert!(matches!(
+            WorkerSecrets::open(tmp.path()),
+            Err(SecretError::Insecure { .. })
+        ));
     }
 
     #[test]
     fn too_many_files_over_several_requests_are_refused() {
         let e = env();
         let a = AttemptId::generate();
-        let first: Vec<SecretFile> = (0..MAX_FILES).map(|i| file(&e.key, &format!("f{i}"), "V=vvvv-0000")).collect();
+        let first: Vec<SecretFile> = (0..MAX_FILES)
+            .map(|i| file(&e.key, &format!("f{i}"), "V=vvvv-0000"))
+            .collect();
         e.ws_secrets.place(&e.key, &a, &e.ws, &first).unwrap();
-        let err = e.ws_secrets.place(&e.key, &a, &e.ws, &[file(&e.key, "one-more", "V=vvvv-0000")]).unwrap_err();
-        assert!(matches!(err, SecretError::Limit(Limit::TooManyFiles { .. })));
+        let err = e
+            .ws_secrets
+            .place(
+                &e.key,
+                &a,
+                &e.ws,
+                &[file(&e.key, "one-more", "V=vvvv-0000")],
+            )
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            SecretError::Limit(Limit::TooManyFiles { .. })
+        ));
         assert!(!e.ws.join("one-more").exists());
     }
 }

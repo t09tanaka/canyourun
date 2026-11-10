@@ -281,10 +281,9 @@ impl Vault {
     /// Delete the run's bundle (idempotent).
     pub fn erase(&self, run: &RunId) -> Result<()> {
         match fs::remove_file(self.path(run)) {
-            Err(e) if e.kind() != ErrorKind::NotFound => Err(SecretError::io(
-                format!("secret bundle of run {run}"),
-                e,
-            )),
+            Err(e) if e.kind() != ErrorKind::NotFound => {
+                Err(SecretError::io(format!("secret bundle of run {run}"), e))
+            }
             _ => Ok(()),
         }
     }

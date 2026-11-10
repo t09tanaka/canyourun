@@ -62,7 +62,10 @@ pub fn check_limits(sizes: &[(usize, usize)]) -> Result<(), Limit> {
     let mut total = 0usize;
     for (index, (path, content)) in sizes.iter().enumerate() {
         if *path > MAX_PATH_BYTES {
-            return Err(Limit::PathTooLong { index, bytes: *path });
+            return Err(Limit::PathTooLong {
+                index,
+                bytes: *path,
+            });
         }
         if *content > MAX_FILE_BYTES {
             return Err(Limit::FileTooLarge {
@@ -216,7 +219,7 @@ pub fn hex_encode(bytes: &[u8]) -> String {
 /// Lower-case hex only. `None` for an odd length or another character.
 pub fn hex_decode(s: &str) -> Option<Vec<u8>> {
     let b = s.as_bytes();
-    if b.len() % 2 != 0 {
+    if !b.len().is_multiple_of(2) {
         return None;
     }
     let nib = |c: u8| match c {
@@ -225,13 +228,23 @@ pub fn hex_decode(s: &str) -> Option<Vec<u8>> {
         _ => None,
     };
     b.chunks(2)
-        .map(|p| Some(nib(p[0])? << 4 | nib(p[1])?))
+        .map(|p| Some(nib(p[0])? * 16 + nib(p[1])?))
         .collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_limits_have_their_documented_values() {
+        assert_eq!(MAX_FILES, 256);
+        assert_eq!(MAX_FILE_BYTES, 524_288);
+        assert_eq!(MAX_TOTAL_BYTES, 8_388_608);
+        assert_eq!(MAX_PATH_BYTES, 1024);
+        assert_eq!(MAX_BATCH_BYTES, 1_048_576);
+        assert_eq!(FILE_OVERHEAD, 128);
+    }
 
     #[test]
     fn limits_accept_the_boundaries_and_refuse_one_over() {
@@ -256,7 +269,9 @@ mod tests {
         let too_many = vec![(1, 1); MAX_FILES + 1];
         assert_eq!(
             check_limits(&too_many),
-            Err(Limit::TooManyFiles { count: MAX_FILES + 1 })
+            Err(Limit::TooManyFiles {
+                count: MAX_FILES + 1
+            })
         );
         let files = MAX_TOTAL_BYTES / MAX_FILE_BYTES;
         let ok = vec![(1, MAX_FILE_BYTES); files];
@@ -289,6 +304,8 @@ mod tests {
     fn batches_are_consecutive_cover_everything_and_stay_in_budget() {
         assert!(plan_batches(&[]).is_empty());
         assert_eq!(plan_batches(&[(5, 5)]), vec![0..1]);
+        // a first file that alone is over the budget is not preceded by an empty batch
+        assert_eq!(plan_batches(&[(1, MAX_BATCH_BYTES)]), vec![0..1]);
         // three files of 400 KiB: two do not fit one 1 MiB batch with a third
         let k = 400 * 1024;
         let b = plan_batches(&[(5, k), (5, k), (5, k)]);
@@ -304,7 +321,7 @@ mod tests {
             vec![0..1, 1..2, 2..3]
         );
         // every maximum-size file fits a batch alone
-        assert!(MAX_FILE_BYTES + MAX_PATH_BYTES + FILE_OVERHEAD <= MAX_BATCH_BYTES);
+        const { assert!(MAX_FILE_BYTES + MAX_PATH_BYTES + FILE_OVERHEAD <= MAX_BATCH_BYTES) };
     }
 
     #[test]
@@ -330,7 +347,10 @@ mod tests {
     #[test]
     fn globs_are_escaped_literally() {
         assert_eq!(escape_glob(".env"), ".env");
-        assert_eq!(escape_glob("a*b?c[d]{e}\\f"), "a\\*b\\?c\\[d\\]\\{e\\}\\\\f");
+        assert_eq!(
+            escape_glob("a*b?c[d]{e}\\f"),
+            "a\\*b\\?c\\[d\\]\\{e\\}\\\\f"
+        );
         assert_eq!(escape_glob("設定/.env"), "設定/.env");
     }
 
@@ -356,7 +376,13 @@ mod tests {
         assert_eq!(out[2].glob, "a\\[1\\].env");
         assert!(!out[2].required);
         // a declared glob that spells the path escaped is the same file too
-        let out = merge_specs(&[SecretSpec { glob: "a\\[1\\].env".into(), required: true }], &["a[1].env".into()]);
+        let out = merge_specs(
+            &[SecretSpec {
+                glob: "a\\[1\\].env".into(),
+                required: true,
+            }],
+            &["a[1].env".into()],
+        );
         assert_eq!(out.len(), 1);
         assert!(out[0].required);
         assert!(merge_specs(&[], &[]).is_empty());
@@ -378,9 +404,18 @@ mod tests {
         );
         assert!(check_paths([".env", "a/.env"]).is_ok());
         assert!(check_paths([]).is_ok());
-        assert!(matches!(check_paths([".env", "../x"]), Err(BadPath::Unsafe(_))));
-        assert!(matches!(check_paths([".env", ".env"]), Err(BadPath::Unsafe(_))));
-        assert!(matches!(check_paths(["A/.env", "a/.ENV"]), Err(BadPath::Unsafe(_))));
+        assert!(matches!(
+            check_paths([".env", "../x"]),
+            Err(BadPath::Unsafe(_))
+        ));
+        assert!(matches!(
+            check_paths([".env", ".env"]),
+            Err(BadPath::Unsafe(_))
+        ));
+        assert!(matches!(
+            check_paths(["A/.env", "a/.ENV"]),
+            Err(BadPath::Unsafe(_))
+        ));
         assert!(!BadPath::TooLong(3).to_string().is_empty());
         assert!(BadPath::Unsafe("x".into()).to_string().contains('x'));
     }
@@ -393,7 +428,10 @@ mod tests {
             listing_digest(&[a.clone(), b.clone()]),
             listing_digest(&[b.clone(), a.clone()])
         );
-        assert_ne!(listing_digest(&[a.clone()]), listing_digest(&[b.clone()]));
+        assert_ne!(
+            listing_digest(std::slice::from_ref(&a)),
+            listing_digest(std::slice::from_ref(&b))
+        );
         assert_ne!(
             listing_digest(&[("ab".into(), "c".into())]),
             listing_digest(&[("a".into(), "bc".into())])
@@ -411,5 +449,11 @@ mod tests {
         assert!(hex_decode("0F").is_none());
         assert!(hex_decode("g0").is_none());
         assert!(hex_decode("0g").is_none());
+        // every nibble position counts
+        assert_eq!(hex_decode("10").unwrap(), vec![16]);
+        assert_eq!(hex_decode("01").unwrap(), vec![1]);
+        assert_eq!(hex_decode("a5").unwrap(), vec![0xa5]);
+        assert_eq!(hex_decode("5a").unwrap(), vec![0x5a]);
+        assert_eq!(hex_decode("9f").unwrap(), vec![0x9f]);
     }
 }

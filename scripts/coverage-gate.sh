@@ -28,6 +28,9 @@ want = {
     "src/protocol/ssh.rs",
     "src/supervisor/spool_plan.rs",
     "src/workspace/plan.rs",
+    "src/secrets/plan.rs",
+    "src/secrets/envfile.rs",
+    "src/secrets/mask.rs",
 }
 seen = set()
 bad = []

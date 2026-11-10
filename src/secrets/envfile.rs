@@ -49,25 +49,24 @@ fn trim(s: &[u8]) -> &[u8] {
 
 fn unescape(s: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(s.len());
-    let mut i = 0;
-    while i < s.len() {
-        if s[i] == b'\\' && i + 1 < s.len() {
-            let c = match s[i + 1] {
+    let mut it = s.iter().copied().peekable();
+    while let Some(c) = it.next() {
+        if c == b'\\' {
+            let mapped = it.peek().and_then(|n| match n {
                 b'n' => Some(b'\n'),
                 b'r' => Some(b'\r'),
                 b't' => Some(b'\t'),
                 b'"' => Some(b'"'),
                 b'\\' => Some(b'\\'),
                 _ => None,
-            };
-            if let Some(c) = c {
-                out.push(c);
-                i += 2;
+            });
+            if let Some(m) = mapped {
+                out.push(m);
+                it.next();
                 continue;
             }
         }
-        out.push(s[i]);
-        i += 1;
+        out.push(c);
     }
     out
 }
@@ -76,89 +75,81 @@ fn unescape(s: &[u8]) -> Vec<u8> {
 /// text after the opening quote). A backslash escapes the next byte in double
 /// quotes only.
 fn closing_quote(rest: &[u8], quote: u8) -> Option<usize> {
-    let mut i = 0;
-    while i < rest.len() {
-        if quote == b'"' && rest[i] == b'\\' {
-            i += 2;
-            continue;
-        }
-        if rest[i] == quote {
+    let mut escaped = false;
+    for (i, &c) in rest.iter().enumerate() {
+        if escaped {
+            escaped = false;
+        } else if quote == b'"' && c == b'\\' {
+            escaped = true;
+        } else if c == quote {
             return Some(i);
         }
-        i += 1;
     }
     None
 }
 
 fn unquoted(v: &[u8]) -> &[u8] {
-    let mut end = v.len();
-    for i in 0..v.len() {
-        if v[i] == b'#' && i > 0 && v[i - 1].is_ascii_whitespace() {
-            end = i;
-            break;
+    let end = v
+        .windows(2)
+        .position(|w| w[0].is_ascii_whitespace() && w[1] == b'#')
+        .unwrap_or(v.len());
+    trim(&v[..end])
+}
+
+/// The text of a quoted value that starts in `first` (after the opening
+/// quote) and may continue over the following lines of `lines`.
+fn quoted<'a>(first: &[u8], quote: u8, lines: &mut impl Iterator<Item = &'a [u8]>) -> Vec<u8> {
+    let mut buf = first.to_vec();
+    loop {
+        if let Some(n) = closing_quote(&buf, quote) {
+            buf.truncate(n);
+            return buf;
+        }
+        match lines.next() {
+            Some(l) => {
+                buf.push(b'\n');
+                buf.extend_from_slice(l);
+            }
+            // never closed: the rest of the file is the value
+            None => return trim(&buf).to_vec(),
         }
     }
-    trim(&v[..end])
 }
 
 /// All values of `content` that must be masked.
 pub fn secret_values(content: &[u8]) -> Values {
     let mut found: Vec<(String, Vec<u8>)> = Vec::new();
-    let mut pos = 0;
-    while pos < content.len() {
-        let line_end = content[pos..]
-            .iter()
-            .position(|c| *c == b'\n')
-            .map_or(content.len(), |n| pos + n);
-        let line = trim(&content[pos..line_end]);
-        let mut next = line_end + 1;
+    let mut lines = content.split(|c| *c == b'\n');
+    while let Some(raw) = lines.next() {
+        let line = trim(raw);
         let line = line
             .strip_prefix(b"export")
             .filter(|r| r.first().is_some_and(|c| c.is_ascii_whitespace()))
             .map_or(line, trim);
-        if line.is_empty() || line[0] == b'#' {
-            pos = next;
+        if line.first().is_none_or(|c| *c == b'#') {
             continue;
         }
         let Some(eq) = line.iter().position(|c| *c == b'=') else {
-            pos = next;
             continue;
         };
         let key = trim(&line[..eq]);
         if !is_key(key) {
-            pos = next;
             continue;
         }
         let key = String::from_utf8_lossy(key).into_owned();
-        let value = trim(&line[eq + 1..]);
+        let value = trim(&line[eq..][1..]);
         match value.first() {
             Some(&q) if q == b'"' || q == b'\'' => {
-                // the value may run over lines: look in the rest of the content
-                let value_start = value.as_ptr() as usize - content.as_ptr() as usize;
-                let rest = &content[value_start + 1..];
-                let (inner, consumed) = match closing_quote(rest, q) {
-                    Some(n) => (&rest[..n], value_start + 1 + n + 1),
-                    None => (trim(rest), content.len()),
-                };
-                found.push((key.clone(), inner.to_vec()));
-                if q == b'"' {
-                    let un = unescape(inner);
-                    if un != inner {
-                        found.push((key, un));
-                    }
-                }
-                // what follows the closing quote on its line is not a pair
-                if consumed > next {
-                    next = content[consumed.min(content.len())..]
-                        .iter()
-                        .position(|c| *c == b'\n')
-                        .map_or(content.len(), |n| consumed + n + 1);
+                let inner = quoted(&value[1..], q, &mut lines);
+                let decoded = (q == b'"').then(|| unescape(&inner));
+                found.push((key.clone(), inner.clone()));
+                if let Some(un) = decoded.filter(|un| *un != inner) {
+                    found.push((key, un));
                 }
             }
             Some(_) => found.push((key, unquoted(value).to_vec())),
             None => {}
         }
-        pos = next;
     }
     let mut seen: BTreeSet<Vec<u8>> = BTreeSet::new();
     let mut out = Values::default();
@@ -212,9 +203,16 @@ mod tests {
     #[test]
     fn quoted_values_lose_their_quotes_and_may_span_lines() {
         assert_eq!(vals("A='single quoted'\n"), ["single quoted"]);
-        assert_eq!(vals("A=\"double \\\"q\\\" x\"\n"), ["double \\\"q\\\" x", "double \"q\" x"]);
-        assert_eq!(vals("  A =  \"abcd efgh\"  \nB=next-value\n"), ["abcd efgh", "next-value"]);
-        let multi = vals("K=\"-----BEGIN KEY-----\nMIIBabcdef\n-----END KEY-----\"\nAFTER=after-1234\n");
+        assert_eq!(
+            vals("A=\"double \\\"q\\\" x\"\n"),
+            ["double \\\"q\\\" x", "double \"q\" x"]
+        );
+        assert_eq!(
+            vals("  A =  \"abcd efgh\"  \nB=next-value\n"),
+            ["abcd efgh", "next-value"]
+        );
+        let multi =
+            vals("K=\"-----BEGIN KEY-----\nMIIBabcdef\n-----END KEY-----\"\nAFTER=after-1234\n");
         assert_eq!(
             multi,
             [
@@ -226,7 +224,10 @@ mod tests {
             ]
         );
         // unterminated: the rest of the file is the value
-        assert_eq!(vals("A=\"open value\nmore text here\n"), ["open value\nmore text here", "open value", "more text here"]);
+        assert_eq!(
+            vals("A=\"open value\nmore text here\n"),
+            ["open value\nmore text here", "open value", "more text here"]
+        );
     }
 
     #[test]
@@ -261,6 +262,12 @@ mod tests {
         assert_eq!(secret_values(b"KEY").values.len(), 0);
         assert_eq!(secret_values(b"KEY=").values.len(), 0);
         assert_eq!(secret_values(b"A= \n").values.len(), 0);
+        // an empty quoted value, and a blank line inside a value
+        assert_eq!(secret_values(b"A=\"\"\n").values.len(), 0);
+        assert_eq!(
+            vals("A=\"aaaaaa\n\nbbbbbb\"\n"),
+            ["aaaaaa\n\nbbbbbb", "aaaaaa", "bbbbbb"]
+        );
         assert_eq!(secret_values(b"=\n=x").values.len(), 0);
     }
 

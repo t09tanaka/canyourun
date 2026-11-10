@@ -22,6 +22,7 @@
 //! this module. The pure decisions ([`plan`], [`envfile`], [`mask`]) have no
 //! I/O and are held to the coverage and mutation gates.
 
+pub mod capture;
 pub mod envfile;
 pub mod key;
 pub mod mask;
@@ -85,7 +86,9 @@ impl SecretError {
             SecretError::Limit(_)
             | SecretError::BadPath(_)
             | SecretError::NonUtf8Path(_)
-            | SecretError::PathSetMismatch => ApiError::new(ErrorCode::InvalidInput, self.to_string()),
+            | SecretError::PathSetMismatch => {
+                ApiError::new(ErrorCode::InvalidInput, self.to_string())
+            }
             SecretError::Tampered { .. }
             | SecretError::Insecure { .. }
             | SecretError::Placement(_)

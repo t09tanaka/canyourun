@@ -41,8 +41,9 @@ impl ClusterKey {
 
     pub fn generate() -> Result<Self> {
         let mut b = vec![0u8; KEY_BYTES];
-        getrandom::fill(&mut b)
-            .map_err(|e| SecretError::Format(format!("no random bytes for the cluster key: {e}")))?;
+        getrandom::fill(&mut b).map_err(|e| {
+            SecretError::Format(format!("no random bytes for the cluster key: {e}"))
+        })?;
         Ok(ClusterKey(b))
     }
 
@@ -88,7 +89,12 @@ pub fn load_or_create(path: &Path) -> Result<ClusterKey> {
     match fs::symlink_metadata(path) {
         Ok(_) => return load(path),
         Err(e) if e.kind() == ErrorKind::NotFound => {}
-        Err(e) => return Err(SecretError::io(format!("cluster key {}", path.display()), e)),
+        Err(e) => {
+            return Err(SecretError::io(
+                format!("cluster key {}", path.display()),
+                e,
+            ))
+        }
     }
     let dir = path
         .parent()
@@ -133,7 +139,10 @@ mod tests {
         let k = load_or_create(&p).unwrap();
         assert_eq!(k.as_bytes().len(), 32);
         assert_eq!(fs::metadata(&p).unwrap().mode() & 0o777, 0o600);
-        assert_eq!(fs::metadata(p.parent().unwrap()).unwrap().mode() & 0o777, 0o700);
+        assert_eq!(
+            fs::metadata(p.parent().unwrap()).unwrap().mode() & 0o777,
+            0o700
+        );
         assert_eq!(load_or_create(&p).unwrap(), k);
         assert_eq!(load(&p).unwrap(), k);
         // no temp file is left behind
@@ -176,8 +185,14 @@ mod tests {
         let k = load_or_create(&p).unwrap();
         for mode in [0o640, 0o604, 0o644, 0o666] {
             fs::set_permissions(&p, fs::Permissions::from_mode(mode)).unwrap();
-            assert!(matches!(load(&p), Err(SecretError::Insecure { .. })), "{mode:o}");
-            assert!(matches!(load_or_create(&p), Err(SecretError::Insecure { .. })));
+            assert!(
+                matches!(load(&p), Err(SecretError::Insecure { .. })),
+                "{mode:o}"
+            );
+            assert!(matches!(
+                load_or_create(&p),
+                Err(SecretError::Insecure { .. })
+            ));
         }
         fs::set_permissions(&p, fs::Permissions::from_mode(0o400)).unwrap();
         assert_eq!(load(&p).unwrap(), k);
@@ -191,7 +206,10 @@ mod tests {
         let link = d.path().join("link.key");
         std::os::unix::fs::symlink(&real, &link).unwrap();
         assert!(matches!(load(&link), Err(SecretError::Insecure { .. })));
-        assert!(matches!(load_or_create(&link), Err(SecretError::Insecure { .. })));
+        assert!(matches!(
+            load_or_create(&link),
+            Err(SecretError::Insecure { .. })
+        ));
         let dir = d.path().join("dir.key");
         fs::create_dir(&dir).unwrap();
         assert!(matches!(load(&dir), Err(SecretError::Insecure { .. })));
@@ -206,9 +224,17 @@ mod tests {
             .enumerate()
         {
             let p = d.path().join(format!("k{i}"));
-            let mut f = OpenOptions::new().write(true).create_new(true).mode(0o600).open(&p).unwrap();
+            let mut f = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&p)
+                .unwrap();
             f.write_all(text.as_bytes()).unwrap();
-            assert!(matches!(load_or_create(&p), Err(SecretError::Format(_))), "{text:?}");
+            assert!(
+                matches!(load_or_create(&p), Err(SecretError::Format(_))),
+                "{text:?}"
+            );
         }
         assert!(ClusterKey::from_bytes(vec![0; 15]).is_err());
         assert!(ClusterKey::from_bytes(vec![0; 16]).is_ok());
@@ -217,8 +243,14 @@ mod tests {
     #[test]
     fn missing_file_and_a_path_without_a_directory() {
         let d = tempfile::tempdir().unwrap();
-        assert!(matches!(load(&d.path().join("none")), Err(SecretError::Io { .. })));
-        assert!(matches!(load_or_create(Path::new("cluster.key")), Err(SecretError::Format(_))));
+        assert!(matches!(
+            load(&d.path().join("none")),
+            Err(SecretError::Io { .. })
+        ));
+        assert!(matches!(
+            load_or_create(Path::new("cluster.key")),
+            Err(SecretError::Format(_))
+        ));
         // the parent is a file
         let f = d.path().join("f");
         fs::write(&f, b"x").unwrap();

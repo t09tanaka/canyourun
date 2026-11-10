@@ -111,15 +111,16 @@ impl StreamMasker {
             return std::mem::take(&mut self.held);
         }
         let hold = self.masker.longest - 1;
-        let mut cut = self.held.len().saturating_sub(hold);
+        let cut = self.held.len().saturating_sub(hold);
         // do not end the released part inside a character
-        while cut > 0 && cut < self.held.len() && (self.held[cut] & 0xC0) == 0x80 {
-            cut -= 1;
-        }
+        let mut cut = (0..=cut)
+            .rev()
+            .find(|&i| i >= self.held.len() || (self.held[i] & 0xC0) != 0x80)
+            .unwrap_or(0);
         // an occurrence (or run of them) that reaches the cut is not complete
         for (s, e) in self.masker.runs(&self.held) {
-            if s < cut && e >= cut {
-                cut = s;
+            if e >= cut {
+                cut = cut.min(s);
             }
         }
         let out = self.masker.mask(&self.held[..cut]);
@@ -256,10 +257,15 @@ mod tests {
                 .collect();
             let input = text.as_bytes();
             let whole = k.mask(input);
-            let mut cuts: Vec<usize> = (0..rng.below(6)).map(|_| rng.below(input.len() + 1)).collect();
+            let mut cuts: Vec<usize> = (0..rng.below(6))
+                .map(|_| rng.below(input.len() + 1))
+                .collect();
             cuts.sort_unstable();
             let streamed = run_stream(&k, input, &cuts);
-            assert_eq!(streamed, whole, "round {round}: patterns {pats:?} text {text:?} cuts {cuts:?}");
+            assert_eq!(
+                streamed, whole,
+                "round {round}: patterns {pats:?} text {text:?} cuts {cuts:?}"
+            );
             // byte by byte as well
             let all: Vec<usize> = (0..=input.len()).collect();
             assert_eq!(run_stream(&k, input, &all), whole, "round {round} bytewise");
@@ -280,8 +286,56 @@ mod tests {
                 .collect();
             let out = k.mask(text.as_bytes());
             let out = String::from_utf8(out).expect("valid utf-8 stays valid");
-            assert!(!out.contains(&p), "pattern {p:?} left in {out:?} from {text:?}");
+            assert!(
+                !out.contains(&p),
+                "pattern {p:?} left in {out:?} from {text:?}"
+            );
         }
+    }
+
+    #[test]
+    fn a_stream_holds_back_exactly_the_longest_pattern_minus_one() {
+        let k = m(&["abcde"]);
+        let mut s = k.stream();
+        // 10 bytes, hold 4: six are released
+        assert_eq!(s.push(b"0123456789"), b"012345");
+        assert_eq!(s.push(b""), b"");
+        assert_eq!(s.push(b"ab"), b"67");
+        assert_eq!(s.finish(), b"89ab");
+        // shorter than the hold: nothing yet
+        let mut s = k.stream();
+        assert_eq!(s.push(b"abcd"), b"");
+        assert_eq!(s.push(b"x"), b"a");
+        // a one-byte pattern holds nothing back, but a match at the very end
+        // waits in case another touches it
+        let mut s = m(&["z"]).stream();
+        assert_eq!(s.push(b"abz"), b"ab");
+        assert_eq!(s.push(b"zc"), b"***c");
+        assert_eq!(s.finish(), b"");
+    }
+
+    #[test]
+    fn the_released_part_never_ends_inside_a_character() {
+        let k = m(&["01234"]);
+        let mut s = k.stream();
+        // 12 bytes, hold 4: the cut at 8 is inside the third character
+        assert_eq!(s.push("ああああ".as_bytes()), "ああ".as_bytes());
+        assert_eq!(s.finish(), "ああ".as_bytes());
+        // a continuation byte right at the start, nothing before it to release
+        let mut s = m(&["abc"]).stream();
+        assert_eq!(s.push(&[0x80, 0x81]), b"");
+        assert_eq!(s.finish(), [0x80, 0x81]);
+    }
+
+    #[test]
+    fn a_run_that_ends_exactly_at_the_cut_waits_for_the_one_that_touches_it() {
+        let k = m(&["abcd", "efgh"]);
+        let mut s = k.stream();
+        let mut out = s.push(b"xxabcdefg");
+        assert_eq!(out, b"xx");
+        out.extend(s.push(b"h"));
+        out.extend(s.finish());
+        assert_eq!(out, b"xx***");
     }
 
     #[test]
