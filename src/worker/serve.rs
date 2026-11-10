@@ -3,7 +3,7 @@
 
 use super::agent::{Agent, Session};
 use crate::error::{ApiError, ErrorCode};
-use crate::ids::{ClusterId, CoordinatorEpoch};
+use crate::ids::ClusterId;
 use crate::protocol::hello::WorkerIdentity;
 use crate::protocol::transport::listen_unix;
 use crate::protocol::{accept, ConnectError, InboundRequest, Io, ServerConfig};
@@ -16,20 +16,32 @@ use tokio::sync::{watch, Semaphore};
 /// inbound queue, which has its own limits.
 pub const MAX_CONCURRENT_REQUESTS: usize = 64;
 
+/// Why a connection ended.
+#[derive(Debug, thiserror::Error)]
+pub enum ServeError {
+    /// The agent could not say who it is (the database did not answer). No
+    /// `hello` was answered: an epoch made up here would be believed.
+    #[error("worker identity: {}", .0.message)]
+    Identity(ApiError),
+    #[error(transparent)]
+    Connect(#[from] ConnectError),
+}
+
 /// What the agent says about itself in `hello`.
-pub fn identity(agent: &Agent) -> WorkerIdentity {
+pub fn identity(agent: &Agent) -> Result<WorkerIdentity, ApiError> {
     let cfg = agent.config();
-    WorkerIdentity {
+    let coordinator_epoch = agent
+        .store()
+        .max_coordinator_epoch()
+        .map_err(|e| ApiError::new(e.code(), format!("the highest coordinator epoch: {e}")))?;
+    Ok(WorkerIdentity {
         worker_id: cfg.worker_id.clone(),
         worker_boot_id: cfg.boot_id.clone(),
         agent_epoch: agent.agent_epoch(),
         profile: cfg.profile.clone(),
         profile_fingerprint: cfg.profile_fingerprint.clone(),
-        coordinator_epoch: agent
-            .store()
-            .max_coordinator_epoch()
-            .unwrap_or(CoordinatorEpoch(0)),
-    }
+        coordinator_epoch,
+    })
 }
 
 /// Serve one connection until the peer closes it.
@@ -38,8 +50,9 @@ pub async fn serve_connection(
     io: Io,
     cluster_id: ClusterId,
     permits: Arc<Semaphore>,
-) -> Result<(), ConnectError> {
-    let accepted = accept(io, ServerConfig::new(cluster_id, identity(&agent))).await?;
+) -> Result<(), ServeError> {
+    let me = identity(&agent).map_err(ServeError::Identity)?;
+    let accepted = accept(io, ServerConfig::new(cluster_id, me)).await?;
     let session = Session {
         coordinator_epoch: accepted.coordinator_epoch,
     };
@@ -90,8 +103,11 @@ pub async fn serve(
                 }
             }
             _ = ticker.tick() => {
+                // Not awaited: a slow pass (a cleanup, a GC) must not keep
+                // connections waiting. The agent runs one pass at a time and
+                // drops a tick that arrives during one.
                 let agent = agent.clone();
-                let _ = tokio::task::spawn_blocking(move || agent.tick()).await;
+                tokio::task::spawn_blocking(move || agent.tick());
             }
             conn = listener.accept() => {
                 let (stream, _) = conn?;

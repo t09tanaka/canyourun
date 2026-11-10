@@ -4,7 +4,7 @@
 //! finds, how a retire and a cancel are answered, which journal entries are
 //! wire events, and the order of the startup steps.
 
-use crate::state::{AttemptState, Receipt};
+use crate::state::{AttemptState, Observation, Receipt};
 use crate::wire::{AttemptPayload, CancelPhase, EventKind, RetireStatus};
 use serde_json::Value;
 use std::collections::BTreeSet;
@@ -21,10 +21,27 @@ pub const MAX_EVENTS: u32 = 500;
 pub const MAX_EVENT_SCAN: u32 = 100_000;
 /// Digests in one `blob_verify`.
 pub const MAX_VERIFY_DIGESTS: usize = 4096;
+/// The longest execution lease a submit may ask for: 24 hours.
+pub const MAX_LEASE_MS: u64 = 24 * 60 * 60 * 1000;
+/// The longest deadline or timeout a submit may ask for: 7 days.
+pub const MAX_TIMEOUT_MS: u64 = 7 * 24 * 60 * 60 * 1000;
+/// Attempts that are not terminal on one worker, unless configured.
+pub const DEFAULT_MAX_LIVE_ATTEMPTS: u32 = 32;
+/// Workspaces prepared at once, unless configured.
+pub const DEFAULT_MAX_PREPARES: u32 = 4;
+/// Supervisor starts that may fail in a row before the agent gives up.
+pub const DEFAULT_MAX_SPAWN_FAILURES: u32 = 5;
+
+/// A string that becomes part of a process's argv, environment or path.
+fn has_nul(s: &str) -> bool {
+    s.contains('\0')
+}
 
 /// Why a payload is refused before anything is stored. The sender's numbers
-/// are not trusted: the checks run on what actually arrived.
-pub fn check_payload(p: &AttemptPayload) -> Result<(), &'static str> {
+/// are not trusted: the checks run on what actually arrived. `poll_ms` is how
+/// often this worker's supervisors look at the lease; a lease that is not
+/// longer could never be seen valid.
+pub fn check_payload(p: &AttemptPayload, poll_ms: u64) -> Result<(), &'static str> {
     if p.commands.is_empty() {
         return Err("the attempt has no command");
     }
@@ -34,11 +51,23 @@ pub fn check_payload(p: &AttemptPayload) -> Result<(), &'static str> {
     if p.lease_ms == 0 {
         return Err("lease_ms must be positive");
     }
-    if p.command_timeout_ms == Some(0)
-        || p.deadline_ms == Some(0)
-        || p.resource_wait_timeout_ms == Some(0)
-    {
-        return Err("a timeout of zero is not a timeout");
+    if p.lease_ms <= poll_ms {
+        return Err("lease_ms must be longer than the worker's poll interval");
+    }
+    if p.lease_ms > MAX_LEASE_MS {
+        return Err("lease_ms is longer than 24 hours");
+    }
+    for t in [
+        p.command_timeout_ms,
+        p.deadline_ms,
+        p.resource_wait_timeout_ms,
+    ] {
+        if t == Some(0) {
+            return Err("a timeout of zero is not a timeout");
+        }
+        if t.is_some_and(|t| t > MAX_TIMEOUT_MS) {
+            return Err("a timeout is longer than 7 days");
+        }
     }
     let mut seen = BTreeSet::new();
     let mut bytes = 0usize;
@@ -58,6 +87,17 @@ pub fn check_payload(p: &AttemptPayload) -> Result<(), &'static str> {
         if !seen.insert(c.node_id.as_str()) {
             return Err("a node_id is used twice");
         }
+        if has_nul(&c.cwd) || c.argv.iter().any(|a| has_nul(a)) {
+            return Err("a command or its directory contains a NUL byte");
+        }
+        for (k, v) in &c.env {
+            if k.is_empty() || k.contains('=') {
+                return Err("an environment name is empty or contains '='");
+            }
+            if has_nul(k) || has_nul(v) {
+                return Err("an environment entry contains a NUL byte");
+            }
+        }
         bytes += c.cwd.len();
         bytes += c.argv.iter().map(String::len).sum::<usize>();
         bytes += c.env.iter().map(|(k, v)| k.len() + v.len()).sum::<usize>();
@@ -69,9 +109,84 @@ pub fn check_payload(p: &AttemptPayload) -> Result<(), &'static str> {
 }
 
 /// Whether the machine was restarted since the agent last ran. A first start
-/// (nothing recorded) is not a restart.
-pub fn boot_changed(recorded: Option<&str>, now: &str) -> bool {
-    recorded.is_some_and(|r| r != now)
+/// (nothing recorded, nothing in the database) is not a restart; a missing
+/// record next to attempts that are not terminal or to launch intents is: the
+/// record was lost, and "same boot" cannot be shown.
+pub fn boot_changed(recorded: Option<&str>, now: &str, has_history: bool) -> bool {
+    match recorded {
+        Some(r) => r != now,
+        None => has_history,
+    }
+}
+
+/// What is left of a period of `total_ms` that began `elapsed_ms` ago;
+/// `None` when it ran out.
+pub fn remaining_ms(total_ms: u64, elapsed_ms: u64) -> Option<u64> {
+    total_ms.checked_sub(elapsed_ms).filter(|left| *left > 0)
+}
+
+/// Whether an answer of `found` entries fits a cap. One that does not is an
+/// error, never a part of the list.
+pub fn fits(found: usize, cap: u32) -> bool {
+    found <= cap as usize
+}
+
+/// Whether a new attempt is refused because `live` attempts are not terminal.
+pub fn at_live_cap(live: u64, cap: u32) -> bool {
+    live >= u64::from(cap)
+}
+
+/// Whether the agent stops starting a supervisor after `failures` in a row.
+pub fn gives_up(failures: u32, cap: u32) -> bool {
+    failures >= cap
+}
+
+/// The pause before the next try after `failures` failed ones: `base_ms`,
+/// doubled each time, at most 32 times `base_ms`.
+pub fn backoff_ms(base_ms: u64, failures: u32) -> u64 {
+    base_ms.saturating_mul(1 << failures.min(5))
+}
+
+/// Whether every launch of an attempt was recorded by another boot of the
+/// machine: nothing of it can still run. A launch without a recorded process
+/// proves nothing.
+pub fn launched_on_another_boot(boots: &[Option<&str>], now: &str) -> bool {
+    !boots.is_empty() && boots.iter().all(|b| b.is_some_and(|b| b != now))
+}
+
+/// What the worker knows about an attempt: `Unknown` when a command may have
+/// run and the agent can neither watch nor recover it.
+pub fn observation(state: AttemptState, gave_up: bool, recovery: Recovery) -> Observation {
+    if state != AttemptState::Terminal && (gave_up || recovery == Recovery::Unresolved) {
+        Observation::Unknown
+    } else {
+        Observation::Known
+    }
+}
+
+/// The answer to a `secret_bundle_put`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SecretPut {
+    /// The files go into the workspace now.
+    Place,
+    /// A cancel or a retire was persisted (`RETIRED`).
+    Stopping,
+    /// The commands may have started (`CONFLICT`): too late for good.
+    TooLate,
+    /// The workspace does not exist yet (`NOT_FOUND`): send it again.
+    NotReady,
+}
+
+pub fn secret_put(state: AttemptState, stop_requested: bool, has_workspace: bool) -> SecretPut {
+    if stop_requested {
+        SecretPut::Stopping
+    } else if !matches!(state, AttemptState::Accepted | AttemptState::Preparing) {
+        SecretPut::TooLate
+    } else if !has_workspace {
+        SecretPut::NotReady
+    } else {
+        SecretPut::Place
+    }
 }
 
 /// What a starting agent knows about one attempt that is not terminal.
@@ -319,11 +434,11 @@ mod tests {
 
     #[test]
     fn a_plain_payload_passes_and_each_fault_is_named() {
-        assert_eq!(check_payload(&payload()), Ok(()));
+        assert_eq!(check_payload(&payload(), 0), Ok(()));
         let bad = |f: &dyn Fn(&mut AttemptPayload)| {
             let mut p = payload();
             f(&mut p);
-            check_payload(&p).unwrap_err()
+            check_payload(&p, 0).unwrap_err()
         };
         assert_eq!(bad(&|p| p.commands.clear()), "the attempt has no command");
         assert_eq!(
@@ -341,7 +456,7 @@ mod tests {
         // Exactly the limit is allowed.
         let mut full = payload();
         full.commands = (0..MAX_COMMANDS).map(|i| cmd(&format!("n{i}"))).collect();
-        assert_eq!(check_payload(&full), Ok(()));
+        assert_eq!(check_payload(&full, 0), Ok(()));
         assert_eq!(bad(&|p| p.commands[0].argv.clear()), "a command is empty");
         assert_eq!(
             bad(&|p| p.commands[0].argv[0].clear()),
@@ -358,13 +473,13 @@ mod tests {
         let timeout = "a per-command timeout must equal command_timeout_ms";
         let mut p = payload();
         p.commands[0].timeout_ms = Some(5);
-        assert_eq!(check_payload(&p), Err(timeout));
+        assert_eq!(check_payload(&p, 0), Err(timeout));
         p.command_timeout_ms = Some(6);
-        assert_eq!(check_payload(&p), Err(timeout));
+        assert_eq!(check_payload(&p, 0), Err(timeout));
         p.command_timeout_ms = Some(5);
-        assert_eq!(check_payload(&p), Ok(()));
+        assert_eq!(check_payload(&p, 0), Ok(()));
         p.commands[0].timeout_ms = None;
-        assert_eq!(check_payload(&p), Ok(()));
+        assert_eq!(check_payload(&p, 0), Ok(()));
 
         let order = "depends_on must name an earlier command";
         let dep = |of: usize, on: &str| {
@@ -372,7 +487,7 @@ mod tests {
             p.commands.push(cmd("b"));
             p.commands.push(cmd("c"));
             p.commands[of].depends_on = vec![NodeId::parse(on).unwrap()];
-            check_payload(&p)
+            check_payload(&p, 0)
         };
         assert_eq!(dep(1, "a"), Ok(()));
         assert_eq!(dep(2, "a"), Ok(()));
@@ -390,7 +505,7 @@ mod tests {
             p.commands[0].argv = vec!["x".repeat(argv)];
             p.commands[0].cwd = "c".repeat(cwd);
             p.commands[0].env.insert("k".repeat(key), "v".repeat(val));
-            check_payload(&p)
+            check_payload(&p, 0)
         };
         assert_eq!(sized(MAX_COMMAND_BYTES - 3, 1, 1, 1), Ok(()));
         for (a, c, k, v) in [(2, 1, 1, 1), (1, 2, 1, 1), (1, 1, 2, 1), (1, 1, 1, 2)] {
@@ -403,14 +518,159 @@ mod tests {
         let mut p = payload();
         p.commands.push(cmd("b"));
         p.commands[0].argv = vec!["x".repeat(MAX_COMMAND_BYTES)];
-        assert_eq!(check_payload(&p), Err("the commands are too large"));
+        assert_eq!(check_payload(&p, 0), Err("the commands are too large"));
     }
 
     #[test]
-    fn only_a_recorded_and_different_boot_id_is_a_reboot() {
-        assert!(!boot_changed(None, "a"));
-        assert!(!boot_changed(Some("a"), "a"));
-        assert!(boot_changed(Some("a"), "b"));
+    fn a_different_or_a_lost_boot_record_is_a_reboot() {
+        assert!(!boot_changed(None, "a", false));
+        assert!(!boot_changed(Some("a"), "a", false));
+        assert!(!boot_changed(Some("a"), "a", true));
+        assert!(boot_changed(Some("a"), "b", false));
+        assert!(boot_changed(Some("a"), "b", true));
+        // No record, but attempts or launches: the record was lost.
+        assert!(boot_changed(None, "a", true));
+    }
+
+    #[test]
+    fn the_lease_and_the_timeouts_are_bounded() {
+        let short = "lease_ms must be longer than the worker's poll interval";
+        let mut p = payload();
+        p.lease_ms = 200;
+        assert_eq!(check_payload(&p, 200), Err(short));
+        assert_eq!(check_payload(&p, 201), Err(short));
+        assert_eq!(check_payload(&p, 199), Ok(()));
+        p.lease_ms = MAX_LEASE_MS;
+        assert_eq!(check_payload(&p, 0), Ok(()));
+        p.lease_ms = MAX_LEASE_MS + 1;
+        assert_eq!(
+            check_payload(&p, 0),
+            Err("lease_ms is longer than 24 hours")
+        );
+        assert_eq!(MAX_LEASE_MS, 86_400_000);
+        assert_eq!(MAX_TIMEOUT_MS, 604_800_000);
+        for which in 0..3 {
+            let set = |v: Option<u64>| {
+                let mut p = payload();
+                match which {
+                    0 => p.command_timeout_ms = v,
+                    1 => p.deadline_ms = v,
+                    _ => p.resource_wait_timeout_ms = v,
+                }
+                check_payload(&p, 0)
+            };
+            assert_eq!(set(Some(MAX_TIMEOUT_MS)), Ok(()));
+            assert_eq!(set(Some(1)), Ok(()));
+            assert_eq!(
+                set(Some(MAX_TIMEOUT_MS + 1)),
+                Err("a timeout is longer than 7 days")
+            );
+            assert_eq!(set(Some(0)), Err("a timeout of zero is not a timeout"));
+        }
+    }
+
+    #[test]
+    fn text_that_cannot_reach_a_process_is_refused() {
+        let nul = Err("a command or its directory contains a NUL byte");
+        let mut p = payload();
+        p.commands[0].argv.push("a\0b".into());
+        assert_eq!(check_payload(&p, 0), nul);
+        let mut p = payload();
+        p.commands[0].cwd = "sub\0".into();
+        assert_eq!(check_payload(&p, 0), nul);
+        let env = |k: &str, v: &str| {
+            let mut p = payload();
+            p.commands[0].env.insert(k.into(), v.into());
+            check_payload(&p, 0)
+        };
+        let name = Err("an environment name is empty or contains '='");
+        assert_eq!(env("", "v"), name);
+        assert_eq!(env("A=B", "v"), name);
+        let entry = Err("an environment entry contains a NUL byte");
+        assert_eq!(env("A\0", "v"), entry);
+        assert_eq!(env("A", "v\0"), entry);
+        assert_eq!(env("A", ""), Ok(()));
+        assert_eq!(env("A", "b=c"), Ok(()));
+    }
+
+    #[test]
+    fn what_is_left_of_a_period_is_never_zero() {
+        assert_eq!(remaining_ms(10, 0), Some(10));
+        assert_eq!(remaining_ms(10, 3), Some(7));
+        assert_eq!(remaining_ms(10, 9), Some(1));
+        assert_eq!(remaining_ms(10, 10), None);
+        assert_eq!(remaining_ms(10, 11), None);
+    }
+
+    #[test]
+    fn caps_are_inclusive_where_they_say_so() {
+        assert!(fits(0, 5) && fits(5, 5));
+        assert!(!fits(6, 5));
+        assert!(!at_live_cap(31, 32));
+        assert!(at_live_cap(32, 32) && at_live_cap(33, 32));
+        assert!(!gives_up(4, 5));
+        assert!(gives_up(5, 5) && gives_up(6, 5));
+        assert_eq!(DEFAULT_MAX_LIVE_ATTEMPTS, 32);
+        assert_eq!(DEFAULT_MAX_PREPARES, 4);
+        assert_eq!(DEFAULT_MAX_SPAWN_FAILURES, 5);
+    }
+
+    #[test]
+    fn the_backoff_doubles_up_to_32_times_the_base() {
+        assert_eq!(backoff_ms(100, 0), 100);
+        assert_eq!(backoff_ms(100, 1), 200);
+        assert_eq!(backoff_ms(100, 4), 1_600);
+        assert_eq!(backoff_ms(100, 5), 3_200);
+        assert_eq!(backoff_ms(100, 6), 3_200);
+        assert_eq!(backoff_ms(100, u32::MAX), 3_200);
+        assert_eq!(backoff_ms(u64::MAX, 1), u64::MAX);
+    }
+
+    #[test]
+    fn only_launches_all_recorded_by_another_boot_prove_a_reboot() {
+        assert!(!launched_on_another_boot(&[], "a"));
+        assert!(launched_on_another_boot(&[Some("b")], "a"));
+        assert!(launched_on_another_boot(&[Some("b"), Some("c")], "a"));
+        assert!(!launched_on_another_boot(&[Some("a")], "a"));
+        assert!(!launched_on_another_boot(&[Some("b"), Some("a")], "a"));
+        assert!(!launched_on_another_boot(&[Some("b"), None], "a"));
+        assert!(!launched_on_another_boot(&[None], "a"));
+    }
+
+    #[test]
+    fn an_attempt_nobody_watches_is_unknown_until_it_ends() {
+        use AttemptState::*;
+        let seen = |s, gave_up, r| observation(s, gave_up, r);
+        assert_eq!(seen(Active, false, Recovery::Supervise), Observation::Known);
+        assert_eq!(
+            seen(Active, true, Recovery::Supervise),
+            Observation::Unknown
+        );
+        assert_eq!(
+            seen(Active, false, Recovery::Unresolved),
+            Observation::Unknown
+        );
+        assert_eq!(seen(Terminal, true, Recovery::Nothing), Observation::Known);
+        assert_eq!(
+            seen(Terminal, false, Recovery::Unresolved),
+            Observation::Known
+        );
+    }
+
+    #[test]
+    fn a_secret_bundle_is_placed_only_before_the_start() {
+        use AttemptState::*;
+        assert_eq!(secret_put(Preparing, false, true), SecretPut::Place);
+        assert_eq!(secret_put(Accepted, false, true), SecretPut::Place);
+        assert_eq!(secret_put(Accepted, false, false), SecretPut::NotReady);
+        assert_eq!(secret_put(Preparing, false, false), SecretPut::NotReady);
+        for s in [Ready, Starting, Active, Cancelling, Finalizing, Terminal] {
+            assert_eq!(secret_put(s, false, true), SecretPut::TooLate);
+            assert_eq!(secret_put(s, false, false), SecretPut::TooLate);
+        }
+        // A stop wins over everything: the answer does not depend on timing.
+        assert_eq!(secret_put(Preparing, true, true), SecretPut::Stopping);
+        assert_eq!(secret_put(Active, true, false), SecretPut::Stopping);
     }
 
     fn facts(state: AttemptState) -> AttemptFacts {

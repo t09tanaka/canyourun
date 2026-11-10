@@ -17,7 +17,9 @@ use super::policy::{self, AttemptFacts, Recovery, Settle, Step};
 use crate::error::{ApiError, ErrorCode};
 use crate::ids::*;
 use crate::platform;
-use crate::state::{AttemptState, Observation, Outcome, Receipt, Termination};
+use crate::state::{
+    AttemptState, Outcome, Receipt, Termination, TimeoutInfo, TimeoutKind, TimeoutPhase,
+};
 use crate::storage::{
     AcceptedAttempt, CancelOutcome, GcReport, LeaseOutcome, NewAcceptance, ProcessLock,
     StorageError, SubmitOutcome, WorkerStore,
@@ -32,14 +34,15 @@ use crate::wire::*;
 use crate::workspace::plan::check_cwd_relative;
 use crate::workspace::Workspace;
 use serde_json::{json, Value};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::Write;
 use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::process::Child;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -81,6 +84,21 @@ pub struct AgentConfig {
     pub retention_ms: u64,
     /// Without `ack_collected`, the protection ends this long after the end.
     pub ack_wait_ms: u64,
+    /// Attempts that are not terminal, at most. A new attempt beyond that is
+    /// refused with `OVERLOADED`; nothing is stored for it.
+    pub max_live_attempts: u32,
+    /// Workspaces prepared at once. The other attempts wait their turn.
+    pub max_concurrent_prepares: u32,
+    /// How long the preparation of one workspace may take before the attempt
+    /// fails (the default of the workspace tool: 15 minutes).
+    pub prepare_timeout_ms: u64,
+    /// Supervisor starts that may fail in a row before the agent gives up.
+    pub max_spawn_failures: u32,
+    /// Attempts in one `list_attempts` answer; more is an error.
+    pub max_list_attempts: u32,
+    /// Journal entries of one attempt a `watch_events` reads; more is an
+    /// error.
+    pub max_event_scan: u32,
 }
 
 impl AgentConfig {
@@ -111,6 +129,12 @@ impl AgentConfig {
             lock_wait_ms: 2_000,
             retention_ms: crate::storage::DEFAULT_ACK_WAIT_MS,
             ack_wait_ms: crate::storage::DEFAULT_ACK_WAIT_MS,
+            max_live_attempts: policy::DEFAULT_MAX_LIVE_ATTEMPTS,
+            max_concurrent_prepares: policy::DEFAULT_MAX_PREPARES,
+            prepare_timeout_ms: crate::workspace::DEFAULT_PREPARE_TIMEOUT.as_millis() as u64,
+            max_spawn_failures: policy::DEFAULT_MAX_SPAWN_FAILURES,
+            max_list_attempts: policy::MAX_LIST_ATTEMPTS,
+            max_event_scan: policy::MAX_EVENT_SCAN,
         }
     }
 
@@ -155,10 +179,115 @@ pub struct Agent {
     threads: Mutex<Vec<JoinHandle<()>>>,
     stopping: AtomicBool,
     report: StartupReport,
+    /// Workspaces being prepared.
+    prepares: Arc<Permits>,
+    /// One lock per attempt (by hash): the cleanup of an attempt and the
+    /// placement of its secrets never run at once, from whichever thread.
+    shards: Arc<Vec<Mutex<()>>>,
+    /// When this process accepted an attempt and last extended its lease.
+    clocks: Mutex<BTreeMap<String, Clock>>,
+    /// Supervisors this agent started that had not exited when their watcher
+    /// let go of them: waited for later, so none stays a zombie.
+    children: Mutex<Vec<Child>>,
+    /// Attempts the agent stopped trying to start or recover.
+    gave_up: Mutex<BTreeSet<String>>,
+    /// The last diagnostic written per subject, so a repeating failure is
+    /// one event.
+    noted: Mutex<BTreeMap<String, String>>,
+    /// One new acceptance at a time: the live cap and the insert are one step.
+    submitting: Mutex<()>,
+    ticking: AtomicBool,
+}
+
+/// Monotonic times (suspend included) of this process.
+#[derive(Debug, Clone, Copy)]
+struct Clock {
+    accepted_ms: u64,
+    granted_ms: u64,
+}
+
+/// The lease as granted before the supervisor started: when it runs out and
+/// the key the database held then.
+#[derive(Debug, Clone, Copy)]
+struct Seed {
+    key: Option<LeaseKey>,
+    ends_ms: u64,
+}
+
+struct Permits {
+    used: Mutex<u32>,
+    max: u32,
+}
+
+struct Permit(Arc<Permits>);
+
+impl Permits {
+    fn try_acquire(p: &Arc<Permits>) -> Option<Permit> {
+        let mut used = lock(&p.used);
+        if *used >= p.max {
+            return None;
+        }
+        *used += 1;
+        Some(Permit(p.clone()))
+    }
+}
+
+impl Drop for Permit {
+    fn drop(&mut self) {
+        let mut used = lock(&self.0.used);
+        *used = used.saturating_sub(1);
+    }
+}
+
+/// What a preparation running on its own thread left for its waiter.
+enum Slot {
+    Waiting,
+    Done(Result<Workspace, ApiError>),
+    /// The waiter gave up: a workspace that still appears is removed.
+    Abandoned,
+}
+
+/// Takes the attempt out of `driving` when its watcher ends, however it ends.
+struct Driving {
+    agent: Arc<Agent>,
+    attempt: AttemptId,
+}
+
+impl Drop for Driving {
+    fn drop(&mut self) {
+        lock(&self.agent.driving).remove(self.attempt.as_str());
+    }
+}
+
+struct Ticking<'a>(&'a AtomicBool);
+
+impl Drop for Ticking<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
+}
+
+const SHARDS: usize = 64;
+
+/// A panic elsewhere must not take the agent's bookkeeping with it: the data
+/// behind these locks stays consistent under every partial update.
+fn lock<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+fn shard<'a>(shards: &'a [Mutex<()>], attempt: &AttemptId) -> &'a Mutex<()> {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    attempt.as_str().hash(&mut h);
+    &shards[(h.finish() % shards.len() as u64) as usize]
 }
 
 fn now() -> u64 {
     platform::wall_ms()
+}
+
+fn failed() -> Termination {
+    Termination::new(Outcome::Failed, None, None).expect("failed without an exit is valid")
 }
 
 fn api(e: StorageError) -> ApiError {
@@ -224,8 +353,13 @@ impl Agent {
                         Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
                         Err(e) => return Err(internal("boot id record", e)),
                     };
-                    report.boot_changed =
-                        policy::boot_changed(recorded.as_deref(), cfg.boot_id.as_str());
+                    let has_history = s.count_nonterminal().map_err(api)? > 0
+                        || s.count_launches().map_err(api)? > 0;
+                    report.boot_changed = policy::boot_changed(
+                        recorded.as_deref(),
+                        cfg.boot_id.as_str(),
+                        has_history,
+                    );
                     opened = Some((s, e));
                 }
                 Step::StoreSecretCopies => host.sweep_store_copies()?,
@@ -251,7 +385,7 @@ impl Agent {
                         let a = rec.attempt_id.clone();
                         match recovery_of(&cfg, s, &rec, report.boot_changed)? {
                             Recovery::Settle(how) => {
-                                if settle(&cfg, s, &a, how_termination(how), how)? {
+                                if settle(&cfg, s, &a, how_termination(how), how, false)? {
                                     report.settled.push(a.clone());
                                 }
                                 // Settled or held by a living supervisor:
@@ -260,6 +394,11 @@ impl Agent {
                             }
                             Recovery::Unresolved => {
                                 note(s, &rec, "agent_unresolved", json!({"why": "no spec"}));
+                                if report.boot_changed {
+                                    // Kept per attempt: the next start no
+                                    // longer sees the change.
+                                    note(s, &rec, "agent_boot_changed", json!({}));
+                                }
                                 report.unresolved.push(a);
                             }
                             _ => todo.push(a),
@@ -273,6 +412,7 @@ impl Agent {
         }
         let (store, epoch) = opened.expect("the store step ran");
         report.watched = todo.clone();
+        let max_prepares = cfg.max_concurrent_prepares.max(1);
         let agent = Arc::new(Agent {
             cfg,
             store,
@@ -283,6 +423,17 @@ impl Agent {
             threads: Mutex::default(),
             stopping: AtomicBool::new(false),
             report,
+            prepares: Arc::new(Permits {
+                used: Mutex::new(0),
+                max: max_prepares,
+            }),
+            shards: Arc::new((0..SHARDS).map(|_| Mutex::new(())).collect()),
+            clocks: Mutex::default(),
+            children: Mutex::default(),
+            gave_up: Mutex::default(),
+            noted: Mutex::default(),
+            submitting: Mutex::default(),
+            ticking: AtomicBool::new(false),
         });
         for a in todo {
             agent.kick(&a);
@@ -312,11 +463,11 @@ impl Agent {
     /// they do not depend on the agent (spec chapter 12).
     pub fn shutdown(&self) {
         self.stopping.store(true, Ordering::SeqCst);
-        let threads = std::mem::take(&mut *self.threads.lock().expect("threads"));
+        let threads = std::mem::take(&mut *lock(&self.threads));
         for t in threads {
             let _ = t.join();
         }
-        self.lock.lock().expect("lock").take();
+        lock(&self.lock).take();
     }
 
     fn stopping(&self) -> bool {
@@ -337,44 +488,95 @@ impl Agent {
 
     /// Make sure a thread watches `attempt`. Idempotent.
     pub fn kick(self: &Arc<Self>, attempt: &AttemptId) {
-        if self.stopping() {
+        self.reap();
+        if self.stopping() || lock(&self.gave_up).contains(attempt.as_str()) {
             return;
         }
-        if !self
-            .driving
-            .lock()
-            .expect("driving")
-            .insert(attempt.to_string())
-        {
+        if !lock(&self.driving).insert(attempt.to_string()) {
             return;
         }
-        let (me, a) = (self.clone(), attempt.clone());
-        let t = std::thread::spawn(move || {
-            me.drive(&a);
-            me.driving.lock().expect("driving").remove(a.as_str());
-        });
-        let mut threads = self.threads.lock().expect("threads");
-        threads.retain(|t| !t.is_finished());
-        threads.push(t);
+        // Made before the thread exists: a thread that cannot be started
+        // drops the guard with its closure, a panicking one while unwinding.
+        let guard = Driving {
+            agent: self.clone(),
+            attempt: attempt.clone(),
+        };
+        let spawned = std::thread::Builder::new()
+            .name("attempt".into())
+            .spawn(move || {
+                let (me, a) = (&guard.agent, &guard.attempt);
+                if catch_unwind(AssertUnwindSafe(|| me.drive(a))).is_err() {
+                    me.drive_panicked(a);
+                }
+            });
+        match spawned {
+            Ok(t) => {
+                let mut threads = lock(&self.threads);
+                threads.retain(|t| !t.is_finished());
+                threads.push(t);
+            }
+            // The next tick tries again.
+            Err(e) => self.note_once(
+                attempt,
+                "agent_thread_failed",
+                json!({ "error": e.to_string() }),
+            ),
+        }
+    }
+
+    /// The watcher of `attempt` panicked. Nothing may be left half-watched
+    /// for ever: the attempt is failed when no command was started, and
+    /// reported as unknown otherwise.
+    fn drive_panicked(&self, attempt: &AttemptId) {
+        let Ok(Some(rec)) = self.store.get(attempt) else {
+            return;
+        };
+        note(&self.store, &rec, "agent_drive_panicked", json!({}));
+        if rec.state != AttemptState::Terminal {
+            self.give_up(&rec, "the watcher panicked", failed());
+        }
+    }
+
+    /// Stop trying to start or recover `rec`. With no launch intent the
+    /// result is fixed here as `t`; an attempt whose command may have run is
+    /// left as it is, no longer watched, and reported as unknown (a retire
+    /// settles it once the machine has rebooted).
+    fn give_up(&self, rec: &AcceptedAttempt, why: &str, t: Termination) {
+        let a = &rec.attempt_id;
+        let settled = settle(&self.cfg, &self.store, a, t, Settle::Interrupted, false);
+        let settled = matches!(settled, Ok(true));
+        note(
+            &self.store,
+            rec,
+            "agent_gave_up",
+            json!({ "why": why, "settled": settled }),
+        );
+        if settled {
+            self.clean(a);
+        } else {
+            lock(&self.gave_up).insert(a.to_string());
+        }
     }
 
     fn drive(&self, attempt: &AttemptId) {
         let mut child: Option<Child> = None;
+        let mut seed: Option<Seed> = None;
         let mut noted_exit = false;
+        // Supervisor starts and supervisors that failed, in a row.
+        let mut failures = 0u32;
+        let mut settle_errors = 0u32;
         while !self.stopping() {
             let rec = match self.store.get(attempt) {
                 Ok(Some(r)) => r,
-                Ok(None) => return,
+                Ok(None) => break,
                 Err(_) => {
                     self.pause(self.cfg.poll_ms);
                     continue;
                 }
             };
             if rec.state == AttemptState::Terminal {
-                if let Some(c) = child.as_mut() {
-                    // Reap it; it is about to exit.
-                    let _ = c.try_wait();
-                }
+                // The supervisor is about to exit; it is waited for later.
+                self.park(child.take());
                 self.clean(attempt);
                 return;
             }
@@ -382,27 +584,41 @@ impl Agent {
             if let Some(c) = child.as_mut() {
                 match c.try_wait() {
                     Ok(None) => {
+                        self.watch_seed(&rec, &mut seed);
                         self.pause(self.cfg.poll_ms);
                         continue;
                     }
                     Ok(Some(status)) => {
                         let code = status.code();
                         child = None;
-                        if code != Some(0) && code != Some(4) && !noted_exit {
-                            noted_exit = true;
-                            note(
-                                &self.store,
-                                &rec,
-                                "agent_supervisor_exit",
-                                json!({ "code": code }),
-                            );
-                        }
+                        seed = None;
                         if code != Some(0) && code != Some(4) {
+                            if !noted_exit {
+                                noted_exit = true;
+                                note(
+                                    &self.store,
+                                    &rec,
+                                    "agent_supervisor_exit",
+                                    json!({ "code": code }),
+                                );
+                            }
+                            failures += 1;
+                            if policy::gives_up(failures, self.cfg.max_spawn_failures) {
+                                self.give_up(
+                                    &rec,
+                                    "the supervisor kept failing",
+                                    termination(None, None),
+                                );
+                                return;
+                            }
                             self.pause(self.cfg.retry_ms);
                         }
                         continue;
                     }
-                    Err(_) => child = None,
+                    Err(_) => {
+                        child = None;
+                        seed = None;
+                    }
                 }
             }
             // The lock tells whether any supervisor (ours or an adopted one)
@@ -415,46 +631,252 @@ impl Agent {
                     continue;
                 }
             }
-            let step = recovery_of(&self.cfg, &self.store, &rec, false);
-            match step {
-                Ok(Recovery::Nothing) | Err(_) => self.pause(self.cfg.poll_ms),
-                Ok(Recovery::Unresolved) => return,
-                Ok(Recovery::Settle(how)) => {
-                    let _ = settle(&self.cfg, &self.store, attempt, how_termination(how), how);
+            let started = match recovery_of(&self.cfg, &self.store, &rec, false) {
+                Ok(Recovery::Nothing) | Err(_) => {
+                    self.pause(self.cfg.poll_ms);
+                    continue;
                 }
-                Ok(Recovery::Supervise) => child = self.spawn(&rec),
+                Ok(Recovery::Unresolved) => break,
+                Ok(Recovery::Settle(how)) => {
+                    let done = settle(
+                        &self.cfg,
+                        &self.store,
+                        attempt,
+                        how_termination(how),
+                        how,
+                        false,
+                    );
+                    self.after_settle(attempt, done, &mut settle_errors);
+                    continue;
+                }
+                Ok(Recovery::Supervise) => self.spawn(&rec).map(|c| Some((c, None))),
                 Ok(Recovery::Resume) => {
                     if rec.state == AttemptState::Ready && self.spec_path(attempt).is_file() {
-                        child = self.spawn(&rec);
-                    } else if let Err(e) = self.prepare(&rec) {
-                        note(
-                            &self.store,
-                            &rec,
-                            "agent_prepare_failed",
-                            json!({ "code": e.code, "message": e.message }),
-                        );
-                        let failed = Termination::new(Outcome::Failed, None, None)
-                            .expect("failed without an exit is valid");
-                        let _ =
-                            settle(&self.cfg, &self.store, attempt, failed, Settle::Interrupted);
+                        self.launch(&rec)
+                    } else {
+                        if let Err(e) = self.prepare(&rec) {
+                            note(
+                                &self.store,
+                                &rec,
+                                "agent_prepare_failed",
+                                json!({ "code": e.code, "message": e.message }),
+                            );
+                            let done = settle(
+                                &self.cfg,
+                                &self.store,
+                                attempt,
+                                failed(),
+                                Settle::Interrupted,
+                                false,
+                            );
+                            self.after_settle(attempt, done, &mut settle_errors);
+                        }
+                        continue;
                     }
                 }
+            };
+            match started {
+                Ok(Some((c, s))) => {
+                    child = Some(c);
+                    seed = s;
+                }
+                // Settled instead of started: the next look sees the end.
+                Ok(None) => {}
+                Err(()) => {
+                    failures += 1;
+                    if policy::gives_up(failures, self.cfg.max_spawn_failures) {
+                        self.give_up(
+                            &rec,
+                            "the supervisor could not be started",
+                            termination(None, None),
+                        );
+                        return;
+                    }
+                    self.pause(self.cfg.retry_ms);
+                }
+            }
+        }
+        self.park(child);
+    }
+
+    /// A settle that failed is tried again, later each time; one that found
+    /// the attempt owned by somebody else waits for the next look.
+    fn after_settle(&self, attempt: &AttemptId, done: Result<bool, ApiError>, errors: &mut u32) {
+        match done {
+            Ok(true) => *errors = 0,
+            Ok(false) => self.pause(self.cfg.poll_ms),
+            Err(e) => {
+                self.note_once(
+                    attempt,
+                    "agent_settle_failed",
+                    json!({ "code": e.code, "message": e.message }),
+                );
+                self.pause(policy::backoff_ms(self.cfg.retry_ms, *errors));
+                *errors = errors.saturating_add(1);
             }
         }
     }
 
-    fn spawn(&self, rec: &AcceptedAttempt) -> Option<Child> {
-        match spawn_detached(&self.cfg.supervisor_exe, &self.spec_path(&rec.attempt_id)) {
-            Ok(c) => Some(c),
-            Err(e) => {
-                note(
-                    &self.store,
-                    rec,
+    fn spawn(&self, rec: &AcceptedAttempt) -> Result<Child, ()> {
+        spawn_detached(&self.cfg.supervisor_exe, &self.spec_path(&rec.attempt_id)).map_err(|e| {
+            note(
+                &self.store,
+                rec,
+                "agent_spawn_failed",
+                json!({ "error": e.to_string() }),
+            );
+        })
+    }
+
+    /// Start the supervisor that will start the commands of a prepared
+    /// attempt. The lease and the deadline have been running since the
+    /// acceptance: with the lease run out nothing is started (spec chapter
+    /// 12), and the supervisor is given what is left of the deadline.
+    /// `Ok(None)`: the attempt was settled instead (or will be, next look).
+    fn launch(&self, rec: &AcceptedAttempt) -> Result<Option<(Child, Option<Seed>)>, ()> {
+        let a = &rec.attempt_id;
+        let payload: AttemptPayload = serde_json::from_value(rec.spec.clone()).map_err(|e| {
+            self.note_once(
+                a,
+                "agent_spawn_failed",
+                json!({ "error": format!("stored payload: {e}") }),
+            );
+        })?;
+        // The key first: a renewal that arrives after this read makes the
+        // seed void (the supervisor counts from it), never too short.
+        let key = self.store.lease(a).ok().flatten().map(|(k, _)| k);
+        let (since_accept, since_grant) = self.elapsed(rec);
+        let Some(lease_left) = policy::remaining_ms(payload.lease_ms, since_grant) else {
+            let _ = self.store.expire_lease(a, now());
+            self.note_once(
+                a,
+                "supervisor_stop",
+                json!({ "reason": "LeaseExpired", "by": "agent", "phase": "before_start" }),
+            );
+            let t = termination(Some(StopReason::LeaseExpired), None);
+            self.settle_unstarted(a, t);
+            return Ok(None);
+        };
+        if let Some(total) = payload.deadline_ms {
+            let Some(left) = policy::remaining_ms(total, since_accept) else {
+                self.note_once(a, "agent_deadline_before_start", json!({}));
+                let info = TimeoutInfo {
+                    kind: TimeoutKind::Deadline,
+                    phase: TimeoutPhase::Preparing,
+                };
+                let t = termination(Some(StopReason::Timeout(info)), None);
+                self.settle_unstarted(a, t);
+                return Ok(None);
+            };
+            self.rewrite_deadline(a, left).map_err(|e| {
+                self.note_once(
+                    a,
                     "agent_spawn_failed",
-                    json!({ "error": e.to_string() }),
+                    json!({ "error": format!("supervisor spec: {e}") }),
                 );
-                self.pause(self.cfg.retry_ms);
-                None
+            })?;
+        }
+        let child = self.spawn(rec)?;
+        let seed = Seed {
+            key,
+            ends_ms: platform::monotonic_ms().saturating_add(lease_left),
+        };
+        Ok(Some((child, Some(seed))))
+    }
+
+    fn settle_unstarted(&self, attempt: &AttemptId, t: Termination) {
+        if settle(
+            &self.cfg,
+            &self.store,
+            attempt,
+            t,
+            Settle::Interrupted,
+            false,
+        )
+        .is_err()
+        {
+            self.pause(self.cfg.retry_ms);
+        }
+    }
+
+    /// The supervisor counts its deadline from its own start.
+    fn rewrite_deadline(&self, attempt: &AttemptId, left_ms: u64) -> Result<(), String> {
+        let path = self.spec_path(attempt);
+        let text = fs::read_to_string(&path).map_err(|e| e.to_string())?;
+        let mut spec: SuperviseSpec = serde_json::from_str(&text).map_err(|e| e.to_string())?;
+        spec.deadline_ms = Some(left_ms);
+        let bytes = serde_json::to_vec(&spec).map_err(|e| e.to_string())?;
+        write_atomic(&path, &bytes).map_err(|e| e.to_string())
+    }
+
+    /// The supervisor starts its lease clock when it starts, with a full
+    /// period. The lease was granted earlier (at the acceptance or the last
+    /// renewal): when that period ends and no renewal has arrived since the
+    /// start, the agent marks the lease expired in the database, which the
+    /// supervisor obeys at its next look. A renewal after the start makes
+    /// the supervisor count from it, and this watch ends.
+    fn watch_seed(&self, rec: &AcceptedAttempt, seed: &mut Option<Seed>) {
+        let Some(s) = *seed else {
+            return;
+        };
+        if platform::monotonic_ms() < s.ends_ms {
+            return;
+        }
+        // Unreadable: look again at the next poll.
+        let Ok(seen) = self.store.lease(&rec.attempt_id) else {
+            return;
+        };
+        let renewed = seen.map(|(k, _)| k) != s.key;
+        let expired = seen.is_some_and(|(_, x)| x);
+        if !renewed && !expired {
+            if self.store.expire_lease(&rec.attempt_id, now()).is_err() {
+                return;
+            }
+            note(
+                &self.store,
+                rec,
+                "agent_lease_expired",
+                json!({ "why": "no renewal since the grant" }),
+            );
+        }
+        *seed = None;
+    }
+
+    /// How long ago the attempt was accepted and its lease last granted, in
+    /// milliseconds: on this process's monotonic clock when it saw both, else
+    /// (the agent restarted since) from the wall-clock times this worker
+    /// recorded. No other host's time is involved.
+    fn elapsed(&self, rec: &AcceptedAttempt) -> (u64, u64) {
+        let mono = platform::monotonic_ms();
+        if let Some(c) = lock(&self.clocks).get(rec.attempt_id.as_str()) {
+            return (
+                mono.saturating_sub(c.accepted_ms),
+                mono.saturating_sub(c.granted_ms),
+            );
+        }
+        let wall = now();
+        let granted = self
+            .store
+            .lease_renewed_at(&rec.attempt_id)
+            .ok()
+            .flatten()
+            .unwrap_or(rec.accepted_at_ms)
+            .max(rec.accepted_at_ms);
+        (
+            wall.saturating_sub(rec.accepted_at_ms),
+            wall.saturating_sub(granted),
+        )
+    }
+
+    /// Wait (without blocking) for the supervisors that have exited.
+    fn reap(&self) {
+        lock(&self.children).retain_mut(|c| matches!(c.try_wait(), Ok(None)));
+    }
+
+    fn park(&self, child: Option<Child>) {
+        if let Some(mut c) = child {
+            if matches!(c.try_wait(), Ok(None)) {
+                lock(&self.children).push(c);
             }
         }
     }
@@ -476,6 +898,70 @@ impl Agent {
         serde_json::from_str(&text).ok()
     }
 
+    /// `host.prepare` under the limits: at most `max_concurrent_prepares` at
+    /// once, at most `prepare_timeout_ms` long. It runs on its own thread,
+    /// which keeps its permit until the host returns, however late; a
+    /// workspace nobody waits for any more is removed. `Ok(None)`: the agent
+    /// is stopping or the attempt is being stopped.
+    fn host_prepare(
+        &self,
+        rec: &AcceptedAttempt,
+        payload: &AttemptPayload,
+    ) -> Result<Option<Workspace>, ApiError> {
+        let a = &rec.attempt_id;
+        let permit = loop {
+            if self.stopping() || self.stop_requested(a) {
+                return Ok(None);
+            }
+            if let Some(p) = Permits::try_acquire(&self.prepares) {
+                break p;
+            }
+            self.pause(self.cfg.poll_ms);
+        };
+        let slot = Arc::new(Mutex::new(Slot::Waiting));
+        let (host, shards, theirs) = (self.host.clone(), self.shards.clone(), slot.clone());
+        let (rec2, payload2) = (rec.clone(), payload.clone());
+        std::thread::Builder::new()
+            .name("prepare".into())
+            .spawn(move || {
+                let _permit = permit;
+                let made = catch_unwind(AssertUnwindSafe(|| host.prepare(&rec2, &payload2)))
+                    .unwrap_or_else(|_| Err(internal("workspace", "the preparation panicked")));
+                let mut slot = lock(&theirs);
+                if matches!(*slot, Slot::Abandoned) {
+                    drop(slot);
+                    if let Ok(ws) = made {
+                        let _one = lock(shard(&shards, &rec2.attempt_id));
+                        let _ = host.cleanup(&rec2.attempt_id, Some(&ws));
+                    }
+                } else {
+                    *slot = Slot::Done(made);
+                }
+            })
+            .map_err(|e| internal("prepare thread", e))?;
+        let end = platform::monotonic_ms().saturating_add(self.cfg.prepare_timeout_ms);
+        loop {
+            {
+                let mut slot = lock(&slot);
+                match std::mem::replace(&mut *slot, Slot::Abandoned) {
+                    Slot::Done(made) => return made.map(Some),
+                    _ if platform::monotonic_ms() >= end => {
+                        return Err(internal(
+                            "workspace",
+                            format!(
+                                "the preparation took longer than {} ms",
+                                self.cfg.prepare_timeout_ms
+                            ),
+                        ))
+                    }
+                    _ if self.stopping() => return Ok(None),
+                    waiting => *slot = waiting,
+                }
+            }
+            std::thread::sleep(Duration::from_millis(self.cfg.poll_ms.clamp(1, 100)));
+        }
+    }
+
     /// `Accepted | Preparing -> Ready`: the workspace, the secret files, the
     /// supervisor's spec. No command is started here.
     fn prepare(&self, rec: &AcceptedAttempt) -> Result<(), ApiError> {
@@ -492,7 +978,10 @@ impl Agent {
         // An agent that died after making the workspace left its record.
         let ws = match self.workspace_of(attempt) {
             Some(ws) if ws.root.is_dir() => ws,
-            _ => self.host.prepare(rec, &payload)?,
+            _ => match self.host_prepare(rec, &payload)? {
+                Some(ws) => ws,
+                None => return Ok(()),
+            },
         };
         let ws_json = serde_json::to_vec(&ws).map_err(|e| internal("workspace record", e))?;
         write_atomic(&self.workspace_path(attempt), &ws_json)
@@ -541,6 +1030,7 @@ impl Agent {
             poll_ms: self.cfg.poll_ms,
             command_timeout_ms: payload.command_timeout_ms,
             resource_wait_timeout_ms: payload.resource_wait_timeout_ms,
+            // What is left of it is written when the supervisor is started.
             deadline_ms: payload.deadline_ms,
             inhibit_sleep: self.cfg.inhibit_sleep,
         };
@@ -568,8 +1058,10 @@ impl Agent {
 
     /// After the end: secret files and the workspace go at once (spec 22.3
     /// does not wait for the logs to be collected); logs, artifacts and the
-    /// result stay until GC.
+    /// result stay until GC. One cleanup of an attempt at a time: the tick
+    /// and the attempt's watcher both come here.
     fn clean(&self, attempt: &AttemptId) {
+        let _one = lock(shard(&self.shards, attempt));
         let ws = self.workspace_of(attempt);
         let marker = self.workspace_path(attempt);
         if ws.is_none() && marker.exists() {
@@ -581,17 +1073,16 @@ impl Agent {
                 let _ = fs::remove_file(marker);
                 let _ = fs::remove_file(self.spec_path(attempt));
                 let _ = fs::remove_dir(self.attempt_dir(attempt));
+                lock(&self.clocks).remove(attempt.as_str());
+                let mine = format!("{attempt}/");
+                lock(&self.noted).retain(|k, _| !k.starts_with(&mine));
             }
-            Err(e) => {
-                if let Ok(Some(rec)) = self.store.get(attempt) {
-                    note(
-                        &self.store,
-                        &rec,
-                        "agent_cleanup_failed",
-                        json!({ "code": e.code, "message": e.message }),
-                    );
-                }
-            }
+            // Tried again at every tick; said once per distinct failure.
+            Err(e) => self.note_once(
+                attempt,
+                "agent_cleanup_failed",
+                json!({ "code": e.code, "message": e.message }),
+            ),
         }
     }
 
@@ -614,26 +1105,137 @@ impl Agent {
     }
 
     /// One GC pass: drop what the store says may go (never an attempt that
-    /// runs or waits for `ack_collected`), then delete the files.
+    /// runs or waits for `ack_collected`), then delete the files. What could
+    /// not be deleted, and queued names that are not this store's, are
+    /// written to the journal (once each while they stay the same).
     pub fn gc(&self) -> Result<GcReport, ApiError> {
         let report = self
             .store
             .gc(now(), self.cfg.retention_ms, self.cfg.ack_wait_ms)
             .map_err(api)?;
-        drain_pending_deletes(&self.store, &self.cfg.attempts_root())
+        let drained = drain_pending_deletes(&self.store, &self.cfg.attempts_root())
             .map_err(|e| internal("gc", e))?;
+        for (locator, error) in &drained.failed {
+            self.note_global(
+                "agent_gc_delete_failed",
+                locator,
+                json!({ "locator": locator, "error": error }),
+            );
+        }
+        for locator in &drained.foreign {
+            self.note_global(
+                "agent_gc_foreign_locator",
+                locator,
+                json!({ "locator": locator }),
+            );
+        }
         Ok(report)
     }
 
     /// Periodic work: watch attempts nobody watches, clean, collect garbage.
+    /// One pass at a time; a call during a pass returns at once.
     pub fn tick(self: &Arc<Self>) {
+        if self.ticking.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let _pass = Ticking(&self.ticking);
+        self.reap();
         if let Ok(list) = self.store.list_nonterminal() {
             for rec in list {
                 self.kick(&rec.attempt_id);
             }
         }
         self.clean_ended();
-        let _ = self.gc();
+        if let Err(e) = self.gc() {
+            self.note_global(
+                "agent_gc_failed",
+                "",
+                json!({ "code": e.code, "message": e.message }),
+            );
+        }
+    }
+
+    /// Whether a diagnostic about `subject` is new (not the one written last).
+    fn is_news(&self, subject: String, payload: &Value) -> bool {
+        let text = payload.to_string();
+        let mut noted = lock(&self.noted);
+        if noted.get(&subject) == Some(&text) {
+            return false;
+        }
+        if noted.len() >= 4096 {
+            noted.clear();
+        }
+        noted.insert(subject, text);
+        true
+    }
+
+    /// A diagnostic event of an attempt, written once while it repeats.
+    fn note_once(&self, attempt: &AttemptId, kind: &str, payload: Value) {
+        if !self.is_news(format!("{attempt}/{kind}"), &payload) {
+            return;
+        }
+        if let Ok(Some(rec)) = self.store.get(attempt) {
+            note(&self.store, &rec, kind, payload);
+        }
+    }
+
+    /// A diagnostic event of no attempt, written once while it repeats.
+    fn note_global(&self, kind: &str, subject: &str, payload: Value) {
+        if self.is_news(format!("/{kind}/{subject}"), &payload) {
+            let _ = self.store.append_event(None, None, kind, &payload, now());
+        }
+    }
+
+    /// A retire of an attempt that may have run and that nobody can watch or
+    /// recover: once every launch of it is known to be from another boot of
+    /// the machine, nothing of it runs any more and it is fixed as
+    /// interrupted. On the same boot it stays unknown.
+    fn settle_lost(&self, attempt: &AttemptId) -> Result<(), ApiError> {
+        let Some(rec) = self.store.get(attempt).map_err(api)? else {
+            return Ok(());
+        };
+        if rec.state == AttemptState::Terminal {
+            return Ok(());
+        }
+        let lost = lock(&self.gave_up).contains(attempt.as_str())
+            || recovery_of(&self.cfg, &self.store, &rec, false)? == Recovery::Unresolved;
+        if !lost {
+            return Ok(());
+        }
+        let launches = self.store.launches(attempt).map_err(api)?;
+        let boots: Vec<Option<&str>> = launches
+            .iter()
+            .map(|(_, _, ident)| ident.as_ref().map(|i| i.boot_id.as_str()))
+            .collect();
+        let rebooted = policy::launched_on_another_boot(&boots, self.cfg.boot_id.as_str())
+            || !self
+                .store
+                .events_of(attempt, "agent_boot_changed")
+                .map_err(api)?
+                .is_empty();
+        if !rebooted {
+            return Ok(());
+        }
+        // A look by a watcher holds the supervisor lock for an instant; a
+        // living supervisor holds it for good.
+        for _ in 0..3 {
+            let t = termination(None, None);
+            if settle(
+                &self.cfg,
+                &self.store,
+                attempt,
+                t,
+                Settle::Interrupted,
+                true,
+            )? {
+                note(&self.store, &rec, "agent_settled_lost", json!({}));
+                lock(&self.gave_up).remove(attempt.as_str());
+                self.clean(attempt);
+                break;
+            }
+            self.pause(self.cfg.poll_ms);
+        }
+        Ok(())
     }
 
     // ---------------------------------------------------------- operations
@@ -716,9 +1318,25 @@ impl Agent {
         if !r.hash_matches().map_err(|e| invalid(e.to_string()))? {
             return Err(invalid("payload_hash does not match the payload"));
         }
-        policy::check_payload(&r.payload).map_err(invalid)?;
-        for c in &r.payload.commands {
-            check_cwd_relative(Path::new(&c.cwd))?;
+        // One acceptance at a time, so the cap and the insert are one step.
+        let one = lock(&self.submitting);
+        // A resend of an accepted attempt is answered with what is there
+        // (spec 11, idempotency): its payload was checked when it was
+        // accepted, and it adds no load. The store still compares the hash.
+        let fresh = self.store.get(&r.attempt_id).map_err(api)?.is_none()
+            && self.store.tombstone(&r.attempt_id).map_err(api)?.is_none();
+        if fresh {
+            policy::check_payload(&r.payload, self.cfg.poll_ms).map_err(invalid)?;
+            for c in &r.payload.commands {
+                check_cwd_relative(Path::new(&c.cwd))?;
+            }
+            let live = self.store.count_nonterminal().map_err(api)?;
+            if policy::at_live_cap(live, self.cfg.max_live_attempts) {
+                return Err(ApiError::new(
+                    ErrorCode::Overloaded,
+                    format!("{live} attempts are not terminal on this worker; ask again later"),
+                ));
+            }
         }
         let spec = serde_json::to_value(&r.payload).map_err(|e| internal("payload", e))?;
         let outcome = self
@@ -737,8 +1355,19 @@ impl Agent {
             )
             .map_err(api)?;
         // The acceptance is committed; only now may anything start.
+        drop(one);
         let (rec, duplicate) = match outcome {
-            SubmitOutcome::Accepted(rec) => (rec, false),
+            SubmitOutcome::Accepted(rec) => {
+                let at = platform::monotonic_ms();
+                lock(&self.clocks).insert(
+                    rec.attempt_id.to_string(),
+                    Clock {
+                        accepted_ms: at,
+                        granted_ms: at,
+                    },
+                );
+                (rec, false)
+            }
             SubmitOutcome::Existing(rec) => (rec, true),
         };
         if rec.state != AttemptState::Terminal {
@@ -759,6 +1388,8 @@ impl Agent {
         let out = self.store.log_position(a, "stdout").map_err(api)?;
         let err = self.store.log_position(a, "stderr").map_err(api)?;
         let dropped = out.dropped_bytes.saturating_add(err.dropped_bytes);
+        let gave_up = lock(&self.gave_up).contains(a.as_str());
+        let recovery = recovery_of(&self.cfg, &self.store, rec, false)?;
         Ok(AttemptStatus {
             schema_version: SchemaVersion::CURRENT,
             attempt_id: a.clone(),
@@ -770,7 +1401,7 @@ impl Agent {
             state: rec.state,
             receipts: rec.receipts,
             spawned_at_ms: rec.receipts.at_ms(Receipt::Running),
-            observation: Observation::Known,
+            observation: policy::observation(rec.state, gave_up, recovery),
             termination: rec.termination,
             nodes: Vec::new(),
             steps: Vec::new(),
@@ -781,15 +1412,25 @@ impl Agent {
     }
 
     fn list(&self, r: ListAttemptsRequest) -> Result<ListAttemptsResponse, ApiError> {
+        // One more than fits: an answer that would be cut is an error, the
+        // caller narrows `states` instead of trusting a part of the list.
+        let cap = self.cfg.max_list_attempts;
         let recs = self
             .store
-            .list_attempts(r.include_terminal, policy::MAX_LIST_ATTEMPTS)
+            .list_attempts(
+                r.states.as_deref(),
+                r.include_terminal,
+                cap.saturating_add(1),
+            )
             .map_err(api)?;
-        let mut attempts = Vec::new();
+        if !policy::fits(recs.len(), cap) {
+            return Err(invalid(format!(
+                "more than {cap} attempts match; narrow `states`"
+            )));
+        }
+        let mut attempts = Vec::with_capacity(recs.len());
         for rec in recs {
-            if r.states.as_ref().is_none_or(|s| s.contains(&rec.state)) {
-                attempts.push(self.status(&rec)?);
-            }
+            attempts.push(self.status(&rec)?);
         }
         Ok(ListAttemptsResponse {
             schema_version: SchemaVersion::CURRENT,
@@ -805,6 +1446,11 @@ impl Agent {
             .renew_lease(&r.attempt_id, r.key(), now())
             .map_err(api)?;
         let extended = outcome == LeaseOutcome::Extended;
+        if extended {
+            if let Some(c) = lock(&self.clocks).get_mut(r.attempt_id.as_str()) {
+                c.granted_ms = platform::monotonic_ms();
+            }
+        }
         let lease_ms = serde_json::from_value::<AttemptPayload>(rec.spec)
             .map(|p| p.lease_ms)
             .unwrap_or(0);
@@ -872,6 +1518,9 @@ impl Agent {
             .is_some();
         let mut now_terminal = was_terminal;
         if known && !was_terminal {
+            // Before the watcher is woken: it takes the supervisor lock for
+            // a moment at each look.
+            self.settle_lost(a)?;
             self.kick(a);
             let mut waited = 0;
             loop {
@@ -902,10 +1551,18 @@ impl Agent {
             return Err(invalid("watch_events needs an attempt_id"));
         };
         self.known(&a)?;
+        let scan = self.cfg.max_event_scan;
         let journal = self
             .store
-            .events_of_attempt(&a, policy::MAX_EVENT_SCAN)
+            .events_of_attempt(&a, scan.saturating_add(1))
             .map_err(api)?;
+        if !policy::fits(journal.len(), scan) {
+            // Numbering what was read would renumber the events behind it.
+            return Err(internal(
+                "watch_events",
+                format!("the journal of attempt {a} has more than {scan} entries"),
+            ));
+        }
         let wire: Vec<_> = journal
             .iter()
             .map(|e| policy::wire_event(&e.kind, &e.payload))
@@ -1032,28 +1689,41 @@ impl Agent {
     }
 
     fn secrets(&self, r: SecretBundlePutRequest) -> Result<SecretBundlePutResponse, ApiError> {
+        // The cleanup of an ended attempt takes the same lock and runs only
+        // after the end is in the database: read under the lock, the state
+        // either still allows the placement (the cleanup then erases what is
+        // placed) or it shows the end and nothing is placed.
+        let _one = lock(shard(&self.shards, &r.attempt_id));
         let rec = self.known(&r.attempt_id)?;
         Self::generation(&rec, r.generation)?;
-        if rec.retired || rec.cancel_requested_at_ms.is_some() {
-            return Err(ApiError::new(
-                ErrorCode::Retired,
-                "the attempt is being stopped",
-            ));
-        }
-        if !matches!(rec.state, AttemptState::Accepted | AttemptState::Preparing) {
-            return Err(ApiError::new(
-                ErrorCode::Conflict,
-                format!(
-                    "attempt {} is {:?}: secrets go in before the start",
-                    rec.attempt_id, rec.state
-                ),
-            ));
-        }
-        let Some(ws) = self.workspace_of(&r.attempt_id) else {
-            return Err(ApiError::new(
-                ErrorCode::Overloaded,
-                "the workspace is not prepared yet; send the bundle again",
-            ));
+        let ws = self.workspace_of(&r.attempt_id);
+        let stop = rec.retired || rec.cancel_requested_at_ms.is_some();
+        let ws = match (policy::secret_put(rec.state, stop, ws.is_some()), ws) {
+            (policy::SecretPut::Place, Some(ws)) => ws,
+            (policy::SecretPut::Stopping, _) => {
+                return Err(ApiError::new(
+                    ErrorCode::Retired,
+                    "the attempt is being stopped",
+                ))
+            }
+            (policy::SecretPut::TooLate, _) => {
+                return Err(ApiError::new(
+                    ErrorCode::Conflict,
+                    format!(
+                        "attempt {} is {:?}: secrets go in before the start",
+                        rec.attempt_id, rec.state
+                    ),
+                ))
+            }
+            // Not `OVERLOADED` (the worker is not refusing load) and not
+            // `CONFLICT` (that one is final): what the bundle goes into does
+            // not exist yet. The sender sends it again.
+            (policy::SecretPut::NotReady, _) | (policy::SecretPut::Place, None) => {
+                return Err(ApiError::new(
+                    ErrorCode::NotFound,
+                    "the workspace is not prepared yet; send the bundle again",
+                ))
+            }
         };
         let placed = self.host.place_secrets(&rec, &ws, &r.files)?;
         Ok(SecretBundlePutResponse {
@@ -1139,19 +1809,22 @@ fn how_termination(how: Settle) -> Termination {
 /// Fix the result of an attempt whose command was never started, holding the
 /// supervisor lock so no supervisor can be starting it meanwhile. `false`
 /// when a supervisor lives (it owns the attempt) or a launch appeared.
+/// `lost` skips the look at the launches: the caller has shown that whatever
+/// was launched cannot run any more (another boot).
 fn settle(
     cfg: &AgentConfig,
     store: &WorkerStore,
     attempt: &AttemptId,
     t: Termination,
     how: Settle,
+    lost: bool,
 ) -> Result<bool, ApiError> {
     let lock = SupervisorLock::try_acquire(&cfg.state_dir, attempt)
         .map_err(|e| internal("supervisor lock", e))?;
     let Some(_lock) = lock else {
         return Ok(false);
     };
-    if !store.launches(attempt).map_err(api)?.is_empty() {
+    if !lost && !store.launches(attempt).map_err(api)?.is_empty() {
         return Ok(false);
     }
     if how == Settle::Cancelled {

@@ -34,6 +34,9 @@ pub mod exit {
     pub const COLLECTION_FAILED: i32 = 78;
     /// Unexpected internal failure.
     pub const INTERNAL: i32 = 79;
+    /// Refused for now, nothing was done: ask again later. Outside `70..=79`
+    /// (all taken); `EX_UNAVAILABLE` of sysexits.
+    pub const OVERLOADED: i32 = 69;
     /// Conventional base for "terminated by signal N": `128 + N`.
     pub const SIGNAL_BASE: i32 = 128;
 }
@@ -150,8 +153,7 @@ impl ErrorCode {
             // Both are "the addressed attempt no longer accepts this", the
             // same family as a payload conflict; the JSON code tells them apart.
             ErrorCode::Retired | ErrorCode::LeaseNotRenewable => exit::CONFLICT,
-            // "Refused for now, ask again": the family of a busy source.
-            ErrorCode::Overloaded => exit::SOURCE_BUSY,
+            ErrorCode::Overloaded => exit::OVERLOADED,
         }
     }
 
@@ -229,10 +231,7 @@ mod tests {
     fn exit_codes_are_unique_except_documented_overlaps() {
         let mut seen = HashSet::new();
         for c in ErrorCode::ALL {
-            let documented_overlap = matches!(
-                c,
-                ErrorCode::Retired | ErrorCode::LeaseNotRenewable | ErrorCode::Overloaded
-            );
+            let documented_overlap = matches!(c, ErrorCode::Retired | ErrorCode::LeaseNotRenewable);
             assert!(
                 seen.insert(c.exit_code()) || documented_overlap,
                 "duplicate exit code for {c}"
@@ -258,7 +257,7 @@ mod tests {
         assert_eq!(ErrorCode::Internal.exit_code(), 79);
         assert_eq!(ErrorCode::Retired.exit_code(), 72);
         assert_eq!(ErrorCode::LeaseNotRenewable.exit_code(), 72);
-        assert_eq!(ErrorCode::Overloaded.exit_code(), 71);
+        assert_eq!(ErrorCode::Overloaded.exit_code(), 69);
         assert_eq!(exit::SUCCESS, 0);
     }
 

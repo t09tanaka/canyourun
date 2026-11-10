@@ -21,7 +21,7 @@ use remote_task_runner::workspace::{Workspace, WorkspaceKind};
 use std::collections::BTreeMap;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
@@ -35,6 +35,17 @@ struct DirHost {
     calls: Mutex<Vec<String>>,
     secrets_ready: AtomicBool,
     fail_core_dumps: AtomicBool,
+    /// `prepare` does not return while this is set.
+    block_prepare: AtomicBool,
+    preparing_now: AtomicUsize,
+    preparing_max: AtomicUsize,
+    /// `secrets_ready` panics (it runs on the attempt's watcher thread).
+    panic_secrets: AtomicBool,
+    fail_cleanup: AtomicBool,
+    slow_cleanup_ms: AtomicU64,
+    /// The attempts being cleaned right now, and whether one ever was twice.
+    cleaning: Mutex<Vec<String>>,
+    overlap: AtomicBool,
 }
 
 impl DirHost {
@@ -81,6 +92,12 @@ impl Host for DirHost {
     }
     fn prepare(&self, a: &AcceptedAttempt, _: &AttemptPayload) -> Result<Workspace, ApiError> {
         self.log(format!("prepare {}", a.attempt_id));
+        let now = self.preparing_now.fetch_add(1, Ordering::SeqCst) + 1;
+        self.preparing_max.fetch_max(now, Ordering::SeqCst);
+        while self.block_prepare.load(Ordering::SeqCst) {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        self.preparing_now.fetch_sub(1, Ordering::SeqCst);
         let dir = self.ws_dir(&a.attempt_id);
         std::fs::create_dir_all(&dir).unwrap();
         Ok(Workspace {
@@ -105,10 +122,27 @@ impl Host for DirHost {
         Ok(files.len() as u32)
     }
     fn secrets_ready(&self, _: &AcceptedAttempt) -> Result<bool, ApiError> {
+        if self.panic_secrets.load(Ordering::SeqCst) {
+            panic!("the host broke (a test of the watcher's panic handling)");
+        }
         Ok(self.secrets_ready.load(Ordering::SeqCst))
     }
     fn cleanup(&self, a: &AttemptId, ws: Option<&Workspace>) -> Result<(), ApiError> {
         self.log(format!("cleanup {a}"));
+        {
+            let mut cleaning = self.cleaning.lock().unwrap();
+            if cleaning.iter().any(|c| c == a.as_str()) {
+                self.overlap.store(true, Ordering::SeqCst);
+            }
+            cleaning.push(a.to_string());
+        }
+        std::thread::sleep(Duration::from_millis(
+            self.slow_cleanup_ms.load(Ordering::SeqCst),
+        ));
+        self.cleaning.lock().unwrap().retain(|c| c != a.as_str());
+        if self.fail_cleanup.load(Ordering::SeqCst) {
+            return Err(ApiError::new(ErrorCode::Internal, "the workspace is busy"));
+        }
         if let Some(ws) = ws {
             let _ = std::fs::remove_dir_all(&ws.root);
         }
@@ -135,6 +169,14 @@ fn fx() -> Fx {
         calls: Mutex::default(),
         secrets_ready: AtomicBool::new(true),
         fail_core_dumps: AtomicBool::new(false),
+        block_prepare: AtomicBool::new(false),
+        preparing_now: AtomicUsize::new(0),
+        preparing_max: AtomicUsize::new(0),
+        panic_secrets: AtomicBool::new(false),
+        fail_cleanup: AtomicBool::new(false),
+        slow_cleanup_ms: AtomicU64::new(0),
+        cleaning: Mutex::default(),
+        overlap: AtomicBool::new(false),
     });
     Fx {
         dir,
@@ -153,7 +195,7 @@ impl Drop for Fx {
         // is under the directory) and the commands they started.
         let state = self.state();
         if let Ok(store) = WorkerStore::open_read_only(&state) {
-            for rec in store.list_attempts(true, 500).unwrap_or_default() {
+            for rec in store.list_attempts(None, true, 500).unwrap_or_default() {
                 for (_, _, ident) in store.launches(&rec.attempt_id).unwrap_or_default() {
                     if let Some(i) = ident {
                         unsafe { libc::kill(-(i.pid as i32), libc::SIGKILL) };
@@ -1008,6 +1050,726 @@ async fn status_events_logs_lease_and_inspect_answer_from_the_store() {
     assert_eq!(e.code, ErrorCode::NotImplemented);
 }
 
+// ------------------------------------------------- limits and failures
+
+fn list_req(states: Option<Vec<AttemptState>>, include_terminal: bool) -> Request {
+    Request::ListAttempts(ListAttemptsRequest {
+        schema_version: SchemaVersion::CURRENT,
+        request_id: RequestId::generate(),
+        states,
+        include_terminal,
+    })
+}
+
+async fn listed(c: &Client, states: Option<Vec<AttemptState>>, terminal: bool) -> Vec<AttemptId> {
+    match call(c, list_req(states, terminal)).await.unwrap() {
+        Response::ListAttempts(l) => l.attempts.into_iter().map(|s| s.attempt_id).collect(),
+        other => panic!("{other:?}"),
+    }
+}
+
+fn put_req(a: &AttemptId) -> Request {
+    Request::SecretBundlePut(SecretBundlePutRequest {
+        schema_version: SchemaVersion::CURRENT,
+        request_id: RequestId::generate(),
+        coordinator_epoch: CoordinatorEpoch(1),
+        attempt_id: a.clone(),
+        generation: Generation(1),
+        files: vec![SecretFile {
+            path: ".env".into(),
+            hmac_digest: HmacDigest::parse(&format!("hmac-sha256:{}", "a".repeat(64))).unwrap(),
+            content: Bytes(b"token".to_vec()),
+        }],
+    })
+}
+
+fn events(f: &Fx, a: &AttemptId, kind: &str) -> usize {
+    f.store().events_of(a, kind).unwrap().len()
+}
+
+fn workspace_record(f: &Fx, a: &AttemptId) -> PathBuf {
+    f.state()
+        .join("attempts")
+        .join(a.as_str())
+        .join("workspace.json")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn list_attempts_filters_in_the_database_and_never_answers_with_a_part() {
+    let f = fx();
+    let mut cfg = f.cfg("boot-a");
+    cfg.max_list_attempts = 3;
+    let agent = f.start_with(cfg);
+    let c = f.connect(&agent).await;
+    // The two oldest attempts run; four newer ones have ended.
+    let (script, _, _) = stay(&f);
+    let mut running = Vec::new();
+    for _ in 0..2 {
+        let a = AttemptId::generate();
+        submit(&c, &a, &payload(&script)).await;
+        running.push(a);
+    }
+    wait_for("both to run", || {
+        running
+            .iter()
+            .all(|a| f.rec(a).state == AttemptState::Active)
+    });
+    for _ in 0..4 {
+        let a = AttemptId::generate();
+        submit(&c, &a, &payload("true")).await;
+        assert_eq!(f.wait_terminal(&a), Outcome::Succeeded);
+    }
+
+    // Six attempts, three fit. The filter runs before the limit: the two
+    // running ones are found behind four newer ones.
+    let mut got = listed(&c, Some(vec![AttemptState::Active]), true).await;
+    got.sort();
+    running.sort();
+    assert_eq!(got, running);
+    assert_eq!(listed(&c, None, false).await.len(), 2);
+    assert!(listed(&c, Some(vec![]), true).await.is_empty());
+    assert!(listed(&c, Some(vec![AttemptState::Terminal]), false)
+        .await
+        .is_empty());
+    // More than fit is an error, not the newest three.
+    for req in [
+        list_req(None, true),
+        list_req(Some(vec![AttemptState::Terminal]), true),
+    ] {
+        let e = call(&c, req).await.unwrap_err();
+        assert_eq!(e.code, ErrorCode::InvalidInput);
+        assert!(e.message.contains("more than 3"), "{}", e.message);
+    }
+    for a in &running {
+        call(&c, retire_req(a)).await.unwrap();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn watch_events_refuses_a_journal_longer_than_it_reads() {
+    let f = fx();
+    let mut cfg = f.cfg("boot-a");
+    cfg.max_event_scan = 2;
+    let agent = f.start_with(cfg);
+    let c = f.connect(&agent).await;
+    let a = AttemptId::generate();
+    submit(&c, &a, &payload("true")).await;
+    f.wait_terminal(&a);
+    let e = call(
+        &c,
+        Request::WatchEvents(WatchEventsRequest {
+            schema_version: SchemaVersion::CURRENT,
+            request_id: RequestId::generate(),
+            attempt_id: Some(a.clone()),
+            after_seq: 0,
+            limit: 10,
+        }),
+    )
+    .await
+    .unwrap_err();
+    assert_eq!(e.code, ErrorCode::Internal);
+    assert!(e.message.contains("more than 2"), "{}", e.message);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_new_attempt_beyond_the_live_cap_is_refused_and_a_resend_is_not() {
+    let f = fx();
+    let mut cfg = f.cfg("boot-a");
+    cfg.max_live_attempts = 2;
+    let agent = f.start_with(cfg);
+    let c = f.connect(&agent).await;
+    // They wait for a secret bundle that does not come.
+    f.host.secrets_ready.store(false, Ordering::SeqCst);
+    let (a1, a2, a3) = (
+        AttemptId::generate(),
+        AttemptId::generate(),
+        AttemptId::generate(),
+    );
+    let (p1, p3) = (payload("true"), payload("true"));
+    submit(&c, &a1, &p1).await;
+    submit(&c, &a2, &payload("true")).await;
+    let e = call(&c, submit_req(&a3, &p3)).await.unwrap_err();
+    assert_eq!(e.code, ErrorCode::Overloaded);
+    assert!(f.store().get(&a3).unwrap().is_none(), "nothing was stored");
+    // The cap is about new load: an accepted attempt is answered as before.
+    assert!(submit(&c, &a1, &p1).await.duplicate);
+    // And another payload under an accepted id is still a conflict.
+    let e = call(&c, submit_req(&a1, &p3)).await.unwrap_err();
+    assert_eq!(e.code, ErrorCode::Conflict);
+
+    call(&c, cancel_req(&a1)).await.unwrap();
+    assert_eq!(f.wait_terminal(&a1), Outcome::Cancelled);
+    assert!(!submit(&c, &a3, &p3).await.duplicate);
+    for a in [&a2, &a3] {
+        call(&c, cancel_req(a)).await.unwrap();
+        f.wait_terminal(a);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_submit_that_no_supervisor_could_honour_is_refused_before_it_is_stored() {
+    let f = fx();
+    let agent = f.start("boot-a");
+    let c = f.connect(&agent).await;
+    let a = AttemptId::generate();
+    let mut p = payload("true");
+    // The fixture's supervisors look every 25 ms.
+    p.lease_ms = 25;
+    let e = call(&c, submit_req(&a, &p)).await.unwrap_err();
+    assert_eq!(e.code, ErrorCode::InvalidInput);
+    p.lease_ms = 25 * 60 * 60 * 1000;
+    let e = call(&c, submit_req(&a, &p)).await.unwrap_err();
+    assert_eq!(e.code, ErrorCode::InvalidInput);
+    p.lease_ms = 60_000;
+    p.commands[0].env.insert("A=B".into(), "x".into());
+    let e = call(&c, submit_req(&a, &p)).await.unwrap_err();
+    assert_eq!(e.code, ErrorCode::InvalidInput);
+    assert!(f.store().get(&a).unwrap().is_none());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn workspaces_are_prepared_no_more_than_the_limit_at_once() {
+    let f = fx();
+    let mut cfg = f.cfg("boot-a");
+    cfg.max_concurrent_prepares = 1;
+    let agent = f.start_with(cfg);
+    let c = f.connect(&agent).await;
+    f.host.block_prepare.store(true, Ordering::SeqCst);
+    let (a1, a2) = (AttemptId::generate(), AttemptId::generate());
+    submit(&c, &a1, &payload("true")).await;
+    submit(&c, &a2, &payload("true")).await;
+    wait_for("both to be in preparation", || {
+        [&a1, &a2]
+            .iter()
+            .all(|a| f.rec(a).state == AttemptState::Preparing)
+    });
+    std::thread::sleep(Duration::from_millis(200));
+    assert_eq!(f.host.preparing_max.load(Ordering::SeqCst), 1);
+    f.host.block_prepare.store(false, Ordering::SeqCst);
+    assert_eq!(f.wait_terminal(&a1), Outcome::Succeeded);
+    assert_eq!(f.wait_terminal(&a2), Outcome::Succeeded);
+    assert_eq!(f.host.preparing_max.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_watcher_that_panics_fails_its_attempt_and_frees_it() {
+    let f = fx();
+    let agent = f.start("boot-a");
+    let c = f.connect(&agent).await;
+    f.host.panic_secrets.store(true, Ordering::SeqCst);
+    let a = AttemptId::generate();
+    submit(&c, &a, &payload("true")).await;
+    assert_eq!(f.wait_terminal(&a), Outcome::Failed);
+    assert_eq!(events(&f, &a, "agent_drive_panicked"), 1);
+    assert_eq!(events(&f, &a, "agent_gave_up"), 1);
+    wait_for("the cleanup", || f.host.count(&format!("cleanup {a}")) > 0);
+    // The agent goes on: the next attempt runs.
+    f.host.panic_secrets.store(false, Ordering::SeqCst);
+    let b = AttemptId::generate();
+    submit(&c, &b, &payload("true")).await;
+    assert_eq!(f.wait_terminal(&b), Outcome::Succeeded);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_preparation_that_takes_too_long_fails_the_attempt_and_its_late_workspace_goes() {
+    let f = fx();
+    let mut cfg = f.cfg("boot-a");
+    cfg.prepare_timeout_ms = 150;
+    let agent = f.start_with(cfg);
+    let c = f.connect(&agent).await;
+    f.host.block_prepare.store(true, Ordering::SeqCst);
+    let a = AttemptId::generate();
+    submit(&c, &a, &payload("true")).await;
+    assert_eq!(f.wait_terminal(&a), Outcome::Failed);
+    assert_eq!(events(&f, &a, "agent_prepare_failed"), 1);
+    // The host is still at it and holds its permit. When it returns, the
+    // workspace nobody waits for is removed.
+    assert_eq!(f.host.preparing_now.load(Ordering::SeqCst), 1);
+    f.host.block_prepare.store(false, Ordering::SeqCst);
+    wait_for("the late workspace to go", || {
+        f.host.preparing_now.load(Ordering::SeqCst) == 0
+            && f.host.count(&format!("cleanup {a}")) >= 2
+            && !f.host.ws_dir(&a).exists()
+    });
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_lease_that_ran_out_during_the_preparation_starts_no_command() {
+    let f = fx();
+    let agent = f.start("boot-a");
+    let c = f.connect(&agent).await;
+    f.host.block_prepare.store(true, Ordering::SeqCst);
+    let (script, marker, _) = stay(&f);
+    let mut p = payload(&script);
+    p.lease_ms = 300;
+    let a = AttemptId::generate();
+    submit(&c, &a, &p).await;
+    std::thread::sleep(Duration::from_millis(500));
+    f.host.block_prepare.store(false, Ordering::SeqCst);
+    assert_eq!(f.wait_terminal(&a), Outcome::Interrupted);
+    assert_eq!(lines(&marker), 0);
+    assert!(f.store().launches(&a).unwrap().is_empty());
+    assert!(matches!(f.store().lease(&a).unwrap(), Some((_, true))));
+    let Response::WatchEvents(w) = call(
+        &c,
+        Request::WatchEvents(WatchEventsRequest {
+            schema_version: SchemaVersion::CURRENT,
+            request_id: RequestId::generate(),
+            attempt_id: Some(a.clone()),
+            after_seq: 0,
+            limit: 100,
+        }),
+    )
+    .await
+    .unwrap() else {
+        panic!()
+    };
+    assert!(w.events.iter().any(|e| e.kind == EventKind::LeaseExpired));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_supervisor_gets_what_is_left_of_the_deadline_and_none_left_starts_nothing() {
+    let f = fx();
+    let agent = f.start("boot-a");
+    let c = f.connect(&agent).await;
+    f.host.block_prepare.store(true, Ordering::SeqCst);
+    let (script, marker, pidfile) = stay(&f);
+    let mut p = payload(&script);
+    p.deadline_ms = Some(60_000);
+    let a = AttemptId::generate();
+    submit(&c, &a, &p).await;
+    std::thread::sleep(Duration::from_millis(300));
+    f.host.block_prepare.store(false, Ordering::SeqCst);
+    wait_for("the command", || read_pid(&pidfile).is_some());
+    let spec: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(
+            f.state()
+                .join("attempts")
+                .join(a.as_str())
+                .join("supervise.json"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let left = spec["deadline_ms"].as_u64().unwrap();
+    assert!(left > 0 && left <= 60_000 - 300, "{left}");
+    call(&c, retire_req(&a)).await.unwrap();
+    f.wait_terminal(&a);
+    assert_eq!(lines(&marker), 1);
+
+    // The whole deadline passes while the workspace is made.
+    f.host.block_prepare.store(true, Ordering::SeqCst);
+    let mut p = payload(&script);
+    p.deadline_ms = Some(200);
+    let b = AttemptId::generate();
+    submit(&c, &b, &p).await;
+    std::thread::sleep(Duration::from_millis(400));
+    f.host.block_prepare.store(false, Ordering::SeqCst);
+    assert_eq!(f.wait_terminal(&b), Outcome::TimedOut);
+    assert_eq!(lines(&marker), 1, "the second command never started");
+    assert!(f.store().launches(&b).unwrap().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_lease_counts_from_its_grant_not_from_the_supervisors_start() {
+    let f = fx();
+    let agent = f.start("boot-a");
+    let c = f.connect(&agent).await;
+    let renew = |a: &AttemptId| {
+        Request::RenewLease(RenewLeaseRequest {
+            schema_version: SchemaVersion::CURRENT,
+            request_id: RequestId::generate(),
+            coordinator_epoch: CoordinatorEpoch(1),
+            attempt_id: a.clone(),
+            generation: Generation(1),
+            lease_seq: 1,
+            lease_ms: 4_000,
+        })
+    };
+    // Never renewed: the supervisor starts 1.5 s into a 3 s lease and would
+    // count 3 s of its own. The agent ends the lease when the grant ends.
+    f.host.block_prepare.store(true, Ordering::SeqCst);
+    let (script, _, _) = stay(&f);
+    let mut p = payload(&script);
+    p.lease_ms = 3_000;
+    let a = AttemptId::generate();
+    submit(&c, &a, &p).await;
+    std::thread::sleep(Duration::from_millis(1_500));
+    f.host.block_prepare.store(false, Ordering::SeqCst);
+    assert_eq!(f.wait_terminal(&a), Outcome::Interrupted);
+    assert_eq!(events(&f, &a, "agent_lease_expired"), 1);
+
+    // Renewed after the start: the supervisor counts from the renewal and
+    // the agent's watch of the first grant ends without a word.
+    f.host.block_prepare.store(true, Ordering::SeqCst);
+    let mut p = payload(&script);
+    p.lease_ms = 4_000;
+    let b = AttemptId::generate();
+    let accepted = Instant::now();
+    submit(&c, &b, &p).await;
+    std::thread::sleep(Duration::from_millis(1_000));
+    f.host.block_prepare.store(false, Ordering::SeqCst);
+    wait_for("the running state", || {
+        f.rec(&b).state == AttemptState::Active
+    });
+    let Response::RenewLease(r) = call(&c, renew(&b)).await.unwrap() else {
+        panic!()
+    };
+    assert!(r.extended);
+    assert!(
+        accepted.elapsed() < Duration::from_millis(3_500),
+        "too slow to tell"
+    );
+    std::thread::sleep(Duration::from_millis(4_600).saturating_sub(accepted.elapsed()));
+    assert_eq!(f.rec(&b).state, AttemptState::Active);
+    assert_eq!(events(&f, &b, "agent_lease_expired"), 0);
+    call(&c, retire_req(&b)).await.unwrap();
+    f.wait_terminal(&b);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_supervisor_that_cannot_be_started_is_tried_five_times_then_the_attempt_ends() {
+    let f = fx();
+    let mut cfg = f.cfg("boot-a");
+    cfg.supervisor_exe = f.path("no-such-binary");
+    cfg.retry_ms = 10;
+    let agent = f.start_with(cfg);
+    let c = f.connect(&agent).await;
+    let a = AttemptId::generate();
+    submit(&c, &a, &payload("true")).await;
+    assert_eq!(f.wait_terminal(&a), Outcome::Interrupted);
+    assert_eq!(events(&f, &a, "agent_spawn_failed"), 5);
+    assert_eq!(events(&f, &a, "agent_gave_up"), 1);
+    wait_for("the cleanup", || f.host.count(&format!("cleanup {a}")) > 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_lost_boot_record_next_to_live_attempts_counts_as_a_reboot() {
+    let f = fx();
+    let agent = f.start("boot-a");
+    assert!(!agent.startup_report().boot_changed, "a first start");
+    let c = f.connect(&agent).await;
+    f.host.secrets_ready.store(false, Ordering::SeqCst);
+    let a = AttemptId::generate();
+    submit(&c, &a, &payload("true")).await;
+    wait_for("the workspace record", || workspace_record(&f, &a).exists());
+    agent.shutdown();
+    std::fs::remove_file(f.state().join("boot_id")).unwrap();
+
+    let agent = f.start("boot-a");
+    assert!(agent.startup_report().boot_changed);
+    assert_eq!(agent.startup_report().settled, vec![a.clone()]);
+    assert_eq!(f.wait_terminal(&a), Outcome::Interrupted);
+    agent.shutdown();
+    // With nothing live and nothing launched, a missing record is a first
+    // start again... but a launch intent anywhere keeps it a reboot.
+    std::fs::remove_file(f.state().join("boot_id")).unwrap();
+    assert!(!f.start("boot-a").startup_report().boot_changed);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn one_cleanup_of_an_attempt_at_a_time_and_a_failing_one_is_said_once() {
+    let f = fx();
+    let agent = f.start("boot-a");
+    let c = f.connect(&agent).await;
+    f.host.fail_cleanup.store(true, Ordering::SeqCst);
+    let a = AttemptId::generate();
+    submit(&c, &a, &payload("true")).await;
+    assert_eq!(f.wait_terminal(&a), Outcome::Succeeded);
+    wait_for("the first cleanup", || {
+        events(&f, &a, "agent_cleanup_failed") == 1
+    });
+    for _ in 0..5 {
+        agent.tick();
+    }
+    assert!(f.host.count(&format!("cleanup {a}")) >= 6);
+    assert_eq!(events(&f, &a, "agent_cleanup_failed"), 1);
+
+    // Now it works, slowly, and everybody comes at once.
+    f.host.fail_cleanup.store(false, Ordering::SeqCst);
+    f.host.slow_cleanup_ms.store(100, Ordering::SeqCst);
+    let racers: Vec<_> = (0..6)
+        .map(|i| {
+            let agent = agent.clone();
+            std::thread::spawn(move || {
+                if i % 2 == 0 {
+                    agent.clean_ended()
+                } else {
+                    agent.tick()
+                }
+            })
+        })
+        .collect();
+    for r in racers {
+        r.join().unwrap();
+    }
+    assert!(!f.host.overlap.load(Ordering::SeqCst));
+    assert!(!f.host.ws_dir(&a).exists());
+    assert!(!workspace_record(&f, &a).exists());
+
+    // A tick during a tick returns at once instead of queueing behind it.
+    f.host.fail_cleanup.store(true, Ordering::SeqCst);
+    f.host.slow_cleanup_ms.store(600, Ordering::SeqCst);
+    let b = AttemptId::generate();
+    submit(&c, &b, &payload("true")).await;
+    assert_eq!(f.wait_terminal(&b), Outcome::Succeeded);
+    wait_for("the watcher's cleanup to end", || {
+        events(&f, &b, "agent_cleanup_failed") == 1
+    });
+    let slow = {
+        let agent = agent.clone();
+        std::thread::spawn(move || agent.tick())
+    };
+    wait_for("the slow pass", || {
+        !f.host.cleaning.lock().unwrap().is_empty()
+    });
+    let started = Instant::now();
+    agent.tick();
+    assert!(started.elapsed() < Duration::from_millis(300));
+    slow.join().unwrap();
+    f.host.fail_cleanup.store(false, Ordering::SeqCst);
+    f.host.slow_cleanup_ms.store(0, Ordering::SeqCst);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_exited_supervisor_does_not_stay_a_zombie() {
+    let f = fx();
+    let agent = f.start("boot-a");
+    let c = f.connect(&agent).await;
+    let (script, _, pidfile) = stay(&f);
+    let a = AttemptId::generate();
+    submit(&c, &a, &payload(&script)).await;
+    wait_for("the command", || read_pid(&pidfile).is_some());
+    let supervisors = f.supervisors(&a);
+    assert_eq!(supervisors.len(), 1);
+    call(&c, retire_req(&a)).await.unwrap();
+    f.wait_terminal(&a);
+    // A zombie still answers a signal 0; a reaped process does not.
+    wait_for("the supervisor to be reaped", || {
+        agent.tick();
+        !alive(supervisors[0])
+    });
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_secret_bundle_for_a_workspace_that_is_not_there_yet_is_sent_again() {
+    let f = fx();
+    let agent = f.start("boot-a");
+    let c = f.connect(&agent).await;
+    f.host.block_prepare.store(true, Ordering::SeqCst);
+    f.host.secrets_ready.store(false, Ordering::SeqCst);
+    let a = AttemptId::generate();
+    submit(&c, &a, &payload("true")).await;
+    // Not `OVERLOADED`, and not the final `CONFLICT`.
+    let e = call(&c, put_req(&a)).await.unwrap_err();
+    assert_eq!(e.code, ErrorCode::NotFound);
+    f.host.block_prepare.store(false, Ordering::SeqCst);
+    wait_for("the workspace record", || workspace_record(&f, &a).exists());
+    call(&c, cancel_req(&a)).await.unwrap();
+    let e = call(&c, put_req(&a)).await.unwrap_err();
+    assert_eq!(e.code, ErrorCode::Retired);
+    assert_eq!(f.wait_terminal(&a), Outcome::Cancelled);
+    assert_eq!(f.host.count(&format!("place {a}")), 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_attempt_nobody_can_recover_is_unknown_until_a_retire_after_a_reboot() {
+    let real = remote_task_runner::platform::boot_id().expect("this machine has a boot id");
+    let f = fx();
+    let mut cfg = f.cfg(&real);
+    cfg.retire_wait_ms = 300;
+    let agent = f.start_with(cfg.clone());
+    let c = f.connect(&agent).await;
+    let (script, marker, pidfile) = stay(&f);
+    let a = AttemptId::generate();
+    submit(&c, &a, &payload(&script)).await;
+    wait_for("the command", || read_pid(&pidfile).is_some());
+    wait_for("the running state", || {
+        f.rec(&a).state == AttemptState::Active
+    });
+    agent.shutdown();
+    for s in f.supervisors(&a) {
+        unsafe { libc::kill(s, libc::SIGKILL) };
+    }
+    wait_for("the supervisor to die", || f.supervisors(&a).is_empty());
+    std::fs::remove_file(
+        f.state()
+            .join("attempts")
+            .join(a.as_str())
+            .join("supervise.json"),
+    )
+    .unwrap();
+
+    // Same boot: the command may still run, and nothing can recover it.
+    let agent = f.start_with(cfg.clone());
+    assert_eq!(agent.startup_report().unresolved, vec![a.clone()]);
+    let c = f.connect(&agent).await;
+    let get = || {
+        Request::GetAttempt(GetAttemptRequest {
+            schema_version: SchemaVersion::CURRENT,
+            request_id: RequestId::generate(),
+            attempt_id: a.clone(),
+        })
+    };
+    let Response::GetAttempt(status) = call(&c, get()).await.unwrap() else {
+        panic!()
+    };
+    assert_eq!(
+        status.observation,
+        remote_task_runner::state::Observation::Unknown
+    );
+    let Response::RetireAttempt(r) = call(&c, retire_req(&a)).await.unwrap() else {
+        panic!()
+    };
+    assert_eq!(r.status, RetireStatus::Unconfirmed);
+    assert_eq!(f.rec(&a).state, AttemptState::Active);
+    agent.shutdown();
+
+    // Another boot: whatever was launched is gone with the old boot.
+    cfg.boot_id = WorkerBootId::parse("boot-next").unwrap();
+    let agent = f.start_with(cfg);
+    assert!(agent.startup_report().boot_changed);
+    assert_eq!(agent.startup_report().unresolved, vec![a.clone()]);
+    let c = f.connect(&agent).await;
+    let Response::RetireAttempt(r) = call(&c, retire_req(&a)).await.unwrap() else {
+        panic!()
+    };
+    assert_eq!(r.status, RetireStatus::Stopped);
+    assert_eq!(f.wait_terminal(&a), Outcome::Interrupted);
+    assert_eq!(events(&f, &a, "agent_settled_lost"), 1);
+    let Response::GetAttempt(status) = call(&c, get()).await.unwrap() else {
+        panic!()
+    };
+    assert_eq!(
+        status.observation,
+        remote_task_runner::state::Observation::Known
+    );
+    assert_eq!(lines(&marker), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn gc_writes_down_what_it_cannot_delete() {
+    let f = fx();
+    let mut cfg = f.cfg("boot-a");
+    cfg.retention_ms = 0;
+    let agent = f.start_with(cfg);
+    let c = f.connect(&agent).await;
+    let a = AttemptId::generate();
+    submit(&c, &a, &payload("true")).await;
+    f.wait_terminal(&a);
+    agent
+        .store()
+        .add_blob_ref(
+            &NewBlobRef {
+                ref_id: format!("{a}/elsewhere"),
+                attempt_id: a.to_string(),
+                kind: BlobKind::Log,
+                locator: "../elsewhere".into(),
+            },
+            1,
+        )
+        .unwrap();
+    let Response::GetResult(result) = call(
+        &c,
+        Request::GetResult(GetResultRequest {
+            schema_version: SchemaVersion::CURRENT,
+            request_id: RequestId::generate(),
+            attempt_id: a.clone(),
+            generation: Generation(1),
+        }),
+    )
+    .await
+    .unwrap() else {
+        panic!()
+    };
+    call(
+        &c,
+        Request::AckCollected(AckCollectedRequest {
+            schema_version: SchemaVersion::CURRENT,
+            request_id: RequestId::generate(),
+            attempt_id: a.clone(),
+            generation: Generation(1),
+            result_digest: result.result_digest,
+        }),
+    )
+    .await
+    .unwrap();
+    std::thread::sleep(Duration::from_millis(5));
+    for _ in 0..3 {
+        agent.gc().unwrap();
+    }
+    let said = f
+        .store()
+        .events_after(0, 10_000)
+        .unwrap()
+        .into_iter()
+        .filter(|e| e.kind == "agent_gc_foreign_locator")
+        .count();
+    assert_eq!(said, 1, "still queued, said once");
+    assert_eq!(f.store().pending_deletes().unwrap().len(), 1);
+}
+
+/// A stop and a secret bundle race the submit, each on its own connection.
+/// Whatever the order: the attempt ends (or never exists), its command starts
+/// at most once, and no workspace or secret file is left.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cancel_and_retire_race_the_submit_and_the_preparation() {
+    let f = fx();
+    let agent = f.start("boot-a");
+    let (c1, c2, c3) = (
+        f.connect(&agent).await,
+        f.connect(&agent).await,
+        f.connect(&agent).await,
+    );
+    for i in 0..16 {
+        let marker = f.path(&format!("race-{i}"));
+        let a = AttemptId::generate();
+        let mut p = payload(&format!("echo start >> {}; sleep 0.05", marker.display()));
+        p.has_secret_bundle = i % 4 < 2;
+        let stop = if i % 2 == 0 {
+            cancel_req(&a)
+        } else {
+            retire_req(&a)
+        };
+        let (submitted, stopped, put) = tokio::join!(
+            call(&c1, submit_req(&a, &p)),
+            call(&c2, stop),
+            call(&c3, put_req(&a)),
+        );
+        stopped.unwrap();
+        match submitted {
+            Ok(_) => {
+                f.wait_terminal(&a);
+            }
+            // The tombstone was first.
+            Err(e) => {
+                assert_eq!(e.code, ErrorCode::Retired, "{e:?}");
+                assert!(f.store().get(&a).unwrap().is_none());
+            }
+        }
+        if let Err(e) = put {
+            assert!(
+                matches!(
+                    e.code,
+                    ErrorCode::NotFound | ErrorCode::Retired | ErrorCode::Conflict
+                ),
+                "{e:?}"
+            );
+        }
+        wait_for("the workspace to go", || {
+            !f.host.ws_dir(&a).exists() && !workspace_record(&f, &a).exists()
+        });
+        assert!(lines(&marker) <= 1);
+        // A late resend never brings it back.
+        match call(&c1, submit_req(&a, &p)).await {
+            Ok(Response::SubmitAttempt(r)) => assert!(r.duplicate),
+            Ok(other) => panic!("{other:?}"),
+            Err(e) => assert_eq!(e.code, ErrorCode::Retired),
+        }
+        assert_eq!(f.store().count_nonterminal().unwrap(), 0);
+    }
+}
+
 // ---------------------------------------------------------------- startup
 
 #[test]
@@ -1039,10 +1801,13 @@ fn startup_runs_every_sweep_in_order_before_any_attempt_is_prepared() {
                     coordinator_epoch: CoordinatorEpoch(1),
                     spec: serde_json::to_value(&p).unwrap(),
                 },
-                1,
+                remote_task_runner::platform::wall_ms(),
             )
             .unwrap();
     }
+    // That agent had recorded the boot (without the record, an attempt in
+    // the database means the record was lost: a reboot).
+    std::fs::write(state.join("boot_id"), "boot-a").unwrap();
     let agent = f.start("boot-a");
     assert_eq!(agent.startup_report().steps, STARTUP_ORDER.to_vec());
     assert_eq!(agent.startup_report().watched, vec![a.clone()]);
