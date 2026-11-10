@@ -87,23 +87,54 @@ impl Masker {
     }
 
     pub fn stream(&self) -> StreamMasker {
+        self.stream_limited(MAX_HELD_BYTES)
+    }
+
+    /// [`stream`](Self::stream) with another bound on the held bytes.
+    pub fn stream_limited(&self, limit: usize) -> StreamMasker {
         StreamMasker {
             masker: self.clone(),
             held: Vec::new(),
+            limit,
         }
     }
 }
 
+/// Most bytes [`StreamMasker`] holds back beyond what one secret needs. A
+/// run of overlapping occurrences (`abab` in `ababab...`) could otherwise keep
+/// growing; past this the run so far is released as one mask.
+pub const MAX_HELD_BYTES: usize = 1024 * 1024;
+
 /// Masks a log arriving in pieces. Output may lag the input by up to
 /// `longest pattern - 1` bytes (plus the rest of a character, so that a piece
-/// of valid UTF-8 text never ends inside one) until [`finish`](Self::finish).
-#[derive(Debug, Clone)]
+/// of valid UTF-8 text never ends inside one) until [`finish`](Self::finish);
+/// what is held never exceeds [`MAX_HELD_BYTES`] plus one chunk. When a
+/// pathological input (a chain of overlapping occurrences longer than that)
+/// forces an early release, the bytes of the chain are masked as one and at
+/// most `longest pattern - 1` bytes of a following overlap can show.
+#[derive(Clone)]
 pub struct StreamMasker {
     masker: Masker,
     held: Vec<u8>,
+    limit: usize,
+}
+
+/// Does not show the held bytes or the patterns: only counts.
+impl std::fmt::Debug for StreamMasker {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StreamMasker")
+            .field("patterns", &self.masker.patterns.len())
+            .field("held_bytes", &self.held.len())
+            .finish_non_exhaustive()
+    }
 }
 
 impl StreamMasker {
+    /// Bytes held back at the moment (for a bound check).
+    pub fn pending(&self) -> usize {
+        self.held.len()
+    }
+
     /// Feed the next bytes; returns what can be released.
     pub fn push(&mut self, chunk: &[u8]) -> Vec<u8> {
         self.held.extend_from_slice(chunk);
@@ -113,15 +144,30 @@ impl StreamMasker {
         let hold = self.masker.longest - 1;
         let cut = self.held.len().saturating_sub(hold);
         // do not end the released part inside a character
-        let mut cut = (0..=cut)
-            .rev()
-            .find(|&i| i >= self.held.len() || (self.held[i] & 0xC0) != 0x80)
-            .unwrap_or(0);
+        let boundary = |at: usize| {
+            (0..=at)
+                .rev()
+                .find(|&i| i >= self.held.len() || (self.held[i] & 0xC0) != 0x80)
+                .unwrap_or(0)
+        };
+        let mut cut = boundary(cut);
         // an occurrence (or run of them) that reaches the cut is not complete
-        for (s, e) in self.masker.runs(&self.held) {
+        let runs = self.masker.runs(&self.held);
+        for &(s, e) in &runs {
             if e >= cut {
                 cut = cut.min(s);
             }
+        }
+        if self.held.len() - cut > self.limit {
+            // too long a chain: release it, keeping only what a later
+            // occurrence could still start in
+            let mut forced = boundary(self.held.len().saturating_sub(hold));
+            for &(s, e) in &runs {
+                if s < forced {
+                    forced = forced.max(e);
+                }
+            }
+            cut = forced;
         }
         let out = self.masker.mask(&self.held[..cut]);
         self.held.drain(..cut);
@@ -371,5 +417,94 @@ mod tests {
         }
         released.extend(s.finish());
         assert_eq!(String::from_utf8(released).unwrap(), text);
+    }
+
+    #[test]
+    fn a_chain_of_overlapping_occurrences_does_not_grow_the_held_bytes_without_bound() {
+        let k = m(&["abab"]);
+        let mut s = k.stream_limited(64);
+        let mut out = Vec::new();
+        let mut peak = 0;
+        for _ in 0..2000 {
+            out.extend(s.push(b"ab"));
+            peak = peak.max(s.pending());
+        }
+        // at most the limit plus what one more chunk and one pattern need
+        assert!(peak <= 64 + 2 + 3, "{peak}");
+        out.extend(s.finish());
+        // every byte of the chain is masked, in a few runs rather than one
+        let text = String::from_utf8(out).unwrap();
+        assert!(text.starts_with("***"));
+        assert!(text.matches("***").count() > 1);
+        // what shows is at most a pattern's worth of overlap per forced release
+        let stars = text.matches("***").count();
+        let rest = text.len() - stars * 3;
+        assert!(rest <= stars * 3, "{rest} bytes show among {stars} masks");
+        // the default bound is 1 MiB and a normal input never reaches it
+        assert_eq!(MAX_HELD_BYTES, 1024 * 1024);
+        let mut d = k.stream();
+        for _ in 0..1000 {
+            d.push(b"ab");
+        }
+        assert!(d.pending() > 64, "an unforced chain is still whole");
+        assert_eq!(String::from_utf8(d.finish()).unwrap(), "***");
+    }
+
+    #[test]
+    fn a_forced_release_keeps_utf8_and_leaves_a_following_secret_masked() {
+        let k = m(&["ああああ", "SECRET-VALUE"]);
+        let mut s = k.stream_limited(32);
+        let mut out = Vec::new();
+        for _ in 0..200 {
+            out.extend(s.push("あ".as_bytes()));
+            assert!(std::str::from_utf8(&out).is_ok());
+        }
+        out.extend(s.push(b" then SECRET-VALUE here"));
+        out.extend(s.finish());
+        let text = String::from_utf8(out).unwrap();
+        assert!(!text.contains("SECRET"), "{text}");
+        assert!(text.ends_with(" here"));
+    }
+
+    #[test]
+    fn the_forced_release_starts_just_over_the_limit_and_takes_the_whole_run() {
+        let k = m(&["abab"]);
+        let mut s = k.stream_limited(64);
+        for n in 1..=32 {
+            s.push(b"ab");
+            assert_eq!(s.pending(), 2 * n, "held up to and including the limit");
+        }
+        let out = s.push(b"ab");
+        assert_eq!(s.pending(), 0, "the whole run went out, as one mask");
+        assert_eq!(out, b"***");
+        // a run that starts exactly where the kept tail starts is kept
+        let k = m(&["aaaa", "xyz"]);
+        let mut s = k.stream_limited(2);
+        let out = s.push(b"aaaaaaaaaaaaqxyz");
+        assert_eq!(s.pending(), 3);
+        assert_eq!(out, b"***q");
+        assert_eq!(s.finish(), b"***");
+    }
+
+    #[test]
+    fn stream_debug_counts_only() {
+        let k = m(&["topsecret-value"]);
+        let mut s = k.stream();
+        s.push(b"abc");
+        let shown = format!("{s:?}");
+        assert!(shown.contains("StreamMasker"), "{shown}");
+        assert!(shown.contains("patterns: 1"), "{shown}");
+        assert!(shown.contains("held_bytes: 3"), "{shown}");
+    }
+
+    #[test]
+    fn what_is_held_is_measured_from_the_cut_not_from_the_start() {
+        // a long prefix does not make the held tail count as too long
+        let k = m(&["secret-value"]);
+        let mut s = k.stream_limited(16);
+        let out = s.push(b"aaaaaaaaaaaaaaaaaaaa secret-value");
+        assert_eq!(out, b"aaaaaaaaaaaaaaaaaaaa ");
+        assert_eq!(s.pending(), 12);
+        assert_eq!(s.finish(), b"***");
     }
 }

@@ -5,6 +5,7 @@
 
 use crate::ids::Digest;
 use crate::source::safety::{check_entries, check_rel_path, MODE_FILE};
+use crate::wire::HmacDigest;
 use local_ci::source::SecretSpec;
 use std::ops::Range;
 
@@ -30,6 +31,7 @@ pub enum Limit {
     FileTooLarge { index: usize, bytes: usize },
     PathTooLong { index: usize, bytes: usize },
     TooManyBytes { bytes: usize },
+    TooManyGlobs { count: usize },
 }
 
 impl std::fmt::Display for Limit {
@@ -50,8 +52,33 @@ impl std::fmt::Display for Limit {
                 f,
                 "secret files hold {bytes} bytes; at most {MAX_TOTAL_BYTES} are allowed"
             ),
+            Limit::TooManyGlobs { count } => write!(
+                f,
+                "{count} secret_files globs are declared; at most {MAX_DECLARED_GLOBS} are allowed"
+            ),
         }
     }
+}
+
+/// Most `[source] secret_files` globs a project may declare.
+pub const MAX_DECLARED_GLOBS: usize = 64;
+
+/// The declared globs: not too many, none longer than a path may be.
+pub fn check_declared(specs: &[SecretSpec]) -> Result<(), Limit> {
+    if specs.len() > MAX_DECLARED_GLOBS {
+        return Err(Limit::TooManyGlobs { count: specs.len() });
+    }
+    if let Some((index, s)) = specs
+        .iter()
+        .enumerate()
+        .find(|(_, s)| s.glob.len() > MAX_PATH_BYTES)
+    {
+        return Err(Limit::PathTooLong {
+            index,
+            bytes: s.glob.len(),
+        });
+    }
+    Ok(())
 }
 
 /// Check `(path length, content length)` of every file against the limits.
@@ -103,12 +130,11 @@ pub fn plan_batches(sizes: &[(usize, usize)]) -> Vec<Range<usize>> {
     out
 }
 
-/// The wire form of a digest local-ci recorded as `hmac-sha256:<hex>`: the
-/// wire type only knows `sha256:<hex>`, and the value stays an HMAC. `None`
-/// for anything else.
-pub fn to_wire_digest(ci: &str) -> Option<Digest> {
-    let hex = ci.strip_prefix("hmac-sha256:")?;
-    Digest::parse(&format!("sha256:{hex}")).ok()
+/// The wire type of a digest local-ci recorded as `hmac-sha256:<hex>`: the
+/// same text, checked. `None` for anything else (a plain `sha256:` hash
+/// included).
+pub fn to_wire_digest(ci: &str) -> Option<HmacDigest> {
+    HmacDigest::parse(ci).ok()
 }
 
 /// Equal in time that does not depend on where the first difference is.
@@ -191,8 +217,8 @@ pub fn check_paths<'a>(paths: impl IntoIterator<Item = &'a str>) -> Result<(), B
 /// What a bundle's manifest listing is digested as, for the storage's
 /// `secret_bundle_ref`: path and HMAC of every file, sorted by path, never the
 /// content (the HMAC is keyed, so the digest reveals nothing about it).
-pub fn listing_digest(entries: &[(String, String)]) -> Digest {
-    let mut sorted: Vec<&(String, String)> = entries.iter().collect();
+pub fn listing_digest(entries: &[(String, HmacDigest)]) -> Digest {
+    let mut sorted: Vec<&(String, HmacDigest)> = entries.iter().collect();
     sorted.sort();
     let mut text = String::new();
     for (path, hmac) in sorted {
@@ -200,7 +226,7 @@ pub fn listing_digest(entries: &[(String, String)]) -> Digest {
         text.push(':');
         text.push_str(path);
         text.push(' ');
-        text.push_str(hmac);
+        text.push_str(hmac.as_str());
         text.push('\n');
     }
     Digest::of_bytes(text.as_bytes())
@@ -286,15 +312,42 @@ mod tests {
     }
 
     #[test]
+    fn declared_globs_are_bounded_in_number_and_length() {
+        let spec = |glob: String| SecretSpec {
+            glob,
+            required: false,
+        };
+        let many = |n: usize| (0..n).map(|i| spec(format!("g{i}"))).collect::<Vec<_>>();
+        assert_eq!(check_declared(&[]), Ok(()));
+        assert_eq!(check_declared(&many(MAX_DECLARED_GLOBS)), Ok(()));
+        assert_eq!(
+            check_declared(&many(MAX_DECLARED_GLOBS + 1)),
+            Err(Limit::TooManyGlobs {
+                count: MAX_DECLARED_GLOBS + 1
+            })
+        );
+        assert_eq!(check_declared(&[spec("a".repeat(MAX_PATH_BYTES))]), Ok(()));
+        assert_eq!(
+            check_declared(&[spec("a".into()), spec("a".repeat(MAX_PATH_BYTES + 1))]),
+            Err(Limit::PathTooLong {
+                index: 1,
+                bytes: MAX_PATH_BYTES + 1
+            })
+        );
+    }
+
+    #[test]
     fn limit_messages_name_sizes_only() {
         for l in [
             Limit::TooManyFiles { count: 300 },
             Limit::FileTooLarge { index: 2, bytes: 9 },
             Limit::PathTooLong { index: 3, bytes: 9 },
             Limit::TooManyBytes { bytes: 77 },
+            Limit::TooManyGlobs { count: 65 },
         ] {
             assert!(!l.to_string().is_empty());
         }
+        assert!(Limit::TooManyGlobs { count: 65 }.to_string().contains("65"));
         assert!(Limit::FileTooLarge { index: 2, bytes: 9 }
             .to_string()
             .contains("#2"));
@@ -328,7 +381,7 @@ mod tests {
     fn the_wire_digest_keeps_the_hmac_and_refuses_other_forms() {
         let hex = "ab".repeat(32);
         let d = to_wire_digest(&format!("hmac-sha256:{hex}")).unwrap();
-        assert_eq!(d.as_str(), format!("sha256:{hex}"));
+        assert_eq!(d.as_str(), format!("hmac-sha256:{hex}"));
         assert!(to_wire_digest(&format!("sha256:{hex}")).is_none());
         assert!(to_wire_digest("hmac-sha256:zz").is_none());
         assert!(to_wire_digest("").is_none());
@@ -422,8 +475,11 @@ mod tests {
 
     #[test]
     fn the_listing_digest_ignores_order_and_separates_fields() {
-        let a = ("a".to_string(), "h1".to_string());
-        let b = ("b".to_string(), "h2".to_string());
+        let h = |c: char| {
+            HmacDigest::parse(&format!("hmac-sha256:{}", c.to_string().repeat(64))).unwrap()
+        };
+        let a = ("a".to_string(), h('1'));
+        let b = ("b".to_string(), h('2'));
         assert_eq!(
             listing_digest(&[a.clone(), b.clone()]),
             listing_digest(&[b.clone(), a.clone()])
@@ -432,9 +488,14 @@ mod tests {
             listing_digest(std::slice::from_ref(&a)),
             listing_digest(std::slice::from_ref(&b))
         );
+        // same HMAC under another path, same path under another HMAC
         assert_ne!(
-            listing_digest(&[("ab".into(), "c".into())]),
-            listing_digest(&[("a".into(), "bc".into())])
+            listing_digest(&[("ab".into(), h('1'))]),
+            listing_digest(&[("a".into(), h('1'))])
+        );
+        assert_ne!(
+            listing_digest(&[("a".into(), h('1'))]),
+            listing_digest(&[("a".into(), h('2'))])
         );
         assert_ne!(listing_digest(&[]), listing_digest(&[a]));
     }

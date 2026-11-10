@@ -1,34 +1,49 @@
 //! Secret files on the worker (spec 22.3, "workerでの配置" and "消去").
 //!
 //! Placement checks everything before it writes anything: the limits, every
-//! path, and every file's HMAC under the cluster key. Files are then written
-//! into the attempt workspace as 0600, walking the path one component at a
-//! time and refusing a symlink (or anything that is not a directory) on the
-//! way; the file itself is created with `create_new`, which never follows a
-//! link. Nothing is written outside the workspace, and nothing is kept
-//! anywhere else: not in the object store, a cache, a template, a log or an
-//! artifact.
+//! path, that each file is one the attempt's source manifest names (path and
+//! HMAC), and every file's HMAC under the cluster key. Files are then written
+//! into the attempt workspace as 0600. The path is walked one component at a
+//! time with `openat(O_NOFOLLOW | O_DIRECTORY)` from a descriptor of the
+//! workspace, so a link swapped in while the walk runs is refused, not
+//! followed; directories this makes are 0700; the file itself is created with
+//! `O_CREAT | O_EXCL | O_NOFOLLOW`. Nothing is written outside the workspace,
+//! and nothing is kept anywhere else: not in the object store, a cache, a
+//! template, a log or an artifact.
 //!
 //! Which files were placed is recorded first, in `<state>/secret-index/
 //! <attempt>.json` (0600; paths only, never a content), so that the erase
 //! after the attempt and the reconcile at worker start know what to remove
 //! even after a crash in between. Erasing runs after the attempt's own
 //! commands have run in that workspace, so it does not trust the tree: it
-//! removes the file itself (a symlink standing in for it is removed, never its
-//! target) and gives up on a path whose parent is no longer a plain directory.
+//! walks the same way, removes the file itself (a symlink standing in for it
+//! is removed, never its target) and gives up on a path whose parent is no
+//! longer a plain directory. Such a path, or an index that cannot be read,
+//! means the secret file cannot be proven gone: the erase fails, the record
+//! stays, and the whole workspace must be deleted
+//! ([`SecretError::WorkspaceRequired`]; [`ReconcileReport::workspace_required`]).
+//!
+//! Before an attempt's commands run, the agent (S10) calls
+//! [`WorkerSecrets::ensure_placed`]: the files in place must be exactly the
+//! ones the source manifest names. A bundle of another run is refused at
+//! [`WorkerSecrets::place`] already, since its files are not in this
+//! attempt's manifest.
 
 use super::key::ClusterKey;
 use super::plan::{check_limits, check_paths, ct_eq, to_wire_digest, Limit, MAX_FILES};
-use super::vault::{read_private, write_private};
+use super::vault::{read_private, sweep_stale_tmp, write_private, STALE_TMP_AGE};
 use super::{Result, SecretError};
 use crate::ids::AttemptId;
 use crate::wire::SecretFile;
-use local_ci::source::{secret_digest, RelPath};
+use local_ci::source::{secret_digest, RelPath, SecretEntry};
+use rustix::fs::{AtFlags, FileType, Mode, OFlags, CWD};
+use rustix::io::Errno;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
-use std::fs::{self, OpenOptions};
-use std::io::{ErrorKind, Write};
-use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
+use std::fs::{self, File};
+use std::io::{ErrorKind, Read, Write};
+use std::os::fd::{AsFd, OwnedFd};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt};
 use std::path::{Path, PathBuf};
 
 #[derive(Serialize, Deserialize)]
@@ -38,15 +53,13 @@ struct Record {
     paths: Vec<String>,
 }
 
-/// What an erase did.
+/// What an erase did. An erase that could not prove a file gone is an error,
+/// not a report.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct EraseReport {
     pub removed: Vec<String>,
     /// Already absent.
     pub gone: Vec<String>,
-    /// A parent is no longer a plain directory (or the path is a directory):
-    /// nothing was touched there.
-    pub unreachable: Vec<String>,
 }
 
 /// What a reconcile pass did.
@@ -54,8 +67,15 @@ pub struct EraseReport {
 pub struct ReconcileReport {
     pub erased: Vec<AttemptId>,
     pub kept: Vec<AttemptId>,
+    /// Attempts whose secret files cannot be proven gone one by one (the index
+    /// is unreadable, or a path is no longer reachable): the caller deletes
+    /// the whole workspace, then calls [`WorkerSecrets::forget`]. The records
+    /// stay until then.
+    pub workspace_required: Vec<AttemptId>,
     /// Records that could not be handled: the file name and why (no values).
     pub failed: Vec<(String, String)>,
+    /// Stale temporary files removed from the index directory.
+    pub stale_tmp_removed: usize,
 }
 
 pub struct WorkerSecrets {
@@ -70,6 +90,55 @@ enum Step {
     Removed,
     Gone,
     Unreachable,
+}
+
+const DIR_FLAGS: OFlags = OFlags::RDONLY
+    .union(OFlags::DIRECTORY)
+    .union(OFlags::NOFOLLOW)
+    .union(OFlags::CLOEXEC);
+
+fn errno_io(e: Errno) -> std::io::Error {
+    e.into()
+}
+
+/// Not a directory, or a link standing where one should be.
+fn is_not_dir(e: Errno) -> bool {
+    e == Errno::LOOP || e == Errno::NOTDIR
+}
+
+enum Walk {
+    Dir(OwnedFd),
+    Gone,
+    Unreachable,
+}
+
+/// The descriptor of the directory holding `rel`'s last component, walked
+/// from `root` without following a link. Nothing is created.
+fn walk_existing(root: &Path, parents: &[&str], rel: &str) -> Result<Walk> {
+    let mut dir = match rustix::fs::openat(CWD, root, DIR_FLAGS, Mode::empty()) {
+        Ok(fd) => fd,
+        Err(Errno::NOENT) => return Ok(Walk::Gone),
+        Err(e) if is_not_dir(e) => return Ok(Walk::Unreachable),
+        Err(e) => return Err(SecretError::io(format!("workspace for {rel}"), errno_io(e))),
+    };
+    for c in parents {
+        dir = match rustix::fs::openat(dir.as_fd(), *c, DIR_FLAGS, Mode::empty()) {
+            Ok(fd) => fd,
+            Err(Errno::NOENT) => return Ok(Walk::Gone),
+            Err(e) if is_not_dir(e) => return Ok(Walk::Unreachable),
+            Err(e) => return Err(SecretError::io(format!("directory of {rel}"), errno_io(e))),
+        };
+    }
+    Ok(Walk::Dir(dir))
+}
+
+fn split_rel(rel: &str) -> Result<(&str, Vec<&str>)> {
+    let mut comps: Vec<&str> = rel.split('/').collect();
+    let last = comps
+        .pop()
+        .filter(|l| !l.is_empty())
+        .ok_or_else(|| placement("empty secret file path"))?;
+    Ok((last, comps))
 }
 
 impl WorkerSecrets {
@@ -113,15 +182,28 @@ impl WorkerSecrets {
         write_private(&self.record_path(attempt), &bytes)
     }
 
+    fn remove_record(&self, attempt: &AttemptId) -> Result<()> {
+        match fs::remove_file(self.record_path(attempt)) {
+            Err(e) if e.kind() != ErrorKind::NotFound => {
+                Err(SecretError::io("secret index".to_string(), e))
+            }
+            _ => Ok(()),
+        }
+    }
+
     /// Place `files` (one request's worth; more may follow for the same
-    /// attempt) in `workspace`. Returns how many are in place. A failure
-    /// leaves none of this call's new files behind.
+    /// attempt) in `workspace`. `expected` is `secret_files` of the attempt's
+    /// source manifest: a file that is not in it, or whose HMAC differs from
+    /// the manifest's, is refused (a bundle of another run, or of another
+    /// capture). Returns how many are in place. A failure leaves none of this
+    /// call's new files behind.
     pub fn place(
         &self,
         key: &ClusterKey,
         attempt: &AttemptId,
         workspace: &Path,
         files: &[SecretFile],
+        expected: &[SecretEntry],
     ) -> Result<u32> {
         // 1. everything is checked before anything is written
         let sizes: Vec<(usize, usize)> = files
@@ -131,11 +213,19 @@ impl WorkerSecrets {
         check_limits(&sizes).map_err(SecretError::Limit)?;
         check_paths(files.iter().map(|f| f.path.as_str())).map_err(SecretError::BadPath)?;
         for f in files {
-            let want = secret_digest(
-                key.as_bytes(),
-                &RelPath(f.path.clone().into_bytes()),
-                &f.content.0,
-            );
+            let rel = RelPath(f.path.clone().into_bytes());
+            let entry = expected.iter().find(|e| e.path == rel).ok_or_else(|| {
+                placement(format!(
+                    "{} is not a secret file of this attempt's source",
+                    f.path
+                ))
+            })?;
+            if !ct_eq(entry.hmac.as_bytes(), f.hmac_digest.as_str().as_bytes()) {
+                return Err(SecretError::Tampered {
+                    path: f.path.clone(),
+                });
+            }
+            let want = secret_digest(key.as_bytes(), &rel, &f.content.0);
             let want = to_wire_digest(&want)
                 .ok_or_else(|| SecretError::Format("unexpected digest form".into()))?;
             if !ct_eq(want.as_str().as_bytes(), f.hmac_digest.as_str().as_bytes()) {
@@ -192,19 +282,74 @@ impl WorkerSecrets {
         Ok(files.len() as u32)
     }
 
+    /// Before the attempt's commands run: the files in place are exactly the
+    /// ones `expected` (`secret_files` of the attempt's source manifest)
+    /// names, each a regular 0600 file. A manifest with no secret file needs
+    /// none placed. The agent (S10) calls this once every
+    /// `secret_bundle_put` has been answered and before it starts the
+    /// attempt; a missing, extra or replaced file stops the attempt.
+    pub fn ensure_placed(&self, attempt: &AttemptId, expected: &[SecretEntry]) -> Result<()> {
+        let want: BTreeSet<&[u8]> = expected.iter().map(|e| e.path.0.as_slice()).collect();
+        let rec = self.load_record(attempt)?;
+        let have: BTreeSet<&[u8]> = rec
+            .iter()
+            .flat_map(|r| r.paths.iter().map(|p| p.as_bytes()))
+            .collect();
+        if want != have {
+            return Err(SecretError::PathSetMismatch);
+        }
+        let Some(rec) = rec else {
+            return Ok(());
+        };
+        let root = PathBuf::from(&rec.workspace);
+        for p in &rec.paths {
+            let (last, parents) = split_rel(p)?;
+            let Walk::Dir(dir) = walk_existing(&root, &parents, p)? else {
+                return Err(placement(format!("{p} is not in the workspace")));
+            };
+            let st =
+                rustix::fs::statat(dir.as_fd(), last, AtFlags::SYMLINK_NOFOLLOW).map_err(|e| {
+                    if e == Errno::NOENT {
+                        placement(format!("{p} is not in the workspace"))
+                    } else {
+                        SecretError::io(format!("secret file {p}"), errno_io(e))
+                    }
+                })?;
+            let regular =
+                FileType::from_raw_mode(st.st_mode as rustix::fs::RawMode) == FileType::RegularFile;
+            if !regular || u32::from(st.st_mode) & 0o777 != 0o600 {
+                return Err(placement(format!(
+                    "{p} is not a regular file with mode 0600"
+                )));
+            }
+        }
+        Ok(())
+    }
+
     /// Remove the files placed for `attempt` and forget them. Idempotent.
+    /// When a path cannot be reached (a parent became a link or a file) or the
+    /// index cannot be read, nothing is claimed: the record stays and the
+    /// error is [`SecretError::WorkspaceRequired`].
     pub fn erase(&self, attempt: &AttemptId) -> Result<EraseReport> {
         let mut report = EraseReport::default();
-        let Some(rec) = self.load_record(attempt)? else {
-            return Ok(report);
+        let rec = match self.load_record(attempt) {
+            Ok(Some(rec)) => rec,
+            Ok(None) => return Ok(report),
+            Err(SecretError::Format(_) | SecretError::Insecure { .. }) => {
+                return Err(SecretError::WorkspaceRequired {
+                    attempt: attempt.to_string(),
+                })
+            }
+            Err(e) => return Err(e),
         };
         let root = PathBuf::from(&rec.workspace);
         let mut first_error: Option<SecretError> = None;
+        let mut unreachable = false;
         for p in &rec.paths {
             match erase_one(&root, p) {
                 Ok(Step::Removed) => report.removed.push(p.clone()),
                 Ok(Step::Gone) => report.gone.push(p.clone()),
-                Ok(Step::Unreachable) => report.unreachable.push(p.clone()),
+                Ok(Step::Unreachable) => unreachable = true,
                 Err(e) => {
                     first_error.get_or_insert(e);
                 }
@@ -214,19 +359,30 @@ impl WorkerSecrets {
             // the record stays, so a later pass tries again
             return Err(e);
         }
-        match fs::remove_file(self.record_path(attempt)) {
-            Err(e) if e.kind() != ErrorKind::NotFound => {
-                Err(SecretError::io("secret index".to_string(), e))
-            }
-            _ => Ok(report),
+        if unreachable {
+            return Err(SecretError::WorkspaceRequired {
+                attempt: attempt.to_string(),
+            });
         }
+        self.remove_record(attempt)?;
+        Ok(report)
+    }
+
+    /// Drop the record of `attempt` once its whole workspace was deleted (the
+    /// way out of [`SecretError::WorkspaceRequired`]). Idempotent.
+    pub fn forget(&self, attempt: &AttemptId) -> Result<()> {
+        self.remove_record(attempt)
     }
 
     /// At worker start: erase the secret files of every attempt `should_erase`
     /// says is terminal (or unknown). Attempts that are still to run keep
-    /// theirs. A pass never stops at the first failure.
+    /// theirs. A pass never stops at the first failure. Stale temporary files
+    /// of the index directory are removed as well.
     pub fn reconcile(&self, should_erase: impl Fn(&AttemptId) -> bool) -> Result<ReconcileReport> {
-        let mut report = ReconcileReport::default();
+        let mut report = ReconcileReport {
+            stale_tmp_removed: sweep_stale_tmp(&self.index_dir, STALE_TMP_AGE)?,
+            ..ReconcileReport::default()
+        };
         let rd = fs::read_dir(&self.index_dir)
             .map_err(|e| SecretError::io(format!("directory {}", self.index_dir.display()), e))?;
         let mut names: Vec<String> = Vec::new();
@@ -253,6 +409,9 @@ impl WorkerSecrets {
             }
             match self.erase(&attempt) {
                 Ok(_) => report.erased.push(attempt),
+                Err(SecretError::WorkspaceRequired { .. }) => {
+                    report.workspace_required.push(attempt)
+                }
                 Err(e) => report.failed.push((name.clone(), e.to_string())),
             }
         }
@@ -260,45 +419,48 @@ impl WorkerSecrets {
     }
 }
 
-/// The directories above the last component of `rel`, created when missing,
-/// each checked not to be a link; then the file.
+/// The directories above the last component of `rel`, created (0700) when
+/// missing, each opened without following a link; then the file.
 fn place_one(root: &Path, rel: &str, content: &[u8], ours_already: bool) -> Result<bool> {
-    let comps: Vec<&str> = rel.split('/').collect();
-    let (last, parents) = comps
-        .split_last()
-        .ok_or_else(|| placement("empty secret file path"))?;
-    let mut cur = root.to_path_buf();
+    let (last, parents) = split_rel(rel)?;
+    let not_dir = || {
+        placement(format!(
+            "{rel}: a parent directory is a link or not a directory"
+        ))
+    };
+    let dir_io = |e: Errno| SecretError::io(format!("directory for {rel}"), errno_io(e));
+    let mut dir = match rustix::fs::openat(CWD, root, DIR_FLAGS, Mode::empty()) {
+        Ok(fd) => fd,
+        Err(e) if is_not_dir(e) => return Err(placement("the workspace is not a plain directory")),
+        Err(e) => return Err(dir_io(e)),
+    };
     for c in parents {
-        cur.push(c);
-        match fs::symlink_metadata(&cur) {
-            Ok(m) if m.file_type().is_dir() => {}
-            Ok(_) => {
-                return Err(placement(format!(
-                    "{rel}: a parent directory is a link or not a directory"
-                )))
-            }
-            Err(e) if e.kind() == ErrorKind::NotFound => {
-                fs::create_dir(&cur)
-                    .map_err(|e| SecretError::io(format!("directory for {rel}"), e))?;
-                let m = fs::symlink_metadata(&cur)
-                    .map_err(|e| SecretError::io(format!("directory for {rel}"), e))?;
-                if !m.file_type().is_dir() {
-                    return Err(placement(format!(
-                        "{rel}: a parent directory was replaced while it was made"
-                    )));
+        dir = match rustix::fs::openat(dir.as_fd(), c, DIR_FLAGS, Mode::empty()) {
+            Ok(fd) => fd,
+            Err(Errno::NOENT) => {
+                match rustix::fs::mkdirat(dir.as_fd(), c, Mode::RWXU) {
+                    Ok(()) | Err(Errno::EXIST) => {}
+                    Err(e) => return Err(dir_io(e)),
+                }
+                // whatever stands there now, if it is not a directory it is refused
+                match rustix::fs::openat(dir.as_fd(), c, DIR_FLAGS, Mode::empty()) {
+                    Ok(fd) => fd,
+                    Err(e) if is_not_dir(e) => return Err(not_dir()),
+                    Err(e) => return Err(dir_io(e)),
                 }
             }
-            Err(e) => return Err(SecretError::io(format!("directory for {rel}"), e)),
-        }
+            Err(e) if is_not_dir(e) => return Err(not_dir()),
+            Err(e) => return Err(dir_io(e)),
+        };
     }
-    let target = cur.join(last);
-    match OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(&target)
-    {
-        Ok(mut f) => {
+    let create = OFlags::WRONLY
+        .union(OFlags::CREATE)
+        .union(OFlags::EXCL)
+        .union(OFlags::NOFOLLOW)
+        .union(OFlags::CLOEXEC);
+    match rustix::fs::openat(dir.as_fd(), last, create, Mode::RUSR | Mode::WUSR) {
+        Ok(fd) => {
+            let mut f = File::from(fd);
             let r = f
                 .write_all(content)
                 .and_then(|()| {
@@ -306,25 +468,36 @@ fn place_one(root: &Path, rel: &str, content: &[u8], ours_already: bool) -> Resu
                 })
                 .and_then(|()| f.sync_all());
             drop(f);
-            let inside = fs::canonicalize(&cur).is_ok_and(|p| p.starts_with(root));
             if let Err(e) = r {
-                let _ = fs::remove_file(&target);
+                let _ = rustix::fs::unlinkat(dir.as_fd(), last, AtFlags::empty());
                 return Err(SecretError::io(format!("secret file {rel}"), e));
-            }
-            if !inside {
-                let _ = fs::remove_file(&target);
-                return Err(placement(format!("{rel}: the parent left the workspace")));
             }
             Ok(true)
         }
-        Err(e) if e.kind() == ErrorKind::AlreadyExists => {
+        Err(Errno::EXIST) => {
             // a re-sent request after a restart: the same file, by us, is fine
-            let meta = fs::symlink_metadata(&target)
+            let read = OFlags::RDONLY
+                .union(OFlags::NOFOLLOW)
+                .union(OFlags::NONBLOCK)
+                .union(OFlags::CLOEXEC);
+            let fd = rustix::fs::openat(dir.as_fd(), last, read, Mode::empty()).map_err(|e| {
+                if is_not_dir(e) {
+                    placement(format!(
+                        "{rel} already exists in the workspace; it is not overwritten"
+                    ))
+                } else {
+                    SecretError::io(format!("secret file {rel}"), errno_io(e))
+                }
+            })?;
+            let mut f = File::from(fd);
+            let meta = f
+                .metadata()
                 .map_err(|e| SecretError::io(format!("secret file {rel}"), e))?;
-            let same = ours_already
-                && meta.file_type().is_file()
-                && meta.mode() & 0o777 == 0o600
-                && fs::read(&target).is_ok_and(|b| b == content);
+            let mut same = false;
+            if ours_already && meta.file_type().is_file() && meta.mode() & 0o777 == 0o600 {
+                let mut have = Vec::new();
+                same = f.read_to_end(&mut have).is_ok() && have == content;
+            }
             if same {
                 Ok(false)
             } else {
@@ -333,42 +506,36 @@ fn place_one(root: &Path, rel: &str, content: &[u8], ours_already: bool) -> Resu
                 )))
             }
         }
-        Err(e) => Err(SecretError::io(format!("secret file {rel}"), e)),
+        Err(e) if is_not_dir(e) => Err(placement(format!(
+            "{rel} cannot be created in the workspace"
+        ))),
+        Err(e) => Err(SecretError::io(format!("secret file {rel}"), errno_io(e))),
     }
 }
 
 /// Remove `rel` under `root` without following a link on the way.
 fn erase_one(root: &Path, rel: &str) -> Result<Step> {
-    match fs::symlink_metadata(root) {
-        Ok(m) if m.file_type().is_dir() => {}
-        Ok(_) => return Ok(Step::Unreachable),
-        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(Step::Gone),
-        Err(e) => return Err(SecretError::io(format!("workspace for {rel}"), e)),
-    }
-    let comps: Vec<&str> = rel.split('/').collect();
-    let (last, parents) = comps
-        .split_last()
-        .ok_or_else(|| placement("empty secret file path"))?;
-    let mut cur = root.to_path_buf();
-    for c in parents {
-        cur.push(c);
-        match fs::symlink_metadata(&cur) {
-            Ok(m) if m.file_type().is_dir() => {}
-            Ok(_) => return Ok(Step::Unreachable),
-            Err(e) if e.kind() == ErrorKind::NotFound => return Ok(Step::Gone),
-            Err(e) => return Err(SecretError::io(format!("directory of {rel}"), e)),
+    let (last, parents) = split_rel(rel)?;
+    let dir = match walk_existing(root, &parents, rel)? {
+        Walk::Dir(fd) => fd,
+        Walk::Gone => return Ok(Step::Gone),
+        Walk::Unreachable => return Ok(Step::Unreachable),
+    };
+    let io = |e: Errno| SecretError::io(format!("secret file {rel}"), errno_io(e));
+    match rustix::fs::statat(dir.as_fd(), last, AtFlags::SYMLINK_NOFOLLOW) {
+        Err(Errno::NOENT) => Ok(Step::Gone),
+        Err(e) => Err(io(e)),
+        Ok(st)
+            if FileType::from_raw_mode(st.st_mode as rustix::fs::RawMode)
+                == FileType::Directory =>
+        {
+            Ok(Step::Unreachable)
         }
-    }
-    let target = cur.join(last);
-    match fs::symlink_metadata(&target) {
-        Ok(m) if m.file_type().is_dir() => Ok(Step::Unreachable),
-        Ok(_) => match fs::remove_file(&target) {
+        Ok(_) => match rustix::fs::unlinkat(dir.as_fd(), last, AtFlags::empty()) {
             Ok(()) => Ok(Step::Removed),
-            Err(e) if e.kind() == ErrorKind::NotFound => Ok(Step::Gone),
-            Err(e) => Err(SecretError::io(format!("secret file {rel}"), e)),
+            Err(Errno::NOENT) => Ok(Step::Gone),
+            Err(e) => Err(io(e)),
         },
-        Err(e) if e.kind() == ErrorKind::NotFound => Ok(Step::Gone),
-        Err(e) => Err(SecretError::io(format!("secret file {rel}"), e)),
     }
 }
 
@@ -377,6 +544,37 @@ mod tests {
     use super::*;
     use crate::wire::Bytes;
     use std::os::unix::fs::{symlink, PermissionsExt};
+
+    /// `place` with the manifest built from the files themselves.
+    trait Put {
+        fn put(
+            &self,
+            key: &ClusterKey,
+            a: &AttemptId,
+            ws: &Path,
+            files: &[SecretFile],
+        ) -> Result<u32>;
+    }
+    fn entries(files: &[SecretFile]) -> Vec<SecretEntry> {
+        files
+            .iter()
+            .map(|f| SecretEntry {
+                path: RelPath(f.path.clone().into_bytes()),
+                hmac: f.hmac_digest.to_string(),
+            })
+            .collect()
+    }
+    impl Put for WorkerSecrets {
+        fn put(
+            &self,
+            key: &ClusterKey,
+            a: &AttemptId,
+            ws: &Path,
+            files: &[SecretFile],
+        ) -> Result<u32> {
+            self.place(key, a, ws, files, &entries(files))
+        }
+    }
 
     struct Env {
         _tmp: tempfile::TempDir,
@@ -431,13 +629,16 @@ mod tests {
             file(&e.key, ".env", "TOKEN=abc-123456\n"),
             file(&e.key, "pkg/a/.env.test", "X=yyyy-9999\n"),
         ];
-        assert_eq!(e.ws_secrets.place(&e.key, &a, &e.ws, &files).unwrap(), 2);
+        assert_eq!(e.ws_secrets.put(&e.key, &a, &e.ws, &files).unwrap(), 2);
         assert_eq!(
             fs::read_to_string(e.ws.join(".env")).unwrap(),
             "TOKEN=abc-123456\n"
         );
         assert_eq!(mode(&e.ws.join(".env")), 0o600);
         assert_eq!(mode(&e.ws.join("pkg/a/.env.test")), 0o600);
+        // the directories placement made are private too
+        assert_eq!(mode(&e.ws.join("pkg")), 0o700);
+        assert_eq!(mode(&e.ws.join("pkg/a")), 0o700);
         // the index lists paths, holds no content, and is private
         let idx = e.state.join("secret-index").join(format!("{a}.json"));
         assert_eq!(mode(&idx), 0o600);
@@ -454,7 +655,7 @@ mod tests {
         let mut bad = file(&e.key, "b.env", "B=bbbb-2222");
         bad.content = Bytes(b"B=changed-22".to_vec());
         let files = [file(&e.key, "a.env", "A=aaaa-1111"), bad];
-        let err = e.ws_secrets.place(&e.key, &a, &e.ws, &files).unwrap_err();
+        let err = e.ws_secrets.put(&e.key, &a, &e.ws, &files).unwrap_err();
         assert!(matches!(err, SecretError::Tampered { ref path } if path == "b.env"));
         assert!(!err.to_string().contains("changed"));
         assert_eq!(fs::read_dir(&e.ws).unwrap().count(), 0);
@@ -466,14 +667,14 @@ mod tests {
         let other = ClusterKey::from_bytes(vec![9; 32]).unwrap();
         let good = [file(&e.key, "a.env", "A=aaaa-1111")];
         assert!(matches!(
-            e.ws_secrets.place(&other, &a, &e.ws, &good),
+            e.ws_secrets.put(&other, &a, &e.ws, &good),
             Err(SecretError::Tampered { .. })
         ));
         // a path is part of the digest: the same content under another path
         let mut moved = file(&e.key, "a.env", "A=aaaa-1111");
         moved.path = "c.env".into();
         assert!(matches!(
-            e.ws_secrets.place(&e.key, &a, &e.ws, &[moved]),
+            e.ws_secrets.put(&e.key, &a, &e.ws, &[moved]),
             Err(SecretError::Tampered { .. })
         ));
     }
@@ -492,7 +693,7 @@ mod tests {
             let f = file(&e.key, bad, "V=vvvv-0000");
             assert!(
                 matches!(
-                    e.ws_secrets.place(&e.key, &a, &e.ws, &[f]),
+                    e.ws_secrets.put(&e.key, &a, &e.ws, &[f]),
                     Err(SecretError::BadPath(_))
                 ),
                 "{bad}"
@@ -503,7 +704,7 @@ mod tests {
             file(&e.key, "d.env", "V=1111-1111"),
         ];
         assert!(matches!(
-            e.ws_secrets.place(&e.key, &a, &e.ws, &dup),
+            e.ws_secrets.put(&e.key, &a, &e.ws, &dup),
             Err(SecretError::BadPath(_))
         ));
         let big = file(
@@ -512,7 +713,7 @@ mod tests {
             &"x".repeat(super::super::plan::MAX_FILE_BYTES + 1),
         );
         assert!(matches!(
-            e.ws_secrets.place(&e.key, &a, &e.ws, &[big]),
+            e.ws_secrets.put(&e.key, &a, &e.ws, &[big]),
             Err(SecretError::Limit(_))
         ));
         assert_eq!(fs::read_dir(&e.ws).unwrap().count(), 0);
@@ -526,7 +727,7 @@ mod tests {
         symlink(&e.outside, e.ws.join("linked")).unwrap();
         let err = e
             .ws_secrets
-            .place(
+            .put(
                 &e.key,
                 &a,
                 &e.ws,
@@ -539,7 +740,7 @@ mod tests {
         fs::write(e.ws.join("plain"), b"x").unwrap();
         assert!(e
             .ws_secrets
-            .place(
+            .put(
                 &e.key,
                 &a,
                 &e.ws,
@@ -551,7 +752,7 @@ mod tests {
         symlink(&e.outside, e.ws.join("d/deep")).unwrap();
         assert!(e
             .ws_secrets
-            .place(
+            .put(
                 &e.key,
                 &a,
                 &e.ws,
@@ -570,7 +771,7 @@ mod tests {
         symlink(&victim, e.ws.join(".env")).unwrap();
         let err = e
             .ws_secrets
-            .place(&e.key, &a, &e.ws, &[file(&e.key, ".env", "S=ssss-0000")])
+            .put(&e.key, &a, &e.ws, &[file(&e.key, ".env", "S=ssss-0000")])
             .unwrap_err();
         assert!(matches!(err, SecretError::Placement(_)));
         assert_eq!(fs::read(&victim).unwrap(), b"keep");
@@ -578,7 +779,7 @@ mod tests {
         symlink(e.outside.join("nothing"), e.ws.join(".env2")).unwrap();
         assert!(e
             .ws_secrets
-            .place(&e.key, &a, &e.ws, &[file(&e.key, ".env2", "S=ssss-0000")])
+            .put(&e.key, &a, &e.ws, &[file(&e.key, ".env2", "S=ssss-0000")])
             .is_err());
         assert!(!e.outside.join("nothing").exists());
     }
@@ -591,11 +792,11 @@ mod tests {
         symlink(&e.ws, &link).unwrap();
         let f = [file(&e.key, ".env", "S=ssss-0000")];
         assert!(matches!(
-            e.ws_secrets.place(&e.key, &a, &link, &f),
+            e.ws_secrets.put(&e.key, &a, &link, &f),
             Err(SecretError::Placement(_))
         ));
         assert!(matches!(
-            e.ws_secrets.place(&e.key, &a, &e.state.join("none"), &f),
+            e.ws_secrets.put(&e.key, &a, &e.state.join("none"), &f),
             Err(SecretError::Io { .. })
         ));
         assert!(!e.ws.join(".env").exists());
@@ -610,7 +811,7 @@ mod tests {
             file(&e.key, "a.env", "A=aaaa-1111"),
             file(&e.key, "b.env", "B=bbbb-2222"),
         ];
-        let err = e.ws_secrets.place(&e.key, &a, &e.ws, &files).unwrap_err();
+        let err = e.ws_secrets.put(&e.key, &a, &e.ws, &files).unwrap_err();
         assert!(matches!(err, SecretError::Placement(_)));
         assert_eq!(fs::read(e.ws.join("b.env")).unwrap(), b"mine");
         assert!(!e.ws.join("a.env").exists(), "the first file was undone");
@@ -621,19 +822,19 @@ mod tests {
         let e = env();
         let a = AttemptId::generate();
         let files = [file(&e.key, ".env", "A=aaaa-1111")];
-        assert_eq!(e.ws_secrets.place(&e.key, &a, &e.ws, &files).unwrap(), 1);
-        assert_eq!(e.ws_secrets.place(&e.key, &a, &e.ws, &files).unwrap(), 1);
+        assert_eq!(e.ws_secrets.put(&e.key, &a, &e.ws, &files).unwrap(), 1);
+        assert_eq!(e.ws_secrets.put(&e.key, &a, &e.ws, &files).unwrap(), 1);
         // the file was changed by something else: not silently accepted
         fs::write(e.ws.join(".env"), b"tampered").unwrap();
-        assert!(e.ws_secrets.place(&e.key, &a, &e.ws, &files).is_err());
+        assert!(e.ws_secrets.put(&e.key, &a, &e.ws, &files).is_err());
         // widened permissions: not "ours" any more
         fs::write(e.ws.join(".env"), b"A=aaaa-1111").unwrap();
         fs::set_permissions(e.ws.join(".env"), fs::Permissions::from_mode(0o644)).unwrap();
-        assert!(e.ws_secrets.place(&e.key, &a, &e.ws, &files).is_err());
+        assert!(e.ws_secrets.put(&e.key, &a, &e.ws, &files).is_err());
         // another attempt does not own it
         let b = AttemptId::generate();
         fs::set_permissions(e.ws.join(".env"), fs::Permissions::from_mode(0o600)).unwrap();
-        assert!(e.ws_secrets.place(&e.key, &b, &e.ws, &files).is_err());
+        assert!(e.ws_secrets.put(&e.key, &b, &e.ws, &files).is_err());
     }
 
     #[test]
@@ -641,16 +842,16 @@ mod tests {
         let e = env();
         let a = AttemptId::generate();
         e.ws_secrets
-            .place(&e.key, &a, &e.ws, &[file(&e.key, "1.env", "A=aaaa-1111")])
+            .put(&e.key, &a, &e.ws, &[file(&e.key, "1.env", "A=aaaa-1111")])
             .unwrap();
         e.ws_secrets
-            .place(&e.key, &a, &e.ws, &[file(&e.key, "2.env", "B=bbbb-2222")])
+            .put(&e.key, &a, &e.ws, &[file(&e.key, "2.env", "B=bbbb-2222")])
             .unwrap();
         let other = e.state.join("ws2");
         fs::create_dir(&other).unwrap();
         assert!(matches!(
             e.ws_secrets
-                .place(&e.key, &a, &other, &[file(&e.key, "3.env", "C=cccc-3333")]),
+                .put(&e.key, &a, &other, &[file(&e.key, "3.env", "C=cccc-3333")]),
             Err(SecretError::Placement(_))
         ));
         let r = e.ws_secrets.erase(&a).unwrap();
@@ -663,7 +864,7 @@ mod tests {
         let e = env();
         let a = AttemptId::generate();
         e.ws_secrets
-            .place(
+            .put(
                 &e.key,
                 &a,
                 &e.ws,
@@ -675,7 +876,7 @@ mod tests {
             .unwrap();
         let r = e.ws_secrets.erase(&a).unwrap();
         assert_eq!(r.removed.len(), 2);
-        assert!(r.gone.is_empty() && r.unreachable.is_empty());
+        assert!(r.gone.is_empty());
         assert!(!e.ws.join(".env").exists() && !e.ws.join("x/.env").exists());
         assert!(!e
             .state
@@ -690,7 +891,7 @@ mod tests {
         let e = env();
         let a = AttemptId::generate();
         e.ws_secrets
-            .place(
+            .put(
                 &e.key,
                 &a,
                 &e.ws,
@@ -712,13 +913,30 @@ mod tests {
         fs::write(&precious2, b"precious2").unwrap();
         symlink(&precious2, e.ws.join(".env")).unwrap();
         fs::remove_file(e.ws.join("gone.env")).unwrap();
-        let r = e.ws_secrets.erase(&a).unwrap();
-        assert_eq!(r.unreachable, ["d/.env"]);
-        assert_eq!(r.removed, [".env"]);
-        assert_eq!(r.gone, ["gone.env"]);
+        // d/.env cannot be reached: nothing is claimed, the record stays, the
+        // workspace has to go; what could be removed was removed
+        let err = e.ws_secrets.erase(&a).unwrap_err();
+        assert!(
+            matches!(err, SecretError::WorkspaceRequired { .. }),
+            "{err}"
+        );
+        assert!(e
+            .state
+            .join("secret-index")
+            .join(format!("{a}.json"))
+            .exists());
         assert_eq!(fs::read(&victim).unwrap(), b"precious");
         assert_eq!(fs::read(&precious2).unwrap(), b"precious2");
         assert!(fs::symlink_metadata(e.ws.join(".env")).is_err());
+        // after the workspace is deleted as a whole, the record is dropped
+        e.ws_secrets.forget(&a).unwrap();
+        assert!(!e
+            .state
+            .join("secret-index")
+            .join(format!("{a}.json"))
+            .exists());
+        e.ws_secrets.forget(&a).unwrap();
+        assert_eq!(e.ws_secrets.erase(&a).unwrap(), EraseReport::default());
     }
 
     #[test]
@@ -726,7 +944,7 @@ mod tests {
         let e = env();
         let a = AttemptId::generate();
         e.ws_secrets
-            .place(&e.key, &a, &e.ws, &[file(&e.key, ".env", "A=aaaa-1111")])
+            .put(&e.key, &a, &e.ws, &[file(&e.key, ".env", "A=aaaa-1111")])
             .unwrap();
         fs::remove_dir_all(&e.ws).unwrap();
         assert_eq!(e.ws_secrets.erase(&a).unwrap().gone, [".env"]);
@@ -734,23 +952,29 @@ mod tests {
         let b = AttemptId::generate();
         fs::create_dir(&e.ws).unwrap();
         e.ws_secrets
-            .place(&e.key, &b, &e.ws, &[file(&e.key, ".env", "A=aaaa-1111")])
+            .put(&e.key, &b, &e.ws, &[file(&e.key, ".env", "A=aaaa-1111")])
             .unwrap();
         let moved = e.state.join("moved");
         fs::rename(&e.ws, &moved).unwrap();
         symlink(&moved, &e.ws).unwrap();
-        assert_eq!(e.ws_secrets.erase(&b).unwrap().unreachable, [".env"]);
+        assert!(matches!(
+            e.ws_secrets.erase(&b),
+            Err(SecretError::WorkspaceRequired { .. })
+        ));
         assert!(moved.join(".env").exists(), "the link was not followed");
         // a directory where the file was
         let c = AttemptId::generate();
         let ws3 = e.state.join("ws3");
         fs::create_dir(&ws3).unwrap();
         e.ws_secrets
-            .place(&e.key, &c, &ws3, &[file(&e.key, ".env", "A=aaaa-1111")])
+            .put(&e.key, &c, &ws3, &[file(&e.key, ".env", "A=aaaa-1111")])
             .unwrap();
         fs::remove_file(ws3.join(".env")).unwrap();
         fs::create_dir(ws3.join(".env")).unwrap();
-        assert_eq!(e.ws_secrets.erase(&c).unwrap().unreachable, [".env"]);
+        assert!(matches!(
+            e.ws_secrets.erase(&c),
+            Err(SecretError::WorkspaceRequired { .. })
+        ));
     }
 
     #[test]
@@ -765,7 +989,7 @@ mod tests {
             let ws = e.state.join(format!("ws{i}"));
             fs::create_dir(&ws).unwrap();
             e.ws_secrets
-                .place(&e.key, a, &ws, &[file(&e.key, ".env", "A=aaaa-1111")])
+                .put(&e.key, a, &ws, &[file(&e.key, ".env", "A=aaaa-1111")])
                 .unwrap();
         }
         // a file that is not an attempt's record, and one that is not a record
@@ -795,19 +1019,23 @@ mod tests {
         let idx = e.state.join("secret-index").join(format!("{a}.json"));
         fs::write(&idx, b"not json").unwrap();
         fs::set_permissions(&idx, fs::Permissions::from_mode(0o600)).unwrap();
+        // which workspace it named is unknown: the whole workspace has to go
         assert!(matches!(
             e.ws_secrets.erase(&a),
-            Err(SecretError::Format(_))
+            Err(SecretError::WorkspaceRequired { .. })
         ));
         let rep = e.ws_secrets.reconcile(|_| true).unwrap();
-        assert_eq!(rep.failed.len(), 1);
+        assert_eq!(rep.workspace_required, vec![a.clone()]);
+        assert!(rep.failed.is_empty() && rep.erased.is_empty());
         assert!(idx.exists());
-        // an index others can read is refused as well
+        // an index others can read is the same: it cannot be trusted
         fs::set_permissions(&idx, fs::Permissions::from_mode(0o644)).unwrap();
         assert!(matches!(
             e.ws_secrets.erase(&a),
-            Err(SecretError::Insecure { .. })
+            Err(SecretError::WorkspaceRequired { .. })
         ));
+        e.ws_secrets.forget(&a).unwrap();
+        assert!(!idx.exists());
     }
 
     #[test]
@@ -829,10 +1057,10 @@ mod tests {
         let first: Vec<SecretFile> = (0..MAX_FILES)
             .map(|i| file(&e.key, &format!("f{i}"), "V=vvvv-0000"))
             .collect();
-        e.ws_secrets.place(&e.key, &a, &e.ws, &first).unwrap();
+        e.ws_secrets.put(&e.key, &a, &e.ws, &first).unwrap();
         let err = e
             .ws_secrets
-            .place(
+            .put(
                 &e.key,
                 &a,
                 &e.ws,

@@ -18,6 +18,13 @@
 //! 6. *Mask*: values of `KEY=VALUE` lines are replaced in logs ([`envfile`],
 //!    [`mask`]).
 //!
+//! Not yet supported, on purpose (until local-ci can do it, L1c): secret files
+//! for a commit or a plain directory source are refused with `INVALID_INPUT`,
+//! see [`capture`]. The supervisor and the agent (S10) call, at start,
+//! [`capture::sweep_store_copies`], [`vault::Vault::sweep`],
+//! [`place::WorkerSecrets::reconcile`] and [`crate::platform::disable_core_dumps`];
+//! the agent calls [`place::WorkerSecrets::ensure_placed`] before an attempt runs.
+//!
 //! Secret values never appear in an error, a `Debug` output or a log line of
 //! this module. The pure decisions ([`plan`], [`envfile`], [`mask`]) have no
 //! I/O and are held to the coverage and mutation gates.
@@ -45,6 +52,14 @@ pub enum SecretError {
     Limit(Limit),
     #[error("{0}")]
     BadPath(BadPath),
+    /// A file a capture would take is refused before the capture: where it
+    /// came from, the pattern, and why.
+    #[error("secret files from {origin} {pattern:?}: {reason}")]
+    Preflight {
+        origin: &'static str,
+        pattern: String,
+        reason: String,
+    },
     #[error("secret file path {0:?} is not valid UTF-8")]
     NonUtf8Path(String),
     /// A file's HMAC does not match: it was changed, or another key made it.
@@ -57,8 +72,15 @@ pub enum SecretError {
     Unavailable { what: String },
     #[error("{what}: {path} must be a regular file readable by its owner only", path = path.display())]
     Insecure { what: &'static str, path: PathBuf },
+    /// The cluster key file does not exist (it is never made by loading).
+    #[error("{0}")]
+    KeyMissing(String),
     #[error("{0}")]
     Placement(String),
+    /// The secret files of an attempt cannot be proven gone one by one: its
+    /// whole workspace has to be deleted (and the record then forgotten).
+    #[error("the secret files of attempt {attempt} cannot be erased one by one; delete its whole workspace")]
+    WorkspaceRequired { attempt: String },
     #[error("{what}: {source}")]
     Io {
         what: String,
@@ -86,12 +108,15 @@ impl SecretError {
             SecretError::Limit(_)
             | SecretError::BadPath(_)
             | SecretError::NonUtf8Path(_)
+            | SecretError::Preflight { .. }
             | SecretError::PathSetMismatch => {
                 ApiError::new(ErrorCode::InvalidInput, self.to_string())
             }
             SecretError::Tampered { .. }
             | SecretError::Insecure { .. }
             | SecretError::Placement(_)
+            | SecretError::WorkspaceRequired { .. }
+            | SecretError::KeyMissing(_)
             | SecretError::Io { .. }
             | SecretError::Format(_) => ApiError::new(ErrorCode::Internal, self.to_string()),
         }

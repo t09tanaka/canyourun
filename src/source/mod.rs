@@ -26,7 +26,7 @@ use local_ci::source::{
 };
 use local_ci::ExecContext;
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 pub use manifest::SourceManifest;
 pub use store::{
@@ -141,18 +141,38 @@ pub fn capture(
         }
         SourceRequest::Directory { dir } => capture_directory(&ctx, dir, &opts).map_err(ci_err)?,
     };
-    refuse_uninitialized_submodules(store, &snap.manifest)?;
-    let manifest = SourceManifest::from_ci(&snap.manifest, request.kind()).ok_or_else(|| {
-        ApiError::new(
-            ErrorCode::Internal,
-            format!("unexpected source id {}", snap.manifest.source_id),
-        )
-    })?;
+    // from here on the store holds a plaintext secret bundle: every way out
+    // that does not hand it to the caller removes it
+    let checked = refuse_uninitialized_submodules(store, &snap.manifest).and_then(|()| {
+        SourceManifest::from_ci(&snap.manifest, request.kind()).ok_or_else(|| {
+            ApiError::new(
+                ErrorCode::Internal,
+                format!("unexpected source id {}", snap.manifest.source_id),
+            )
+        })
+    });
+    let manifest = match checked {
+        Ok(m) => m,
+        Err(e) => {
+            remove_secret_copy(snap.secrets.as_deref());
+            return Err(e);
+        }
+    };
     Ok(Captured {
         manifest,
         secrets: snap.secrets,
         warnings: snap.warnings,
     })
+}
+
+/// Remove the store's plaintext secret bundle, if there is one. Best effort:
+/// it is called on the way out of an error, which it must not replace; a copy
+/// that stays is found by the sweep at start
+/// ([`crate::secrets::capture::sweep_store_copies`]).
+fn remove_secret_copy(path: Option<&Path>) {
+    if let Some(p) = path {
+        let _ = std::fs::remove_file(p);
+    }
 }
 
 /// A submodule that was not initialized in the original has no files to
@@ -254,8 +274,15 @@ pub fn capture_for_run(
         ci_source_id: got.manifest.ci_source_id.clone(),
         ..wanted
     };
-    let bound = store.bind_run(run, &record).map_err(internal)?;
+    let bound = match store.bind_run(run, &record) {
+        Ok(b) => b,
+        Err(e) => {
+            remove_secret_copy(got.secrets.as_deref());
+            return Err(internal(e));
+        }
+    };
     if bound != record {
+        remove_secret_copy(got.secrets.as_deref());
         return Err(ApiError::new(
             ErrorCode::Internal,
             format!(

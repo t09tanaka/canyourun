@@ -10,20 +10,68 @@
 //!
 //! A value shorter than [`MIN_MASK_BYTES`] is not masked: replacing every `1`
 //! or `on` in a log would hide more than it protects, and a value that short
-//! carries no secrecy that masking could keep. The names of such keys are
+//! carries no secrecy that masking could keep. Nor is a common setting value
+//! (`true`, `false`, `null`, `test`, `development`, `production`,
+//! `localhost` and the like, in any case). The names of such keys are
 //! returned (never the values) so the caller can say so.
+//!
+//! Only `KEY=VALUE` text is understood. A secret that is not of that shape is
+//! not masked, and the caller must not rely on it: the `_authToken` line of an
+//! `.npmrc` (`//host/:_authToken=...`, whose "key" is not a plain name), the
+//! fields of a JSON file, a PEM block, a certificate. Masking is a safety
+//! net for dotenv files, not a guarantee for every kind of secret file.
 
 use std::collections::BTreeSet;
 
 /// Shortest value (in bytes) that is masked.
-pub const MIN_MASK_BYTES: usize = 4;
+pub const MIN_MASK_BYTES: usize = 8;
 
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
+/// Values that are settings, not secrets, and appear in every log: never
+/// masked (compared without regard to case). Their keys are reported as
+/// skipped.
+const COMMON_VALUES: &[&str] = &[
+    "true",
+    "false",
+    "null",
+    "none",
+    "test",
+    "testing",
+    "development",
+    "production",
+    "staging",
+    "localhost",
+    "undefined",
+    "enabled",
+    "disabled",
+    "debug",
+];
+
+fn is_common(v: &[u8]) -> bool {
+    COMMON_VALUES
+        .iter()
+        .any(|c| v.eq_ignore_ascii_case(c.as_bytes()))
+}
+
+#[derive(Default, Clone, PartialEq, Eq)]
 pub struct Values {
     /// The strings to mask, each at least [`MIN_MASK_BYTES`] long, no repeats.
     pub values: Vec<Vec<u8>>,
     /// Keys whose value (or part of it) was too short to mask.
     pub skipped_keys: Vec<String>,
+}
+
+/// Shows how many values there are and how long, never a value or a key.
+impl std::fmt::Debug for Values {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Values")
+            .field("values", &self.values.len())
+            .field(
+                "value_bytes",
+                &self.values.iter().map(Vec::len).collect::<Vec<_>>(),
+            )
+            .field("skipped_keys", &self.skipped_keys.len())
+            .finish()
+    }
 }
 
 fn is_key(k: &[u8]) -> bool {
@@ -163,7 +211,7 @@ pub fn secret_values(content: &[u8]) -> Values {
             if piece.is_empty() {
                 continue;
             }
-            if piece.len() < MIN_MASK_BYTES {
+            if piece.len() < MIN_MASK_BYTES || is_common(piece) {
                 skipped.insert(key.clone());
             } else if seen.insert(piece.to_vec()) {
                 out.values.push(piece.to_vec());
@@ -194,9 +242,9 @@ mod tests {
 
     #[test]
     fn an_unquoted_value_ends_at_a_comment_but_keeps_a_hash_inside() {
-        assert_eq!(vals("A=abc#def # tail\n"), ["abc#def"]);
+        assert_eq!(vals("A=abcd#def # tail\n"), ["abcd#def"]);
         // masking too much is the safe side: a leading `#` stays in the value
-        assert_eq!(vals("A=# alone\n"), ["# alone"]);
+        assert_eq!(vals("A=# alone!\n"), ["# alone!"]);
         assert_eq!(vals("A=value1234 \t#x"), ["value1234"]);
     }
 
@@ -238,26 +286,72 @@ mod tests {
         assert_eq!(v[2], "line1-aaa");
         assert_eq!(v[3], "line2-bbb\t\r\\x\\q");
         // a trailing backslash is kept
-        assert_eq!(vals("A=\"abcde\\\\\"\n"), ["abcde\\\\", "abcde\\"]);
+        assert_eq!(vals("A=\"abcdefg\\\\\"\n"), ["abcdefg\\\\", "abcdefg\\"]);
         // single quotes do not unescape
-        assert_eq!(vals("A='ab\\ncd'\n"), ["ab\\ncd"]);
+        assert_eq!(vals("A='abcd\\nefgh'\n"), ["abcd\\nefgh"]);
     }
 
     #[test]
     fn short_values_are_skipped_by_key_and_never_returned() {
-        let r = secret_values(b"A=1\nB=abc\nC=abcd\nD=\"x\ny\"\nA=on\nE=\n");
-        assert_eq!(r.values, vec![b"abcd".to_vec()]);
-        assert_eq!(r.skipped_keys, ["A", "B", "D"]);
+        let r = secret_values(b"A=1\nB=abc\nC=abcdefg\nD=\"x\ny\"\nA=on\nE=\nF=abcdefgh\n");
+        assert_eq!(r.values, vec![b"abcdefgh".to_vec()]);
+        assert_eq!(r.skipped_keys, ["A", "B", "C", "D"]);
         // exactly MIN_MASK_BYTES is masked
-        assert_eq!(secret_values(b"A=abcd").values.len(), 1);
-        assert_eq!(secret_values(b"A=abc").values.len(), 0);
+        assert_eq!(MIN_MASK_BYTES, 8);
+        assert_eq!(secret_values(b"A=abcdefgh").values.len(), 1);
+        assert_eq!(secret_values(b"A=abcdefg").values.len(), 0);
+    }
+
+    #[test]
+    fn common_setting_values_are_not_masked_in_any_case() {
+        for v in [
+            "true",
+            "FALSE",
+            "null",
+            "Test",
+            "development",
+            "Production",
+            "LOCALHOST",
+            "undefined",
+            "disabled",
+        ] {
+            let r = secret_values(format!("MODE={v}\n").as_bytes());
+            assert!(r.values.is_empty(), "{v}");
+            // a skipped key is reported only when the value is short or common
+            assert_eq!(r.skipped_keys, ["MODE"], "{v}");
+        }
+        // a value that merely contains one is a value
+        assert_eq!(vals("A=production-key-1\n"), ["production-key-1"]);
+        assert_eq!(vals("A=localhost:5432/db\n"), ["localhost:5432/db"]);
+        // not in KEY=VALUE shape: not understood, so not masked
+        assert!(vals("//registry.example.org/:_authToken=npm-token-abcdef\n").is_empty());
+        assert!(vals("{\"token\": \"json-secret-abcdef\"}\n").is_empty());
+    }
+
+    #[test]
+    fn debug_shows_counts_and_lengths_only() {
+        let v = secret_values(b"API_KEY=super-secret-value\nTOKEN=another-secret-1\nSHORT=1\n");
+        let shown = format!("{v:?}");
+        assert!(!shown.contains("secret"), "{shown}");
+        assert!(!shown.contains("API_KEY") && !shown.contains("TOKEN") && !shown.contains("SHORT"));
+        assert!(shown.contains("values: 2"), "{shown}");
+        assert!(
+            shown.contains("[18, 16]") || shown.contains("[16, 18]"),
+            "{shown}"
+        );
+        assert!(shown.contains("skipped_keys: 1"), "{shown}");
     }
 
     #[test]
     fn repeated_values_are_listed_once_and_binary_input_is_fine() {
         assert_eq!(vals("A=samesame\nB=samesame\n"), ["samesame"]);
-        let r = secret_values(&[b'A', b'=', 0xff, 0xfe, 0xfd, 0xfc, b'\n']);
-        assert_eq!(r.values, vec![vec![0xff, 0xfe, 0xfd, 0xfc]]);
+        let r = secret_values(&[
+            b'A', b'=', 0xff, 0xfe, 0xfd, 0xfc, 0xfb, 0xfa, 0xf9, 0xf8, b'\n',
+        ]);
+        assert_eq!(
+            r.values,
+            vec![vec![0xff, 0xfe, 0xfd, 0xfc, 0xfb, 0xfa, 0xf9, 0xf8]]
+        );
         assert_eq!(secret_values(b"").values.len(), 0);
         assert_eq!(secret_values(b"KEY").values.len(), 0);
         assert_eq!(secret_values(b"KEY=").values.len(), 0);
@@ -265,8 +359,8 @@ mod tests {
         // an empty quoted value, and a blank line inside a value
         assert_eq!(secret_values(b"A=\"\"\n").values.len(), 0);
         assert_eq!(
-            vals("A=\"aaaaaa\n\nbbbbbb\"\n"),
-            ["aaaaaa\n\nbbbbbb", "aaaaaa", "bbbbbb"]
+            vals("A=\"aaaaaaaa\n\nbbbbbbbb\"\n"),
+            ["aaaaaaaa\n\nbbbbbbbb", "aaaaaaaa", "bbbbbbbb"]
         );
         assert_eq!(secret_values(b"=\n=x").values.len(), 0);
     }

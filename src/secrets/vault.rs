@@ -12,7 +12,7 @@ use super::key::ClusterKey;
 use super::plan::{check_limits, check_paths, ct_eq, hex_decode, listing_digest, to_wire_digest};
 use super::{Result, SecretError};
 use crate::ids::{Digest, RunId};
-use crate::wire::{Bytes, SecretFile};
+use crate::wire::{Bytes, HmacDigest, SecretFile};
 use local_ci::source::{secret_digest, RelPath, SecretEntry};
 use serde::Deserialize;
 use std::collections::BTreeSet;
@@ -20,6 +20,10 @@ use std::fs::{self, OpenOptions};
 use std::io::{ErrorKind, Write};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime};
+
+/// A temporary file older than this is a leftover of a crash.
+pub(crate) const STALE_TMP_AGE: Duration = Duration::from_secs(600);
 
 /// The files of one run with their keyed digests, ready to send. `Debug`
 /// names the paths and never shows a content.
@@ -51,10 +55,10 @@ impl HeldBundle {
     /// Digest of the listing (paths and HMACs, not contents), for the storage
     /// reference of this bundle.
     pub fn listing_digest(&self) -> Digest {
-        let entries: Vec<(String, String)> = self
+        let entries: Vec<(String, HmacDigest)> = self
             .files
             .iter()
-            .map(|f| (f.path.clone(), f.hmac_digest.to_string()))
+            .map(|f| (f.path.clone(), f.hmac_digest.clone()))
             .collect();
         listing_digest(&entries)
     }
@@ -63,12 +67,12 @@ impl HeldBundle {
     /// the keys whose value was too short to mask.
     pub fn mask_values(&self) -> Values {
         let mut all = Values::default();
-        let mut seen = BTreeSet::new();
         let mut skipped = BTreeSet::new();
         for f in &self.files {
             let v = secret_values(&f.content.0);
             for x in v.values {
-                if seen.insert(x.clone()) {
+                // no second copy of a value: a short scan, not a set of clones
+                if !all.values.contains(&x) {
                     all.values.push(x);
                 }
             }
@@ -156,7 +160,45 @@ pub(crate) fn write_private(path: &Path, bytes: &[u8]) -> Result<()> {
         let _ = fs::remove_file(&tmp);
         return Err(io(e));
     }
-    Ok(())
+    // the rename itself must survive a crash too
+    sync_dir(dir).map_err(io)
+}
+
+/// Make the entries of directory `dir` durable.
+pub(crate) fn sync_dir(dir: &Path) -> std::io::Result<()> {
+    fs::File::open(dir)?.sync_all()
+}
+
+/// Remove the temporary files (`.<name>.<ulid>.tmp`, regular files only) of
+/// `dir` last written more than `max_age` ago: a crash between creating one
+/// and renaming it leaves a plaintext copy behind. Returns how many.
+pub(crate) fn sweep_stale_tmp(dir: &Path, max_age: Duration) -> Result<usize> {
+    let io = |e| SecretError::io(format!("directory {}", dir.display()), e);
+    let now = SystemTime::now();
+    let mut removed = 0;
+    for entry in fs::read_dir(dir).map_err(io)? {
+        let entry = entry.map_err(io)?;
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if !(name.starts_with('.') && name.ends_with(".tmp")) {
+            continue;
+        }
+        let Ok(meta) = fs::symlink_metadata(entry.path()) else {
+            continue;
+        };
+        let age = meta
+            .modified()
+            .ok()
+            .and_then(|m| now.duration_since(m).ok())
+            .unwrap_or(Duration::ZERO);
+        if meta.file_type().is_file() && age >= max_age {
+            match fs::remove_file(entry.path()) {
+                Ok(()) => removed += 1,
+                Err(e) if e.kind() == ErrorKind::NotFound => {}
+                Err(e) => return Err(io(e)),
+            }
+        }
+    }
+    Ok(removed)
 }
 
 pub struct Vault {
@@ -192,22 +234,47 @@ impl Vault {
         fs::symlink_metadata(self.path(run)).is_ok()
     }
 
-    /// Take the bundle local-ci wrote at `store_copy` for `run`. A run that
-    /// already holds a bundle keeps it (a retry must not change it). The
-    /// store's copy is removed either way.
-    pub fn adopt(&self, run: &RunId, store_copy: &Path) -> Result<()> {
-        let bytes = read_private(store_copy, "secret bundle")?;
-        serde_json::from_slice::<Stored>(&bytes).map_err(|_| unreadable())?;
-        if !self.has(run) {
-            write_private(&self.path(run), &bytes)?;
-        }
-        match fs::remove_file(store_copy) {
+    /// Take the bundle local-ci wrote at `store_copy` for `run`, and check it
+    /// against the manifest's `entries` under `key` (see [`Vault::load`]): a
+    /// copy that does not verify is not kept. A run that already holds a
+    /// bundle keeps it (a retry must not change it). The store's plaintext
+    /// copy is removed whatever the outcome, an error included.
+    pub fn adopt(
+        &self,
+        run: &RunId,
+        store_copy: &Path,
+        entries: &[SecretEntry],
+        key: &ClusterKey,
+    ) -> Result<()> {
+        let taken = self.take(run, store_copy, entries, key);
+        let removed = match fs::remove_file(store_copy) {
             Err(e) if e.kind() != ErrorKind::NotFound => Err(SecretError::io(
                 format!("secret bundle {}", store_copy.display()),
                 e,
             )),
             _ => Ok(()),
+        };
+        taken.and(removed)
+    }
+
+    fn take(
+        &self,
+        run: &RunId,
+        store_copy: &Path,
+        entries: &[SecretEntry],
+        key: &ClusterKey,
+    ) -> Result<()> {
+        let bytes = read_private(store_copy, "secret bundle")?;
+        serde_json::from_slice::<Stored>(&bytes).map_err(|_| unreadable())?;
+        if self.has(run) {
+            return Ok(());
         }
+        write_private(&self.path(run), &bytes)?;
+        if let Err(e) = self.load(run, entries, key) {
+            let _ = self.erase(run);
+            return Err(e);
+        }
+        Ok(())
     }
 
     /// The files of `run`, checked against the manifest's `entries`: the same
@@ -289,9 +356,11 @@ impl Vault {
     }
 
     /// Delete the bundle of every run `is_terminal` says is finished (and
-    /// whose required collection is done). Returns the runs erased. A file
-    /// that is not a run's bundle is left alone.
+    /// whose required collection is done), and the stale temporary files of
+    /// the directory. Returns the runs erased. A file that is not a run's
+    /// bundle is left alone.
     pub fn sweep(&self, is_terminal: impl Fn(&RunId) -> bool) -> Result<Vec<RunId>> {
+        sweep_stale_tmp(&self.dir, STALE_TMP_AGE)?;
         let mut erased = Vec::new();
         let rd = fs::read_dir(&self.dir)
             .map_err(|e| SecretError::io(format!("directory {}", self.dir.display()), e))?;
