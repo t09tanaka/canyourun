@@ -129,6 +129,9 @@ impl std::fmt::Debug for StreamMasker {
     }
 }
 
+/// The continuation bytes (`10xxxxxx`) a UTF-8 character can have.
+const MAX_CONTINUATION: usize = 3;
+
 impl StreamMasker {
     /// Bytes held back at the moment (for a bound check).
     pub fn pending(&self) -> usize {
@@ -143,12 +146,15 @@ impl StreamMasker {
         }
         let hold = self.masker.longest - 1;
         let cut = self.held.len().saturating_sub(hold);
-        // do not end the released part inside a character
+        // Do not end the released part inside a character. A character has
+        // at most `MAX_CONTINUATION` continuation bytes, so the walk back is
+        // that short: a longer run of them is not text, and is cut where it
+        // is (walking to its start would hold the whole run, without bound).
         let boundary = |at: usize| {
-            (0..=at)
+            (at.saturating_sub(MAX_CONTINUATION)..=at)
                 .rev()
                 .find(|&i| i >= self.held.len() || (self.held[i] & 0xC0) != 0x80)
-                .unwrap_or(0)
+                .unwrap_or(at)
         };
         let mut cut = boundary(cut);
         // an occurrence (or run of them) that reaches the cut is not complete
@@ -484,6 +490,49 @@ mod tests {
         assert_eq!(s.pending(), 3);
         assert_eq!(out, b"***q");
         assert_eq!(s.finish(), b"***");
+    }
+
+    #[test]
+    fn a_long_run_of_continuation_bytes_is_not_held() {
+        // Not text: there is no character to keep whole, and walking back to
+        // the start of the run would hold all of it.
+        let k = m(&["hunter2!"]);
+        let mut s = k.stream();
+        let mut out = Vec::new();
+        for _ in 0..4096 {
+            out.extend(s.push(&[0x80, 0xBF, 0x9A]));
+            assert!(s.pending() <= 7, "only what a secret could start in");
+        }
+        assert_eq!(s.pending(), 7);
+        out.extend(s.push(b"hunter2! after"));
+        out.extend(s.finish());
+        let mut want = [0x80u8, 0xBF, 0x9A].repeat(4096);
+        want.extend_from_slice(b"*** after");
+        assert_eq!(out, want);
+        // The forced release does not walk further back either.
+        let k = m(&["abab"]);
+        let mut s = k.stream_limited(8);
+        s.push(&[0x80; 64]);
+        assert_eq!(s.pending(), 3);
+    }
+
+    #[test]
+    fn the_walk_back_is_as_long_as_a_character_and_no_longer() {
+        // The last byte of a four-byte character: three steps back find its
+        // start, and the character stays whole.
+        let k = m(&["zz"]);
+        let mut s = k.stream();
+        let crab = "\u{1F980}".as_bytes();
+        assert_eq!(crab.len(), 4);
+        let mut input = b"a".to_vec();
+        input.extend_from_slice(crab);
+        assert_eq!(s.push(&input), b"a");
+        assert_eq!(s.pending(), 4);
+        // Four continuation bytes are no character: the cut stays where the
+        // secret needs it, one byte from the end.
+        let mut s = k.stream();
+        assert_eq!(s.push(&[b'a', 0x80, 0x80, 0x80, 0x80]).len(), 4);
+        assert_eq!(s.pending(), 1);
     }
 
     #[test]
