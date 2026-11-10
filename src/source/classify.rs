@@ -35,9 +35,12 @@ pub fn error_code(e: &SourceError) -> ErrorCode {
         | ShallowClone
         | UnsupportedObjectFormat { .. }
         | OriginalConfigChanged { .. }
+        | SecretTooLarge { .. }
         | RepositoryUnreadable { .. } => ErrorCode::InvalidInput,
         FilterMissing { .. } | WorkspaceNotClean { .. } => ErrorCode::Blocked,
-        Corrupt { .. } => ErrorCode::Internal,
+        // the runner picks the bundle's path (one per run, in a directory it
+        // made): a path that cannot be written is the runner's, not the input's
+        Corrupt { .. } | SecretBundlePath { .. } => ErrorCode::Internal,
     }
 }
 
@@ -124,6 +127,15 @@ mod tests {
                 path: s("p"),
                 detail: s("d"),
             },
+            SecretBundlePath {
+                path: s("p"),
+                why: s("w"),
+            },
+            SecretTooLarge {
+                path: s(".env"),
+                size: 2,
+                limit: 1,
+            },
         ]
     }
 
@@ -171,6 +183,8 @@ mod tests {
                 Blocked,
                 Blocked,
                 InvalidInput,
+                InvalidInput,
+                Internal,
                 InvalidInput
             ]
         );

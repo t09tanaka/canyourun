@@ -753,63 +753,6 @@ fn a_create_after_a_crash_clears_the_stale_branch_and_registration() {
 
 // ---- review fixes -----------------------------------------------------
 
-/// The capture store's own Git repository that holds `tree` (local-ci writes
-/// the index tree there).
-fn repo_with(f: &Fixture, tree: &str) -> PathBuf {
-    let git = f.root.join("capture-state/sources/git");
-    std::fs::read_dir(git)
-        .unwrap()
-        .map(|e| e.unwrap().path())
-        .find(|d| {
-            Command::new("git")
-                .args(["cat-file", "-e", tree])
-                .current_dir(d)
-                .env_clear()
-                .envs(f.env())
-                .output()
-                .unwrap()
-                .status
-                .success()
-        })
-        .expect("the index tree is in the capture store")
-}
-
-/// The objects `tree` needs, copied from the repository `src` into `dst` (what
-/// a bundle that carried the original's index tree would do).
-fn copy_objects(f: &Fixture, src: &Path, dst: &Path, tree: &str) {
-    use std::io::Write;
-    let ids: String = f
-        .git(src, &["rev-list", "--objects", tree])
-        .lines()
-        .map(|l| format!("{}\n", l.split(' ').next().unwrap()))
-        .collect();
-    let mut pack = Command::new("git");
-    pack.args(["pack-objects", "--stdout", "-q"])
-        .current_dir(src)
-        .env_clear()
-        .envs(f.env())
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped());
-    let mut child = pack.spawn().unwrap();
-    child
-        .stdin
-        .take()
-        .unwrap()
-        .write_all(ids.as_bytes())
-        .unwrap();
-    let packed = child.wait_with_output().unwrap().stdout;
-    let mut unpack = Command::new("git");
-    unpack
-        .args(["unpack-objects", "-q"])
-        .current_dir(dst)
-        .env_clear()
-        .envs(f.env())
-        .stdin(std::process::Stdio::piped());
-    let mut child = unpack.spawn().unwrap();
-    child.stdin.take().unwrap().write_all(&packed).unwrap();
-    assert!(child.wait().unwrap().success());
-}
-
 /// A worktree capture of a repository with a staged change, an unstaged one
 /// and an untracked file.
 fn dirty_capture(f: &Fixture, store: &SourceStore) -> CiManifest {
@@ -836,10 +779,8 @@ fn head_and_index_are_the_originals() {
         let ws = f.workspaces(&b.fw(&f));
         let repo = f.clone_of(&ws);
         f.deliver(&store, &repo, &m);
-        let tree = m.index_tree.clone().unwrap();
-        // the bundle does not carry the index tree yet: it is copied in
-        let src = repo_with(&f, &tree);
-        copy_objects(&f, &src, repo.dir(), &tree);
+        // the bundle carries the index tree (local-ci 0.10)
+        assert!(m.index_tree.is_some());
         let w = ws
             .create(&AttemptId::generate(), &store, &m, Some(&repo))
             .unwrap();
@@ -876,6 +817,15 @@ fn without_the_index_tree_the_index_is_the_heads_and_it_is_said() {
     let ws = f.workspaces(&b.fw(&f));
     let repo = f.clone_of(&ws);
     f.deliver(&store, &repo, &m);
+    // a clone that has not got the index tree (a bundle made before local-ci 0.10)
+    let index_ref = f.git(
+        repo.dir(),
+        &["for-each-ref", "--format=%(refname)", "refs/local-ci/index"],
+    );
+    f.git(repo.dir(), &["update-ref", "-d", index_ref.trim()]);
+    f.git(repo.dir(), &["reflog", "expire", "--expire=now", "--all"]);
+    f.git(repo.dir(), &["repack", "-a", "-d", "-q"]);
+    f.git(repo.dir(), &["prune", "--expire=now"]);
     let head = f.git(&f.dir, &["rev-parse", "HEAD"]);
     let w = ws
         .create(&AttemptId::generate(), &store, &m, Some(&repo))

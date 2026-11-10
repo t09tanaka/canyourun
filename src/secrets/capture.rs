@@ -1,25 +1,19 @@
 //! Capturing a run's source together with its secret files (spec 22.3).
 //!
-//! Which requests may carry secret files, for now (a stopgap until local-ci
-//! can do the rest, see below):
+//! Which requests may carry secret files:
 //!
-//! - `Worktree`: yes. The declared globs plus what `.worktreeinclude` matches
-//!   are read from the working tree.
-//! - `Commit`: refused (`INVALID_INPUT`) when secret files are declared or
-//!   `.worktreeinclude` matches an ignored file. The spec's answer is to read
-//!   them from the original worktree and send them with the commit, which
-//!   needs local-ci to take a secret root separate from the clean clone the
-//!   commit is checked out in. Until then a commit run is not silently sent
-//!   without its secrets.
-//! - `Directory`: refused likewise when secret files are declared or a
-//!   `.worktreeinclude` names a pattern. local-ci's directory capture has no
-//!   way to keep a secret file out of the snapshot, so its plaintext would
-//!   become a blob in the object store.
+//! - `Worktree`: the declared globs plus what `.worktreeinclude` matches are
+//!   read from the working tree.
+//! - `Commit`: the same, read from the original worktree the commit came from
+//!   (local-ci's `secret_root`), never from the clean checkout the commit is
+//!   captured in.
+//! - `Directory`: the declared globs (local-ci separates them from the
+//!   snapshot as it does for a worktree). A `.worktreeinclude` that names a
+//!   pattern is still refused: its patterns are Git's, and there is no
+//!   repository to evaluate them in, so which files it means cannot be told.
 //!
-//! Both refusals are lifted when local-ci's secret root and secret separation
-//! for a directory capture exist (the L1c work).
-//!
-//! The store's plaintext bundle (`<store>/secrets/<source>.json`) lives from
+//! //! The store's plaintext bundle (`<store>/secrets/<run>.json`, a path of the
+//! run, created by local-ci and never replaced) lives from
 //! the moment local-ci writes it until the vault has adopted it. Every error
 //! after that moment removes it, a later call for a run whose capture was
 //! already bound adopts a copy that is still there, and
@@ -39,6 +33,8 @@ use local_ci::source::SecretSpec;
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::ErrorKind;
+use std::os::unix::fs::DirBuilderExt;
+use std::path::PathBuf;
 
 /// What decides the secret files of a capture.
 pub struct SecretInputs<'a> {
@@ -47,13 +43,22 @@ pub struct SecretInputs<'a> {
     pub declared: &'a [SecretSpec],
 }
 
-fn unsupported(what: &str) -> ApiError {
+fn worktreeinclude_in_directory() -> ApiError {
     ApiError::new(
         ErrorCode::InvalidInput,
-        format!(
-            "{what}: secret files are not supported for this kind of source yet (they are for a worktree); remove them from [source] secret_files and .worktreeinclude, or run from the working tree. Support follows with the next local-ci release"
-        ),
+        "a directory capture: .worktreeinclude names patterns, which are Git's and cannot be evaluated in a directory that is not a repository; list the files in [source] secret_files, or run from a repository".to_string(),
     )
+}
+
+/// Where local-ci writes the plaintext bundle of `run` in `store`.
+pub fn run_bundle_path(store: &SourceStore, run: &RunId) -> PathBuf {
+    store.root().join("secrets").join(format!("{run}.json"))
+}
+
+/// The leftover of a bundle write that was killed: local-ci's temporary file
+/// (`.secrets.tmp-*`) holds the secret files in plain.
+fn is_bundle_tmp(name: &str) -> bool {
+    name.starts_with(".secrets.tmp-")
 }
 
 /// `capture_for_run` with secret files: the declared globs plus what
@@ -72,25 +77,17 @@ pub fn capture_run(
     let (key, declared) = (inputs.key, inputs.declared);
     check_declared(declared).map_err(|l| ApiError::new(ErrorCode::InvalidInput, l.to_string()))?;
     let included = match request {
-        SourceRequest::Worktree { dir } => ignored_matches(env, dir).map_err(|e| e.to_api())?,
-        SourceRequest::Commit { dir, .. } => {
-            if !declared.is_empty()
-                || !ignored_matches(env, dir)
-                    .map_err(|e| e.to_api())?
-                    .is_empty()
-            {
-                return Err(unsupported("a commit capture"));
-            }
-            vec![]
+        SourceRequest::Worktree { dir } | SourceRequest::Commit { dir, .. } => {
+            ignored_matches(env, dir).map_err(|e| e.to_api())?
         }
         SourceRequest::Directory { dir } => {
-            if !declared.is_empty() || declares_patterns(dir).map_err(|e| e.to_api())? {
-                return Err(unsupported("a directory capture"));
+            if declares_patterns(dir).map_err(|e| e.to_api())? {
+                return Err(worktreeinclude_in_directory());
             }
             vec![]
         }
     };
-    if let SourceRequest::Worktree { dir } = request {
+    if let SourceRequest::Worktree { dir } | SourceRequest::Commit { dir, .. } = request {
         // fail on a file that cannot be sent before local-ci reads anything
         preflight(env, dir, declared, &included).map_err(|e| e.to_api())?;
     }
@@ -103,14 +100,24 @@ pub fn capture_run(
             ApiError::new(ErrorCode::Internal, format!("secret capture lock: {e:#}"))
         })?)
     };
+    let copy = run_bundle_path(store, run);
+    if !specs.is_empty() {
+        fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(store.root().join("secrets"))
+            .map_err(|e| {
+                ApiError::new(ErrorCode::Internal, format!("secret store directory: {e}"))
+            })?;
+    }
     let params = CaptureParams {
+        secret_bundle: (!specs.is_empty()).then(|| copy.clone()),
         secret_files: specs,
         secret_key: key.as_bytes().to_vec(),
         ..params.clone()
     };
     let got = capture_for_run(env, store, run, request, &params)?;
     let entries = &got.manifest.secret_files;
-    let copy = store.secrets_path(&got.manifest.ci_source_id);
     // a fresh capture hands the path over; a repeated call finds the copy an
     // earlier call could not adopt, if it is still there
     let pending = match &got.secrets {
@@ -129,9 +136,10 @@ pub fn capture_run(
 }
 
 /// Remove the plaintext bundles in the store that no run is going to adopt:
-/// every `<store>/secrets/<source>.json` for which `keep(source)` is false.
-/// `keep` is true for the sources of runs that were captured but whose bundle
-/// is not in the vault yet; a call at supervisor start with such a `keep`
+/// every `<store>/secrets/<name>.json` for which `keep(name)` is false (`name`
+/// is the run id of a run's own bundle, the source id of a default one), and
+/// the `.secrets.tmp-*` files a killed bundle write left. `keep` is true for
+/// the runs that were captured but whose bundle is not in the vault yet; a call at supervisor start with such a `keep`
 /// (or `|_| false`) is what clears the leftovers of a crash (S10). It takes
 /// the same lock as [`capture_run`], so it never removes a bundle that a
 /// capture in this or another process is about to adopt. Returns how many
@@ -156,6 +164,15 @@ pub fn sweep_store_copies(
     for entry in rd {
         let entry = entry.map_err(|e| internal("secret store directory", &e))?;
         let name = entry.file_name().to_string_lossy().into_owned();
+        if is_bundle_tmp(&name) {
+            // under the lock of every capture that writes one: not in use
+            match fs::remove_file(entry.path()) {
+                Ok(()) => removed += 1,
+                Err(e) if e.kind() == ErrorKind::NotFound => {}
+                Err(e) => return Err(internal("secret store file", &e)),
+            }
+            continue;
+        }
         let Some(stem) = name.strip_suffix(".json") else {
             continue;
         };
