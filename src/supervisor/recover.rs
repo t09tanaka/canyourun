@@ -10,6 +10,10 @@
 //! investigated through task-traffic-controller and, when that cannot rule a
 //! process out, the attempt stays unresolved.
 //!
+//! The attempt is settled through its log spool like a run that ended
+//! normally: the spool is resumed, closed and described in the result. What
+//! the command wrote while no supervisor was alive is not in it.
+//!
 //! A leader that is gone does not mean its group is: descendants can outlive
 //! it. So the group (from the pgid task-traffic-controller recorded, else the
 //! leader's pid) is stopped when it still has members and the leader is the
@@ -20,13 +24,16 @@
 
 use super::error::Result;
 use super::identity::{verdict, Verdict};
-use super::run::{finalize, sidecar_child, stop_confirmed, unresolved_report, Report, Traffic};
+use super::run::{
+    open_spool, settle, settle_without_spool, sidecar_child, stop_confirmed, unresolved_report,
+    Report, Traffic,
+};
 use super::spec::{command_id, SuperviseSpec};
 use super::stop::{group_alive, StopResult, StopTarget};
 use super::termination::{termination, StopReason};
 use crate::platform;
 use crate::state::AttemptState;
-use crate::storage::{Finalized, WorkerStore};
+use crate::storage::WorkerStore;
 use serde_json::json;
 use task_traffic_controller::managed;
 
@@ -119,9 +126,12 @@ pub fn recover(spec: &SuperviseSpec, store: &WorkerStore) -> Result<Report> {
     if reason.is_some() && rec.state != AttemptState::Cancelling {
         let _ = store.transition(attempt, AttemptState::Cancelling, platform::wall_ms());
     }
-    let (t, here) = match finalize(store, attempt, termination(reason, None))? {
-        Finalized::Won(t) => (t, true),
-        Finalized::AlreadyTerminal(t) => (t, false),
+    // Whatever the spool holds of the lost supervisor's output is closed
+    // with the attempt; a spool that cannot be resumed is a spool failure.
+    let term = termination(reason, None);
+    let (t, here) = match open_spool(spec, store)? {
+        Ok(spool) => settle(store, &spec.spool_root, attempt, &spool, term)?,
+        Err(e) => settle_without_spool(store, attempt, "open", &e.to_string(), term)?,
     };
     Ok(Report {
         termination: Some(t),

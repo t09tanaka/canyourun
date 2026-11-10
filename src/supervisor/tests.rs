@@ -1606,3 +1606,212 @@ fn an_index_scan_over_any_sixteen_bytes_keeps_a_valid_prefix() {
         assert_eq!(rec.seq, fed as u64 + u64::from(p.end < len), "case {case}");
     }
 }
+
+// ------------------------------------------------- the supervisor and the spool
+
+use super::pump::{pump, Pipe};
+use super::run::{settle, SpoolBeat};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
+
+fn succeeded() -> Termination {
+    Termination::new(Outcome::Succeeded, Some(crate::state::Exit::Code(0)), None).unwrap()
+}
+
+fn spool_failures(w: &Wk, a: &AttemptId) -> Vec<serde_json::Value> {
+    let all = w.store.events_of(a, "spool_failed").unwrap();
+    all.into_iter().map(|e| e.payload).collect()
+}
+
+#[test]
+fn settling_closes_the_spool_and_stores_the_result() {
+    let w = wk();
+    let a = accept(&w);
+    let s = AttemptSpool::open(&w.root, &a, BIG).unwrap();
+    s.writer(Stdout).append(b"hello").unwrap();
+    let (t, here) = settle(&w.store, &w.root, &a, &s, succeeded()).unwrap();
+    assert_eq!((t, here), (succeeded(), true));
+    let result = w.store.get_result(&a).unwrap().unwrap();
+    assert_eq!(result["logs"]["stdout"]["bytes"], 5);
+    assert!(SpoolReader::open(&w.root, &a).unwrap().finished());
+    assert!(spool_failures(&w, &a).is_empty());
+    // Again (a retry after a crash): the same termination, fixed before.
+    let (t, here) = settle(&w.store, &w.root, &a, &s, cancelled()).unwrap();
+    assert_eq!((t, here), (succeeded(), false));
+}
+
+#[test]
+fn a_spool_that_fails_at_the_end_makes_the_attempt_interrupted_with_an_event() {
+    let w = wk();
+    let a = accept(&w);
+    let s = AttemptSpool::open(&w.root, &a, BIG).unwrap();
+    s.writer(Stdout).append(b"partial").unwrap();
+    // The disk refused a write.
+    s.writer(Stdout).poison();
+    let (t, here) = settle(&w.store, &w.root, &a, &s, succeeded()).unwrap();
+    // Not the success the command reported, and not a silent drop.
+    assert_eq!(t.outcome(), Outcome::Interrupted);
+    assert_eq!(t.exit(), Some(crate::state::Exit::Code(0)));
+    assert!(here);
+    let rec = w.store.get(&a).unwrap().unwrap();
+    assert_eq!(rec.state, AttemptState::Terminal);
+    assert_eq!(rec.termination, Some(t));
+    let ev = spool_failures(&w, &a);
+    assert_eq!(ev.len(), 1, "{ev:?}");
+    assert_eq!(ev[0]["stage"], "finish");
+    assert!(ev[0]["error"].as_str().unwrap().contains("spool"), "{ev:?}");
+    // Nothing describes the incomplete output as a result.
+    assert!(w.store.get_result(&a).unwrap().is_none());
+    assert!(!SpoolReader::open(&w.root, &a).unwrap().finished());
+    // A second settle changes nothing and does not repeat the event.
+    let (again, here) = settle(&w.store, &w.root, &a, &s, succeeded()).unwrap();
+    assert_eq!((again, here), (t, false));
+    assert_eq!(spool_failures(&w, &a).len(), 1);
+}
+
+#[test]
+fn a_cancel_stays_a_cancel_when_the_spool_fails() {
+    let w = wk();
+    let a = accept(&w);
+    let s = AttemptSpool::open(&w.root, &a, BIG).unwrap();
+    s.writer(Stderr).poison();
+    let (t, _) = settle(&w.store, &w.root, &a, &s, cancelled()).unwrap();
+    assert_eq!(t, cancelled());
+    assert_eq!(spool_failures(&w, &a).len(), 1);
+}
+
+#[test]
+fn the_heartbeat_stores_positions_only_when_they_moved() {
+    let w = wk();
+    let a = accept(&w);
+    let s = AttemptSpool::open(&w.root, &a, BIG).unwrap();
+    let mut beat = SpoolBeat::default();
+    let stored = || w.store.log_position(&a, "stdout").unwrap();
+    s.writer(Stdout).append(b"abc").unwrap();
+    assert_eq!(stored().written_bytes, 0);
+    beat.beat(&w.store, &a, &s, None).unwrap();
+    assert_eq!((stored().written_bytes, stored().last_seq), (3, 1));
+    // The bytes are published to a reader of another process as well.
+    let r = SpoolReader::open(&w.root, &a).unwrap();
+    assert_eq!(r.read(Stdout, 0, 10).unwrap().data, b"abc");
+    // Nothing new: no new index record (so, no sync) and no change.
+    beat.beat(&w.store, &a, &s, None).unwrap();
+    assert_eq!(s.writer(Stdout).status().seq, 1);
+    s.writer(Stdout).append(b"de").unwrap();
+    beat.beat(&w.store, &a, &s, None).unwrap();
+    assert_eq!((stored().written_bytes, stored().last_seq), (5, 2));
+    assert!(beat.failure.is_none());
+    assert!(spool_failures(&w, &a).is_empty());
+}
+
+#[test]
+fn the_heartbeat_records_a_spool_failure_once_and_is_not_an_error() {
+    let w = wk();
+    let a = accept(&w);
+    let s = AttemptSpool::open(&w.root, &a, BIG).unwrap();
+    let mut beat = SpoolBeat::default();
+    s.writer(Stdout).append(b"abc").unwrap();
+    s.writer(Stdout).poison();
+    beat.beat(&w.store, &a, &s, None).unwrap();
+    assert!(beat.failure.is_some());
+    let ev = spool_failures(&w, &a);
+    assert_eq!(ev.len(), 1);
+    assert_eq!(ev[0]["stage"], "write");
+    // The position that could not be made durable was not stored.
+    assert_eq!(w.store.log_position(&a, "stdout").unwrap().written_bytes, 0);
+    // Later beats do nothing more.
+    beat.beat(&w.store, &a, &s, Some("again".into())).unwrap();
+    assert_eq!(spool_failures(&w, &a).len(), 1);
+
+    // What the reader thread reported is a failure too, with its own words.
+    let b = accept(&w);
+    let s = AttemptSpool::open(&w.root, &b, BIG).unwrap();
+    let mut beat = SpoolBeat::default();
+    beat.beat(&w.store, &b, &s, Some("disk full".into()))
+        .unwrap();
+    assert_eq!(beat.failure.as_deref(), Some("disk full"));
+    assert_eq!(spool_failures(&w, &b)[0]["error"], "disk full");
+
+    // An attempt the database does not know is a storage error, not a spool
+    // failure: the caller keeps supervising and tries again.
+    let unknown = AttemptId::generate();
+    let s = AttemptSpool::open(&w.root, &unknown, BIG).unwrap();
+    s.writer(Stdout).append(b"x").unwrap();
+    let mut beat = SpoolBeat::default();
+    assert!(beat.beat(&w.store, &unknown, &s, None).is_err());
+    assert!(beat.failure.is_none());
+}
+
+/// Run the pump against writers in this process (threads), as a command's
+/// descriptors would write.
+fn pumped(s: &AttemptSpool, pipe: &Pipe, write: impl FnOnce(fs::File) + Send) -> Option<String> {
+    let done = AtomicBool::new(false);
+    let error = Mutex::new(None);
+    std::thread::scope(|sc| {
+        let feeder = sc.spawn(|| pump(pipe, s.writer(Stdout), &done, &error));
+        let out = fs::OpenOptions::new()
+            .append(true)
+            .open(pipe.path())
+            .unwrap();
+        write(out);
+        done.store(true, Ordering::SeqCst);
+        feeder.join().unwrap();
+    });
+    error.into_inner().unwrap()
+}
+
+#[test]
+fn the_pump_carries_everything_written_before_the_end() {
+    let (dir, a, s) = spool(BIG);
+    let path = Pipe::path_for(dir.path(), &a, 0);
+    let pipe = Pipe::open(&path).unwrap();
+    // More than a pipe holds: the writer only gets through if it is read.
+    let data = pattern(0, 600_000);
+    let err = pumped(&s, &pipe, |mut out| out.write_all(&data).unwrap());
+    assert_eq!(err, None);
+    s.finish().unwrap();
+    let r = SpoolReader::open(dir.path(), &a).unwrap();
+    assert_eq!(read_all(&r, Stdout), data);
+    drop(pipe);
+    assert!(!path.exists(), "the pipe is removed with its reader");
+}
+
+#[test]
+fn the_pump_keeps_reading_when_the_spool_is_full_or_has_failed() {
+    // Full: the rest is counted, the writer is never blocked.
+    let (_d, a, s) = spool(10);
+    let pipe = Pipe::open(&Pipe::path_for(_d.path(), &a, 0)).unwrap();
+    let data = pattern(0, 300_000);
+    assert_eq!(pumped(&s, &pipe, |mut o| o.write_all(&data).unwrap()), None);
+    let st = s.writer(Stdout).status();
+    assert_eq!((st.end, st.dropped), (10, 299_990));
+
+    // Failed: the first failure is reported, and the writer still finishes.
+    let (_d, a, s) = spool(BIG);
+    let pipe = Pipe::open(&Pipe::path_for(_d.path(), &a, 3)).unwrap();
+    s.writer(Stdout).poison();
+    let err = pumped(&s, &pipe, |mut o| o.write_all(&data).unwrap());
+    assert!(err.is_some_and(|e| e.contains("spool")));
+}
+
+#[test]
+fn a_pipe_is_made_once_reused_after_a_crash_and_never_replaces_another_file() {
+    let (dir, a, _s) = spool(BIG);
+    let path = Pipe::path_for(dir.path(), &a, 1);
+    assert!(path.starts_with(super::spool::logs_dir(dir.path(), &a)));
+    let first = Pipe::open(&path).unwrap();
+    assert_eq!(first.path(), path);
+    // A crash leaves the FIFO behind: the next supervisor reads from it.
+    std::mem::forget(first);
+    let again = Pipe::open(&path).unwrap();
+    drop(again);
+    assert!(!path.exists());
+    // A regular file or a symlink at the path is an error and stays.
+    fs::write(&path, b"mine").unwrap();
+    assert!(Pipe::open(&path).is_err());
+    assert_eq!(fs::read(&path).unwrap(), b"mine");
+    let link = Pipe::path_for(dir.path(), &a, 2);
+    std::os::unix::fs::symlink(&path, &link).unwrap();
+    assert!(Pipe::open(&link).is_err());
+    assert!(link.symlink_metadata().is_ok() && path.exists());
+}

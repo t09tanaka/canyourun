@@ -7,6 +7,7 @@ pub mod lease;
 pub mod lock;
 pub mod outcome;
 pub mod process;
+mod pump;
 pub mod recover;
 pub mod run;
 pub mod spec;

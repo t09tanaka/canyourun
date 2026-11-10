@@ -252,6 +252,9 @@ fn file_digest(path: &Path) -> Result<(Digest, u64)> {
 pub struct Recorded {
     pub result: Value,
     pub fresh: bool,
+    /// This call fixed the attempt's termination (otherwise it was fixed
+    /// before: by an earlier call, or by a competing writer).
+    pub finalized: bool,
 }
 
 fn summary(s: StreamStatus) -> StreamSummary {
@@ -429,6 +432,7 @@ pub fn finish_attempt(
         return Ok(Recorded {
             result: existing,
             fresh: false,
+            finalized: false,
         });
     }
     check_artifacts(root, attempt, artifacts)?;
@@ -453,14 +457,19 @@ pub fn finish_attempt(
             at_ms,
         )?;
     }
-    let fixed = store.finalize(attempt, termination, at_ms)?.termination();
+    let fin = store.finalize(attempt, termination, at_ms)?;
+    let fixed = fin.termination();
     let result = result_json(&fixed, artifacts, summary(out), summary(err));
     let fresh = store.record_result(attempt, &result)?;
     // The stored result is the truth, whichever call stored it: a crash
     // between storing it and the events is repaired by the next call, which
     // writes the events the result implies and the journal lacks.
     ensure_truncation_events(store, attempt, &result, at_ms)?;
-    Ok(Recorded { result, fresh })
+    Ok(Recorded {
+        result,
+        fresh,
+        finalized: fin.won(),
+    })
 }
 
 /// Write `log_truncated` for each stream the result says dropped bytes, unless

@@ -10,7 +10,9 @@ use remote_task_runner::supervisor::process::{code, spawn_detached, supervise};
 use remote_task_runner::supervisor::recover::recover;
 use remote_task_runner::supervisor::run::{run, Report};
 use remote_task_runner::supervisor::spec::{NodeSpec, SuperviseSpec};
+use remote_task_runner::supervisor::spool::SpoolReader;
 use remote_task_runner::wire::LeaseKey;
+use remote_task_runner::wire::LogStream;
 use std::collections::BTreeMap;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -35,7 +37,6 @@ fn node(name: &str, script: &str) -> NodeSpec {
         argv: vec!["/bin/sh".into(), "-c".into(), script.into()],
         cwd: std::env::temp_dir(),
         env,
-        stdout_log: None,
         weight: Some(1),
     }
 }
@@ -88,6 +89,9 @@ fn fx(nodes: Vec<NodeSpec>) -> Fx {
         resource_wait_timeout_ms: None,
         deadline_ms: None,
         inhibit_sleep: false,
+        spool_root: dir.path().join("spool"),
+        log_limit_bytes: 1 << 30,
+        workspace_warnings: vec![],
     };
     Fx {
         strays: Default::default(),
@@ -139,6 +143,55 @@ impl Fx {
     }
     fn state(&self) -> AttemptState {
         self.store.get(self.attempt()).unwrap().unwrap().state
+    }
+    /// What a reader in another process sees of the attempt's output.
+    fn output_of(
+        &self,
+        attempt: &AttemptId,
+    ) -> (Vec<u8>, remote_task_runner::supervisor::spool::ReadChunk) {
+        let r = SpoolReader::open(&self.spec.spool_root, attempt).unwrap();
+        let (mut out, mut off) = (Vec::new(), 0);
+        loop {
+            let c = r.read(LogStream::Stdout, off, 1 << 20).unwrap();
+            out.extend_from_slice(&c.data);
+            if c.data.is_empty() {
+                return (out, c);
+            }
+            off = c.next_offset;
+        }
+    }
+    fn output(&self) -> String {
+        String::from_utf8(self.output_of(self.attempt()).0).unwrap()
+    }
+    fn events(&self, attempt: &AttemptId, kind: &str) -> Vec<serde_json::Value> {
+        let all = self.store.events_of(attempt, kind).unwrap();
+        all.into_iter().map(|e| e.payload).collect()
+    }
+    /// Accept another attempt of the same task (the first one is over) and
+    /// return the spec that supervises it.
+    fn next_attempt(&self) -> SuperviseSpec {
+        let first = self.store.get(self.attempt()).unwrap().unwrap();
+        let attempt = AttemptId::generate();
+        self.store
+            .submit(
+                NewAcceptance {
+                    attempt_id: attempt.clone(),
+                    run_id: first.run_id,
+                    task_id: first.task_id,
+                    generation: Generation(first.generation.0 + 1),
+                    payload_hash: first.payload_hash,
+                    coordinator_epoch: first.coordinator_epoch,
+                    spec: serde_json::json!({}),
+                },
+                100,
+            )
+            .unwrap();
+        for (to, at) in [(AttemptState::Preparing, 101), (AttemptState::Ready, 102)] {
+            self.store.transition(&attempt, to, at).unwrap();
+        }
+        let mut spec = self.spec.clone();
+        spec.attempt_id = attempt;
+        spec
     }
     fn term(&self) -> remote_task_runner::state::Termination {
         self.store
@@ -219,25 +272,225 @@ fn a_failing_node_stops_the_attempt_and_later_nodes_never_start() {
 }
 
 #[test]
-fn nodes_run_in_order_with_an_isolated_environment_and_a_log_file() {
+fn nodes_run_in_order_with_an_isolated_environment_and_their_output_in_the_spool() {
     let f = fx(vec![]);
-    let log = f.path("out.log");
     let mut spec = f.spec.clone();
     let mut n1 = node("one", "echo first:$RTR_VAR:${HOME:-nohome}; echo err >&2");
     n1.env.insert("RTR_VAR".into(), "x".into());
-    n1.stdout_log = Some(log.clone());
-    let mut n2 = node("two", "echo second");
-    n2.stdout_log = Some(log.clone());
+    let n2 = node("two", "echo second");
     spec.nodes = vec![n1, n2];
     let t = settled(&run(&spec).unwrap());
     assert_eq!(t.outcome(), Outcome::Succeeded);
-    let text = std::fs::read_to_string(&log).unwrap();
+    let text = f.output();
     // The supervisor's own HOME is not inherited.
     assert!(text.contains("first:x:nohome"), "{text}");
     assert!(text.contains("err"), "{text}");
     assert!(text.contains("second"), "{text}");
     assert!(text.find("first").unwrap() < text.find("second").unwrap());
     assert_eq!(f.store.launches(f.attempt()).unwrap().len(), 2);
+    // The spool is closed, its position is stored and the result describes it.
+    let (bytes, last) = f.output_of(f.attempt());
+    assert!(last.eof && !last.log_truncated);
+    let pos = f.store.log_position(f.attempt(), "stdout").unwrap();
+    assert_eq!(pos.written_bytes, bytes.len() as u64);
+    let result = f.store.get_result(f.attempt()).unwrap().expect("a result");
+    assert_eq!(result["termination"]["outcome"], "succeeded");
+    assert_eq!(result["logs"]["stdout"]["bytes"], bytes.len() as u64);
+    // The pipes the output came through are gone.
+    let left: Vec<_> =
+        std::fs::read_dir(spec.spool_root.join(f.attempt().to_string()).join("logs"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().into_string().unwrap())
+            .filter(|n| n.ends_with(".pipe"))
+            .collect();
+    assert!(left.is_empty(), "{left:?}");
+}
+
+#[test]
+fn output_larger_than_a_pipe_is_stored_whole_and_in_order() {
+    // Far more than a pipe holds, not UTF-8, written faster than it is read.
+    let f = fx(vec![node(
+        "big",
+        "i=0; while [ $i -lt 40 ]; do head -c 65536 /dev/zero | tr '\\000' '\\377'; i=$((i+1)); done; printf end",
+    )]);
+    let t = settled(&run(&f.spec).unwrap());
+    assert_eq!(t.outcome(), Outcome::Succeeded);
+    let (bytes, last) = f.output_of(f.attempt());
+    assert_eq!(bytes.len(), 40 * 65536 + 3);
+    assert!(bytes[..40 * 65536].iter().all(|b| *b == 0xff));
+    assert_eq!(&bytes[40 * 65536..], b"end");
+    assert!(last.eof);
+}
+
+#[test]
+fn the_task_limit_counts_what_its_other_attempts_stored() {
+    let mut f = fx(vec![node("n", "printf %060d 0; exit 1")]);
+    f.spec.log_limit_bytes = 100;
+    let t = settled(&run(&f.spec).unwrap());
+    assert_eq!(t.outcome(), Outcome::Failed);
+    assert_eq!(f.output().len(), 60);
+    assert!(f.events(f.attempt(), "log_truncated").is_empty());
+    // The retry is another attempt of the same task, supervised by another
+    // process: it may store only what the first one left of the limit.
+    let second = f.next_attempt();
+    assert_eq!(
+        f.store
+            .log_bytes_of_other_attempts(&second.attempt_id)
+            .unwrap(),
+        60
+    );
+    assert_eq!(f.store.log_bytes_of_other_attempts(f.attempt()).unwrap(), 0);
+    let mut spec = second.clone();
+    spec.nodes = vec![node("n", "printf %070d 7")];
+    let spec_path = write_spec(&f, &spec);
+    let mut child = spawn_detached(&exe(), &spec_path).unwrap();
+    f.track(child.id());
+    assert_eq!(child.wait().unwrap().code(), Some(code::SETTLED));
+    let a2 = &second.attempt_id;
+    let (bytes, last) = f.output_of(a2);
+    assert_eq!(bytes, "0".repeat(40).into_bytes());
+    assert!(last.eof && last.log_truncated);
+    assert_eq!(last.dropped_bytes, 30);
+    let pos = f.store.log_position(a2, "stdout").unwrap();
+    assert_eq!((pos.written_bytes, pos.dropped_bytes), (40, 30));
+    // The command itself was not disturbed by the limit.
+    let rec = f.store.get(a2).unwrap().unwrap();
+    assert_eq!(rec.termination.unwrap().outcome(), Outcome::Succeeded);
+    let ev = f.events(a2, "log_truncated");
+    assert_eq!(ev.len(), 1, "{ev:?}");
+    assert_eq!(ev[0]["dropped_bytes"], 30);
+    // The first attempt's output is untouched, and it now counts 40 more
+    // against any later attempt.
+    assert_eq!(f.output().len(), 60);
+    assert_eq!(
+        f.store.log_bytes_of_other_attempts(f.attempt()).unwrap(),
+        40
+    );
+}
+
+#[test]
+fn each_heartbeat_publishes_the_output_and_advances_the_stored_position() {
+    let f = fx(vec![]);
+    let (go, end) = (f.path("go"), f.path("end"));
+    let script = format!(
+        "printf one; while [ ! -e '{}' ]; do sleep 0.05; done; printf two; \
+         while [ ! -e '{}' ]; do sleep 0.05; done",
+        go.display(),
+        end.display()
+    );
+    let mut spec = f.spec.clone();
+    spec.nodes = vec![node("n", &script)];
+    let spec_path = write_spec(&f, &spec);
+    // The supervisor is another process; this one reads like the agent does,
+    // through its own database connection and the spool's reader.
+    let mut sup = spawn_detached(&exe(), &spec_path).unwrap();
+    f.track(sup.id());
+    let reader = f.open_second();
+    let written = || {
+        reader
+            .log_position(f.attempt(), "stdout")
+            .unwrap()
+            .written_bytes
+    };
+    wait_for("the first output to be stored", || written() == 3);
+    assert_eq!(f.state(), AttemptState::Active);
+    assert_eq!(f.output(), "one");
+    let seq = reader.log_position(f.attempt(), "stdout").unwrap().last_seq;
+    std::fs::write(&go, b"").unwrap();
+    wait_for("the position to advance", || written() == 6);
+    assert_eq!(f.state(), AttemptState::Active, "still running");
+    assert_eq!(f.output(), "onetwo");
+    assert!(reader.log_position(f.attempt(), "stdout").unwrap().last_seq > seq);
+    assert!(!f.output_of(f.attempt()).1.eof, "the spool is still open");
+    std::fs::write(&end, b"").unwrap();
+    assert_eq!(sup.wait().unwrap().code(), Some(code::SETTLED));
+    assert_eq!(f.term().outcome(), Outcome::Succeeded);
+    assert!(f.output_of(f.attempt()).1.eof);
+}
+
+#[test]
+fn a_spool_that_cannot_be_opened_interrupts_the_attempt_and_nothing_is_started() {
+    let f = fx(vec![]);
+    let marker = f.path("ran");
+    let mut spec = f.spec.clone();
+    spec.nodes = vec![node("n", &format!("touch '{}'", marker.display()))];
+    // The spool root is a file: no directory can be made below it.
+    std::fs::write(&spec.spool_root, b"in the way").unwrap();
+    let spec_path = write_spec(&f, &spec);
+    let mut sup = spawn_detached(&exe(), &spec_path).unwrap();
+    f.track(sup.id());
+    assert_eq!(sup.wait().unwrap().code(), Some(code::SETTLED));
+    assert_eq!(f.term().outcome(), Outcome::Interrupted);
+    assert_eq!(f.term().exit(), None);
+    assert!(
+        !marker.exists(),
+        "no command without a place for its output"
+    );
+    assert!(f.store.launches(f.attempt()).unwrap().is_empty());
+    let ev = f.events(f.attempt(), "spool_failed");
+    assert_eq!(ev.len(), 1, "{ev:?}");
+    assert_eq!(ev[0]["stage"], "open");
+    assert!(!ev[0]["error"].as_str().unwrap().is_empty());
+    assert!(f.store.get_result(f.attempt()).unwrap().is_none());
+    assert_eq!(std::fs::read(&spec.spool_root).unwrap(), b"in the way");
+}
+
+#[test]
+fn a_cancelled_attempt_whose_spool_cannot_be_opened_stays_cancelled() {
+    let f = fx(vec![node("n", "true")]);
+    std::fs::write(&f.spec.spool_root, b"").unwrap();
+    f.store.cancel(f.attempt(), CoordinatorEpoch(1), 5).unwrap();
+    let t = settled(&run(&f.spec).unwrap());
+    assert_eq!(t.outcome(), Outcome::Cancelled);
+    assert_eq!(f.events(f.attempt(), "spool_failed").len(), 1);
+}
+
+#[test]
+fn an_output_pipe_that_cannot_be_made_interrupts_the_attempt() {
+    let f = fx(vec![]);
+    let marker = f.path("ran");
+    let mut spec = f.spec.clone();
+    spec.nodes = vec![node("n", &format!("touch '{}'", marker.display()))];
+    // Something that is not a pipe sits where the node's pipe belongs.
+    let logs = spec.spool_root.join(f.attempt().to_string()).join("logs");
+    std::fs::create_dir_all(&logs).unwrap();
+    std::fs::write(logs.join("node-0.pipe"), b"not a pipe").unwrap();
+    let t = settled(&run(&spec).unwrap());
+    assert_eq!(t.outcome(), Outcome::Interrupted);
+    assert!(!marker.exists());
+    let ev = f.events(f.attempt(), "spool_failed");
+    assert_eq!(ev.len(), 1, "{ev:?}");
+    assert_eq!(ev[0]["stage"], "pipe");
+    // What was in the way is not removed or written through.
+    assert_eq!(
+        std::fs::read(logs.join("node-0.pipe")).unwrap(),
+        b"not a pipe"
+    );
+}
+
+#[test]
+fn workspace_warnings_become_events_once_and_bounded() {
+    let mut f = fx(vec![node("n", "true")]);
+    let long = "x".repeat(10_000);
+    let mut warnings = vec!["index not reproduced".to_string(), long];
+    warnings.extend((0..70).map(|i| format!("warning {i}")));
+    f.spec.workspace_warnings = warnings;
+    let t = settled(&run(&f.spec).unwrap());
+    assert_eq!(t.outcome(), Outcome::Succeeded);
+    let ev = f.events(f.attempt(), "workspace_warning");
+    assert_eq!(ev.len(), 65, "64 warnings and the count of the rest");
+    assert_eq!(ev[0]["message"], "index not reproduced");
+    assert_eq!(ev[1]["message"].as_str().unwrap().len(), 4096);
+    assert_eq!(ev[64]["message"], "8 more warnings omitted");
+    // A second start (the attempt is over) writes nothing more.
+    run(&f.spec).unwrap();
+    assert_eq!(f.events(f.attempt(), "workspace_warning").len(), 65);
+    // No warnings, no events.
+    let quiet = fx(vec![node("n", "true")]);
+    run(&quiet.spec).unwrap();
+    assert!(quiet
+        .events(quiet.attempt(), "workspace_warning")
+        .is_empty());
 }
 
 #[test]
@@ -712,6 +965,12 @@ fn a_killed_supervisor_leaves_the_command_for_recovery_to_stop() {
     wait_for("the orphan to be gone", || !alive(leader_pid));
     assert!(!alive(read_pid(&bg).unwrap()));
     assert_eq!(f.store.launches(f.attempt()).unwrap().len(), 1);
+    // Recovery resumed the dead supervisor's spool and closed it with the
+    // attempt: readers reach its end and the result is stored.
+    assert!(f.output_of(f.attempt()).1.eof);
+    let result = f.store.get_result(f.attempt()).unwrap().expect("a result");
+    assert_eq!(result["termination"]["outcome"], "interrupted");
+    assert!(f.events(f.attempt(), "spool_failed").is_empty());
 }
 
 #[test]

@@ -9,6 +9,16 @@
 //! process group when one of them says so. The result is fixed once, after
 //! the stop is confirmed.
 //!
+//! The commands' output goes to the attempt's log spool
+//! ([`super::spool`], through [`super::pump`]). While a command runs, every
+//! look (one per `poll_ms`: the supervisor's heartbeat) also makes the spool
+//! durable and stores its positions in the worker database; the result is
+//! fixed through [`finish_attempt`], which closes the spool first. A spool
+//! that cannot store the output (it cannot be opened, a write or the final
+//! sync fails) stops the command, is recorded as a `spool_failed` event and
+//! makes the attempt `interrupted`: its output is incomplete, so it is never
+//! reported as a success ([`after_spool_failure`]).
+//!
 //! When the command's processes cannot be confirmed stopped (even after a few
 //! bounded retries), the attempt is left non-terminal and the process exits
 //! with `UNRESOLVED` after recording a `supervisor_unresolved` event (reason
@@ -18,17 +28,27 @@
 //! the stop of the group (S10/S12 implement that loop).
 
 use super::error::{Result, SupervisorError};
+use super::outcome::{finish_attempt, sync_log_position, OutcomeError};
+use super::pump::{pump, Pipe};
 use super::spec::{command_id, spec_digest, NodeSpec, SuperviseSpec};
+use super::spool::{AttemptSpool, SpoolError};
+use super::spool_plan::{attempt_limit, warning_texts, MAX_WARNINGS, MAX_WARNING_BYTES};
 use super::stop::{
     group_alive, retries_for, stop_group_retrying, StopResult, StopTarget, StopTimes,
 };
-use super::termination::{may_continue, pick_reason, termination, StopReason};
+use super::termination::{after_spool_failure, may_continue, pick_reason, termination, StopReason};
 use super::{lease::LeaseClock, lease::LeaseStatus, timeouts};
-use crate::ids::{NodeId, WorkerBootId};
+use crate::ids::{AttemptId, NodeId, WorkerBootId};
 use crate::platform::{self, Inhibit};
 use crate::state::{AttemptState, Exit, Receipt, Termination};
-use crate::storage::{Finalized, LaunchClaim, ProcessIdentity, StorageError, WorkerStore};
+use crate::storage::{
+    Finalized, LaunchClaim, LogPosition, ProcessIdentity, StorageError, WorkerStore,
+};
+use crate::wire::LogStream;
 use serde_json::json;
+use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use task_traffic_controller::config::Config;
 use task_traffic_controller::context::Context;
@@ -143,6 +163,12 @@ pub(crate) fn finalize(
     attempt: &crate::ids::AttemptId,
     term: Termination,
 ) -> Result<Finalized> {
+    to_finalizing(store, attempt)?;
+    Ok(store.finalize(attempt, term, platform::wall_ms())?)
+}
+
+/// Move the attempt to `Finalizing` unless it is there or terminal already.
+fn to_finalizing(store: &WorkerStore, attempt: &AttemptId) -> Result<()> {
     for _ in 0..3 {
         let state = store.get(attempt)?.map(|a| a.state);
         match state {
@@ -162,7 +188,146 @@ pub(crate) fn finalize(
             }
         }
     }
-    Ok(store.finalize(attempt, term, platform::wall_ms())?)
+    Ok(())
+}
+
+/// Open (or, after a crash, resume) the attempt's spool with what the task's
+/// limit leaves it: the limit less what the task's other attempts stored.
+/// The inner error is the spool's own: the caller settles the attempt
+/// without a spool then ([`settle_without_spool`]).
+pub(crate) fn open_spool(
+    spec: &SuperviseSpec,
+    store: &WorkerStore,
+) -> Result<std::result::Result<AttemptSpool, SpoolError>> {
+    let others = store.log_bytes_of_other_attempts(&spec.attempt_id)?;
+    let limit = attempt_limit(spec.log_limit_bytes, others);
+    Ok(AttemptSpool::open(
+        &spec.spool_root,
+        &spec.attempt_id,
+        limit,
+    ))
+}
+
+/// Record that the spool failed at `stage`, once per stage.
+fn note_spool_failure(
+    store: &WorkerStore,
+    attempt: &AttemptId,
+    stage: &str,
+    why: &str,
+) -> Result<()> {
+    let Some(a) = store.get(attempt)? else {
+        return Ok(());
+    };
+    store.append_events_unseen(
+        Some(&a.run_id),
+        attempt,
+        "spool_failed",
+        "stage",
+        &[(stage.to_string(), json!({ "stage": stage, "error": why }))],
+        platform::wall_ms(),
+    )?;
+    Ok(())
+}
+
+/// Settle the attempt as `term`: close its spool, fix the termination and
+/// store the result ([`finish_attempt`]). When the spool cannot be completed
+/// the attempt is settled without it. Returns the termination that holds and
+/// whether this call fixed it.
+pub(crate) fn settle(
+    store: &WorkerStore,
+    root: &Path,
+    attempt: &AttemptId,
+    spool: &AttemptSpool,
+    term: Termination,
+) -> Result<(Termination, bool)> {
+    to_finalizing(store, attempt)?;
+    match finish_attempt(store, root, attempt, spool, term, &[], platform::wall_ms()) {
+        Ok(recorded) => {
+            let fixed = store
+                .get(attempt)?
+                .and_then(|a| a.termination)
+                .ok_or_else(|| {
+                    SupervisorError::State(format!(
+                        "attempt {attempt} was finished but is not terminal"
+                    ))
+                })?;
+            Ok((fixed, recorded.finalized))
+        }
+        Err(OutcomeError::SpoolFailed(e)) => {
+            settle_without_spool(store, attempt, "finish", &e.to_string(), term)
+        }
+        Err(OutcomeError::Storage(e)) => Err(e.into()),
+        Err(OutcomeError::Io(e)) => Err(e.into()),
+        Err(e) => Err(SupervisorError::State(e.to_string())),
+    }
+}
+
+/// Settle an attempt whose spool failed at `stage`: say so in the journal and
+/// fix what [`after_spool_failure`] makes of `term` (never a success). No
+/// result is stored: there is no complete output to describe.
+pub(crate) fn settle_without_spool(
+    store: &WorkerStore,
+    attempt: &AttemptId,
+    stage: &str,
+    why: &str,
+    term: Termination,
+) -> Result<(Termination, bool)> {
+    note_spool_failure(store, attempt, stage, why)?;
+    let fin = finalize(store, attempt, after_spool_failure(term))?;
+    Ok((fin.termination(), fin.won()))
+}
+
+/// The spool side of the supervisor's heartbeat.
+#[derive(Debug, Default)]
+pub(crate) struct SpoolBeat {
+    /// Why the spool can no longer store the output, once it cannot.
+    pub failure: Option<String>,
+    /// The positions the worker database holds.
+    synced: Option<(LogPosition, LogPosition)>,
+}
+
+impl SpoolBeat {
+    /// One heartbeat: make what the spool holds durable and store its
+    /// positions ([`sync_log_position`]); nothing is done when nothing was
+    /// appended since the last one. `pump_error` is what the thread feeding the
+    /// spool reported. A spool failure is recorded here (the event, then
+    /// `failure`) and is not an error of this call; a storage error is.
+    pub fn beat(
+        &mut self,
+        store: &WorkerStore,
+        attempt: &AttemptId,
+        spool: &AttemptSpool,
+        pump_error: Option<String>,
+    ) -> Result<()> {
+        if self.failure.is_some() {
+            return Ok(());
+        }
+        let failed = match pump_error {
+            Some(why) => Some(why),
+            None => {
+                let now: (LogPosition, LogPosition) = (
+                    spool.writer(LogStream::Stdout).status().into(),
+                    spool.writer(LogStream::Stderr).status().into(),
+                );
+                if self.synced == Some(now) {
+                    return Ok(());
+                }
+                match sync_log_position(store, attempt, spool) {
+                    Ok(stored) => {
+                        self.synced = Some(stored);
+                        None
+                    }
+                    Err(OutcomeError::Storage(e)) => return Err(e.into()),
+                    Err(e) => Some(e.to_string()),
+                }
+            }
+        };
+        if let Some(why) = failed {
+            note_spool_failure(store, attempt, "write", &why)?;
+            self.failure = Some(why);
+        }
+        Ok(())
+    }
 }
 
 /// Move to `to` when the state machine allows it from where the attempt is;
@@ -186,6 +351,10 @@ struct Control<'a> {
     traffic: Traffic,
     lease: LeaseClock,
     started_ms: u64,
+    spool: &'a AttemptSpool,
+    beat: SpoolBeat,
+    /// The first failure of a thread feeding the spool.
+    pump_error: Arc<Mutex<Option<String>>>,
 }
 
 impl Control<'_> {
@@ -240,6 +409,21 @@ impl Control<'_> {
         let spec = self.spec;
         let attempt = spec.attempt_id.clone();
         let id = command_id(&attempt, index);
+        // The pipe the command's output comes through. Without it nothing is
+        // registered or started.
+        let pipe = match Pipe::open(&Pipe::path_for(&spec.spool_root, &attempt, index)) {
+            Ok(p) => p,
+            Err(e) => {
+                let why = format!("the output pipe of node {}: {e}", node.node_id);
+                note_spool_failure(self.store, &attempt, "pipe", &why)?;
+                self.beat.failure = Some(why);
+                return Ok(NodeEnd {
+                    reason: Some(StopReason::SpoolFailed),
+                    exit: None,
+                    unconfirmed: false,
+                });
+            }
+        };
         let opts = Opts {
             weight: node.weight,
             front: false,
@@ -247,7 +431,7 @@ impl Control<'_> {
             argv: node.argv.clone(),
             cwd: node.cwd.clone(),
             env: Some(node.env.clone()),
-            stdout_log: node.stdout_log.clone(),
+            stdout_log: Some(pipe.path().to_path_buf()),
         };
         let limits = self.traffic.cfg.limits();
         let registration = managed::register(
@@ -331,7 +515,58 @@ impl Control<'_> {
             }
             Err(e) => return Err(e.into()),
         }
-        self.run_admitted(guard, &opts, node, &id, limits)
+        self.run_piped(guard, &opts, node, &id, limits, &pipe)
+    }
+
+    /// Run the admitted command with its output pumped into the spool, and
+    /// leave the spool's positions stored when it is over.
+    fn run_piped(
+        &mut self,
+        guard: managed::OwnerGuard,
+        opts: &Opts,
+        node: &NodeSpec,
+        id: &str,
+        limits: task_traffic_controller::admit::Limits,
+        pipe: &Pipe,
+    ) -> Result<NodeEnd> {
+        let out = self.spool.writer(LogStream::Stdout);
+        let error = Arc::clone(&self.pump_error);
+        let done = AtomicBool::new(false);
+        let end = std::thread::scope(|s| {
+            let feeder = s.spawn(|| pump(pipe, out, &done, &error));
+            let end = self.run_admitted(guard, opts, node, id, limits);
+            // The command is over (or given up on): what it wrote is read to
+            // the end, within a bound.
+            done.store(true, Ordering::SeqCst);
+            if feeder.join().is_err() {
+                error
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .get_or_insert_with(|| "the output reader panicked".into());
+            }
+            end
+        });
+        let mut end = end?;
+        match self.heartbeat() {
+            // The final positions are stored again when the attempt is settled.
+            Err(SupervisorError::Storage(e)) if e.is_retryable() => {}
+            other => other?,
+        }
+        if self.beat.failure.is_some() {
+            // Output was lost: whatever the command did, nothing follows it.
+            end.reason.get_or_insert(StopReason::SpoolFailed);
+        }
+        Ok(end)
+    }
+
+    fn heartbeat(&mut self) -> Result<()> {
+        let pump_error = self
+            .pump_error
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        self.beat
+            .beat(self.store, &self.spec.attempt_id, self.spool, pump_error)
     }
 
     /// Stop before anything was started: release the registration.
@@ -449,6 +684,13 @@ impl Control<'_> {
                 self.note_not_recorded(&node.node_id, t.pid)?;
                 w.noted = true;
             }
+        }
+        self.heartbeat()?;
+        if w.reason.is_none() && self.beat.failure.is_some() {
+            // The output can no longer be stored: the command is stopped
+            // rather than left to run with its output lost.
+            w.reason = Some(StopReason::SpoolFailed);
+            self.begin_stop(StopReason::SpoolFailed)?;
         }
         if w.reason.is_none() {
             let stage = timeouts::Stage::Running {
@@ -591,6 +833,44 @@ pub fn run(spec: &SuperviseSpec) -> Result<Report> {
         platform::wall_ms(),
     )?;
 
+    let warnings: Vec<_> = warning_texts(&spec.workspace_warnings, MAX_WARNINGS, MAX_WARNING_BYTES)
+        .into_iter()
+        .map(|m| (m.clone(), json!({ "message": m })))
+        .collect();
+    store.append_events_unseen(
+        Some(&rec.run_id),
+        attempt,
+        "workspace_warning",
+        "message",
+        &warnings,
+        platform::wall_ms(),
+    )?;
+
+    let spool = match open_spool(spec, &store)? {
+        Ok(s) => s,
+        Err(e) => {
+            // Nothing is started without a place for its output.
+            let reason =
+                (rec.cancel_requested_at_ms.is_some() || rec.retired).then_some(StopReason::Cancel);
+            if reason.is_some() {
+                move_to(&store, attempt, AttemptState::Cancelling)?;
+            }
+            let (termination, finalized_here) = settle_without_spool(
+                &store,
+                attempt,
+                "open",
+                &e.to_string(),
+                termination(reason, None),
+            )?;
+            return Ok(Report {
+                termination: Some(termination),
+                finalized_here,
+                unresolved: None,
+                sleep_inhibit,
+            });
+        }
+    };
+
     let now = platform::monotonic_ms();
     let applied = store.lease(attempt)?.map(|(k, _)| k);
     let mut ctl = Control {
@@ -599,6 +879,9 @@ pub fn run(spec: &SuperviseSpec) -> Result<Report> {
         traffic: Traffic::open(spec)?,
         lease: LeaseClock::start(now, spec.lease_ms, spec.poll_ms, applied),
         started_ms: now,
+        spool: &spool,
+        beat: SpoolBeat::default(),
+        pump_error: Arc::default(),
     };
     let mut end = NodeEnd {
         reason: None,
@@ -626,11 +909,7 @@ pub fn run(spec: &SuperviseSpec) -> Result<Report> {
         );
     }
     let term = termination(end.reason, end.exit);
-    let fin = finalize(&store, attempt, term)?;
-    let (termination, finalized_here) = match fin {
-        Finalized::Won(t) => (t, true),
-        Finalized::AlreadyTerminal(t) => (t, false),
-    };
+    let (termination, finalized_here) = settle(&store, &spec.spool_root, attempt, &spool, term)?;
     Ok(Report {
         termination: Some(termination),
         finalized_here,

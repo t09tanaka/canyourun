@@ -12,6 +12,8 @@ use std::path::{Path, PathBuf};
 /// Spec chapter 12 defaults.
 pub const DEFAULT_LEASE_MS: u64 = 60_000;
 pub const DEFAULT_TERM_GRACE_MS: u64 = 10_000;
+/// The spec's default cap on the log bytes one task may store on a worker.
+pub const DEFAULT_LOG_LIMIT_BYTES: u64 = 1 << 30;
 const DEFAULT_KILL_WAIT_MS: u64 = 10_000;
 const DEFAULT_POLL_MS: u64 = 200;
 
@@ -30,8 +32,12 @@ fn d_poll() -> u64 {
 fn d_true() -> bool {
     true
 }
+fn d_log_limit() -> u64 {
+    DEFAULT_LOG_LIMIT_BYTES
+}
 
-/// One command of the attempt (a step, a setup builder, ...).
+/// One command of the attempt (a step, a setup builder, ...). Its stdout and
+/// stderr go to the attempt's log spool (stdin is `/dev/null`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NodeSpec {
     pub node_id: NodeId,
@@ -41,11 +47,6 @@ pub struct NodeSpec {
     /// environment is inherited.
     #[serde(default)]
     pub env: BTreeMap<String, String>,
-    /// Where the command's stdout and stderr are appended (stdin is
-    /// `/dev/null`). The log spool reads from here. `None` inherits the
-    /// supervisor's own, which is the null device when it runs detached.
-    #[serde(default)]
-    pub stdout_log: Option<PathBuf>,
     #[serde(default)]
     pub weight: Option<u32>,
 }
@@ -85,6 +86,17 @@ pub struct SuperviseSpec {
     /// Hold an idle-sleep inhibition while running.
     #[serde(default = "d_true")]
     pub inhibit_sleep: bool,
+    /// The root of the worker's log spool and artifact store: the output of
+    /// every node is stored under `<spool_root>/<attempt>/logs`.
+    pub spool_root: PathBuf,
+    /// The cap on the log bytes the task may store on this worker, all its
+    /// attempts together. This attempt gets what the others left.
+    #[serde(default = "d_log_limit")]
+    pub log_limit_bytes: u64,
+    /// What the workspace creation could not do (`Workspace.warnings`); the
+    /// supervisor writes them to the event journal when it starts.
+    #[serde(default)]
+    pub workspace_warnings: Vec<String>,
 }
 
 impl SuperviseSpec {
@@ -105,6 +117,11 @@ impl SuperviseSpec {
             || self.deadline_ms == Some(0)
         {
             return bad("a timeout of zero is not a timeout");
+        }
+        if !self.spool_root.is_absolute() {
+            // A relative root would follow whatever directory the supervisor
+            // happens to run in.
+            return bad("spool_root must be an absolute path");
         }
         let mut seen = std::collections::BTreeSet::new();
         for n in &self.nodes {
@@ -172,7 +189,6 @@ mod tests {
             argv: vec!["true".into()],
             cwd: "/".into(),
             env: BTreeMap::new(),
-            stdout_log: None,
             weight: None,
         }
     }
@@ -193,6 +209,9 @@ mod tests {
             resource_wait_timeout_ms: None,
             deadline_ms: None,
             inhibit_sleep: false,
+            spool_root: "/spool".into(),
+            log_limit_bytes: DEFAULT_LOG_LIMIT_BYTES,
+            workspace_warnings: vec![],
         }
     }
 
@@ -205,13 +224,15 @@ mod tests {
         assert_eq!(back, s);
         let minimal = serde_json::json!({
             "state_dir": "/s", "worker_id": "w", "attempt_id": s.attempt_id,
-            "traffic_state_dir": "/t",
+            "traffic_state_dir": "/t", "spool_root": "/spool",
             "nodes": [{"node_id": "a", "argv": ["true"], "cwd": "/"}],
         });
         let m: SuperviseSpec = serde_json::from_value(minimal).unwrap();
         assert_eq!(m.lease_ms, 60_000);
         assert_eq!(m.term_grace_ms, 10_000);
         assert!(m.inhibit_sleep);
+        assert_eq!(m.log_limit_bytes, 1 << 30);
+        assert!(m.workspace_warnings.is_empty());
         assert_eq!(m.traffic_config_path(), PathBuf::from("/t/config.toml"));
     }
 
@@ -219,6 +240,9 @@ mod tests {
     fn bad_specs_are_refused() {
         let mut s = spec();
         s.nodes.clear();
+        assert!(s.validate().is_err());
+        let mut s = spec();
+        s.spool_root = "spool".into();
         assert!(s.validate().is_err());
         let mut s = spec();
         s.lease_ms = 0;
