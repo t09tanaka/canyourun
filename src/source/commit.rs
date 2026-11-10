@@ -15,12 +15,38 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 fn run(env: &BTreeMap<String, String>, cwd: &Path, args: &[&str]) -> Result<String> {
+    run_with(env, cwd, args, &[])
+}
+
+/// The commands that write the scratch repository ignore the user's and the
+/// system's Git configuration: a checkout must leave the committed bytes as
+/// they are (an LFS pointer stays a pointer, no smudge filter reaches for the
+/// network); the capture reads the payload from the LFS store itself.
+fn run_scratch(env: &BTreeMap<String, String>, cwd: &Path, args: &[&str]) -> Result<String> {
+    run_with(
+        env,
+        cwd,
+        args,
+        &[
+            ("GIT_CONFIG_NOSYSTEM", "1"),
+            ("GIT_CONFIG_GLOBAL", "/dev/null"),
+        ],
+    )
+}
+
+fn run_with(
+    env: &BTreeMap<String, String>,
+    cwd: &Path,
+    args: &[&str],
+    extra: &[(&str, &str)],
+) -> Result<String> {
     let out = Command::new("git")
         .args(["-c", "protocol.file.allow=always"])
         .args(args)
         .current_dir(cwd)
         .env_clear()
         .envs(env)
+        .envs(extra.iter().copied())
         .env("GIT_TERMINAL_PROMPT", "0")
         .output()
         .context("cannot run git")?;
@@ -97,7 +123,7 @@ pub(crate) fn checkout(
         root: root.clone(),
         base: base.clone(),
     };
-    run(env, &root, &["init", "-q"])?;
+    run_scratch(env, &root, &["init", "-q"])?;
     let src = top.to_string_lossy().into_owned();
     let mut fetch = vec![
         "-c",
@@ -112,11 +138,11 @@ pub(crate) fn checkout(
     if let Some(b) = &base {
         fetch.push(b);
     }
-    run(env, &root, &fetch)?;
+    run_scratch(env, &root, &fetch)?;
     if let Ok(url) = run(env, &top, &["config", "--get", "remote.origin.url"]) {
-        run(env, &root, &["remote", "add", "origin", &url])?;
+        run_scratch(env, &root, &["remote", "add", "origin", &url])?;
     }
-    run(env, &root, &["checkout", "-q", "--detach", &commit])?;
+    run_scratch(env, &root, &["checkout", "-q", "--detach", &commit])?;
     // LFS payloads the original has stay where the capture looks for them
     let common = run(env, &top, &["rev-parse", "--git-common-dir"])?;
     let lfs = top.join(common).join("lfs");
