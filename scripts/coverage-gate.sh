@@ -21,6 +21,11 @@ want = {
     "src/source/safety.rs",
     "src/source/classify.rs",
     "src/source/diff.rs",
+    "src/protocol/frame.rs",
+    "src/protocol/sched.rs",
+    "src/protocol/hello.rs",
+    "src/protocol/chunk.rs",
+    "src/protocol/ssh.rs",
 }
 seen = set()
 bad = []

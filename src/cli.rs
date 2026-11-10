@@ -193,6 +193,11 @@ impl Envelope {
 
 /// Run a parsed command and return the process exit code.
 pub fn run(cli: Cli) -> i32 {
+    if let Command::Worker(args) = &cli.command {
+        if args.stdio && !args.ephemeral {
+            return run_worker_stdio();
+        }
+    }
     let envelope = Envelope::not_implemented();
     if cli.json {
         let line = serde_json::to_string(&envelope).expect("envelope serializes");
@@ -201,6 +206,51 @@ pub fn run(cli: Cli) -> i32 {
         eprintln!("error: {}", envelope.error.message);
     }
     ErrorCode::NotImplemented.exit_code()
+}
+
+/// `worker --stdio`: relay stdin and stdout to the worker agent's Unix socket.
+/// stdout carries protocol bytes only, so every diagnostic goes to stderr and
+/// `--json` is not honoured here. This is the one place the process environment
+/// is read (to find the socket); the rest of the crate takes a map.
+fn run_worker_stdio() -> i32 {
+    use crate::protocol::transport::{bridge, default_agent_socket, BridgeError};
+    // Only HOME is read, with `var_os`: `std::env::vars()` panics on any
+    // non-UTF-8 variable, and a bridge started under an odd environment must
+    // still work. A HOME that is not UTF-8 cannot be a worker socket path here.
+    let mut env = std::collections::BTreeMap::new();
+    if let Some(home) = std::env::var_os("HOME").and_then(|h| h.into_string().ok()) {
+        env.insert("HOME".to_string(), home);
+    }
+    let Some(socket) = default_agent_socket(&env) else {
+        eprintln!("error: cannot locate the worker agent socket: HOME is not set");
+        return ErrorCode::InvalidInput.exit_code();
+    };
+    let runtime = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(e) => {
+            eprintln!("error: cannot start the runtime: {e}");
+            return exit::FAILURE;
+        }
+    };
+    let result = runtime.block_on(bridge(&socket, tokio::io::stdin(), tokio::io::stdout()));
+    // `tokio::io::stdin` reads on a blocking thread. When the agent closes
+    // first, that read may be parked on a stdin the peer keeps open, and a plain
+    // drop of the runtime would wait for it forever.
+    runtime.shutdown_background();
+    match result {
+        Ok(()) => exit::SUCCESS,
+        Err(e @ BridgeError::AgentNotRunning { .. }) => {
+            eprintln!("error: {e}");
+            ErrorCode::NotFound.exit_code()
+        }
+        Err(e) => {
+            eprintln!("error: {e}");
+            exit::FAILURE
+        }
+    }
 }
 
 /// Entry point used by the binary: parse arguments, run, return the exit code.
