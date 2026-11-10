@@ -9,6 +9,7 @@ mod proto_common;
 use proto_common::client_cfg;
 use remote_task_runner::error::{ApiError, ErrorCode};
 use remote_task_runner::ids::*;
+use remote_task_runner::platform::{signal_pid, signal_process_group};
 use remote_task_runner::protocol::transport::duplex_pair;
 use remote_task_runner::protocol::{connect, CallError, Client};
 use remote_task_runner::state::{AttemptState, Outcome};
@@ -197,16 +198,28 @@ impl Drop for Fx {
         if let Ok(store) = WorkerStore::open_read_only(&state) {
             for rec in store.list_attempts(None, true, 500).unwrap_or_default() {
                 for (_, _, ident) in store.launches(&rec.attempt_id).unwrap_or_default() {
-                    if let Some(i) = ident {
-                        unsafe { libc::kill(-(i.pid as i32), libc::SIGKILL) };
+                    if let Some(pgid) = ident.and_then(|i| i32::try_from(i.pid).ok()) {
+                        kill_group(pgid);
                     }
                 }
             }
         }
         for pid in pgrep(&state.to_string_lossy()) {
-            unsafe { libc::kill(pid, libc::SIGKILL) };
+            kill_pid(pid);
         }
     }
+}
+
+/// SIGKILL through the guarded helpers only: they refuse pid 0, 1 and
+/// anything that would wrap to a negative pid.
+fn kill_pid(pid: i32) {
+    if let Ok(p) = u32::try_from(pid) {
+        signal_pid(p, libc::SIGKILL);
+    }
+}
+
+fn kill_group(pgid: i32) {
+    signal_process_group(pgid, libc::SIGKILL);
 }
 
 fn pgrep(pattern: &str) -> Vec<i32> {
@@ -221,7 +234,7 @@ fn pgrep(pattern: &str) -> Vec<i32> {
 }
 
 fn alive(pid: i32) -> bool {
-    unsafe { libc::kill(pid, 0) == 0 }
+    u32::try_from(pid).is_ok_and(|p| signal_pid(p, 0))
 }
 
 fn wait_for(what: &str, f: impl Fn() -> bool) {
@@ -638,7 +651,7 @@ async fn a23_a_dead_supervisor_is_recovered_and_the_command_is_not_started_again
     let pid = read_pid(&pidfile).unwrap();
     agent.shutdown();
     for s in f.supervisors(&a) {
-        unsafe { libc::kill(s, libc::SIGKILL) };
+        kill_pid(s);
     }
     wait_for("the supervisor to die", || f.supervisors(&a).is_empty());
     assert!(alive(pid), "the command outlives its supervisor");
@@ -682,9 +695,9 @@ async fn a24_a_changed_boot_id_interrupts_everything_and_a_retry_runs() {
     // killed and the next agent is told another boot ID.)
     agent.shutdown();
     for s in f.supervisors(&running) {
-        unsafe { libc::kill(s, libc::SIGKILL) };
+        kill_pid(s);
     }
-    unsafe { libc::kill(-pid, libc::SIGKILL) };
+    kill_group(pid);
     wait_for("the processes to die", || {
         f.supervisors(&running).is_empty() && !alive(pid)
     });
@@ -1589,7 +1602,7 @@ async fn an_attempt_nobody_can_recover_is_unknown_until_a_retire_after_a_reboot(
     });
     agent.shutdown();
     for s in f.supervisors(&a) {
-        unsafe { libc::kill(s, libc::SIGKILL) };
+        kill_pid(s);
     }
     wait_for("the supervisor to die", || f.supervisors(&a).is_empty());
     std::fs::remove_file(
