@@ -46,11 +46,17 @@ pub fn check_payload(p: &AttemptPayload) -> Result<(), &'static str> {
         if c.argv.first().is_none_or(|a| a.is_empty()) {
             return Err("a command is empty");
         }
+        // The supervisor has one command timeout for the attempt and runs
+        // the commands in the order given. Anything else would be dropped
+        // silently, so it is refused.
+        if c.timeout_ms.is_some() && c.timeout_ms != p.command_timeout_ms {
+            return Err("a per-command timeout must equal command_timeout_ms");
+        }
+        if c.depends_on.iter().any(|d| !seen.contains(d.as_str())) {
+            return Err("depends_on must name an earlier command");
+        }
         if !seen.insert(c.node_id.as_str()) {
             return Err("a node_id is used twice");
-        }
-        if c.timeout_ms == Some(0) {
-            return Err("a timeout of zero is not a timeout");
         }
         bytes += c.cwd.len();
         bytes += c.argv.iter().map(String::len).sum::<usize>();
@@ -329,10 +335,13 @@ mod tests {
             (&|p: &mut AttemptPayload| p.command_timeout_ms = Some(0)) as &dyn Fn(&mut _),
             &|p: &mut AttemptPayload| p.deadline_ms = Some(0),
             &|p: &mut AttemptPayload| p.resource_wait_timeout_ms = Some(0),
-            &|p: &mut AttemptPayload| p.commands[0].timeout_ms = Some(0),
         ] {
             assert_eq!(bad(f), "a timeout of zero is not a timeout");
         }
+        // Exactly the limit is allowed.
+        let mut full = payload();
+        full.commands = (0..MAX_COMMANDS).map(|i| cmd(&format!("n{i}"))).collect();
+        assert_eq!(check_payload(&full), Ok(()));
         assert_eq!(bad(&|p| p.commands[0].argv.clear()), "a command is empty");
         assert_eq!(
             bad(&|p| p.commands[0].argv[0].clear()),
@@ -342,6 +351,36 @@ mod tests {
             bad(&|p| p.commands.push(cmd("a"))),
             "a node_id is used twice"
         );
+    }
+
+    #[test]
+    fn what_the_supervisor_cannot_honour_is_refused() {
+        let timeout = "a per-command timeout must equal command_timeout_ms";
+        let mut p = payload();
+        p.commands[0].timeout_ms = Some(5);
+        assert_eq!(check_payload(&p), Err(timeout));
+        p.command_timeout_ms = Some(6);
+        assert_eq!(check_payload(&p), Err(timeout));
+        p.command_timeout_ms = Some(5);
+        assert_eq!(check_payload(&p), Ok(()));
+        p.commands[0].timeout_ms = None;
+        assert_eq!(check_payload(&p), Ok(()));
+
+        let order = "depends_on must name an earlier command";
+        let dep = |of: usize, on: &str| {
+            let mut p = payload();
+            p.commands.push(cmd("b"));
+            p.commands.push(cmd("c"));
+            p.commands[of].depends_on = vec![NodeId::parse(on).unwrap()];
+            check_payload(&p)
+        };
+        assert_eq!(dep(1, "a"), Ok(()));
+        assert_eq!(dep(2, "a"), Ok(()));
+        assert_eq!(dep(2, "b"), Ok(()));
+        assert_eq!(dep(0, "b"), Err(order));
+        assert_eq!(dep(1, "c"), Err(order));
+        assert_eq!(dep(1, "b"), Err(order));
+        assert_eq!(dep(1, "nowhere"), Err(order));
     }
 
     #[test]

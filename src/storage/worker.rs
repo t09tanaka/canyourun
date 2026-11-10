@@ -297,6 +297,17 @@ impl WorkerStore {
         &self.worker_id
     }
 
+    /// The highest coordinator epoch a request carried so far.
+    pub fn max_coordinator_epoch(&self) -> Result<CoordinatorEpoch> {
+        self.db.call(|c| {
+            let e: i64 =
+                c.query_row("SELECT max_coordinator_epoch FROM worker_state", [], |r| {
+                    r.get(0)
+                })?;
+            Ok(CoordinatorEpoch(to_u64(e)?))
+        })
+    }
+
     /// A new agent process started: bump the agent epoch.
     pub fn start_agent(&self, at_ms: u64) -> Result<AgentEpoch> {
         self.db.write(move |tx| {

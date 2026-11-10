@@ -1,9 +1,9 @@
 //! The real [`Host`]: the source store, fast-worktree workspaces and the
 //! secret files of this worker's state directory.
 //!
-//! The source of a run has to be in the worker's store, bound to the run,
-//! before its attempt is prepared; how it gets there (the blob operations of
-//! the protocol) is not this module's concern.
+//! The source an attempt names has to be in the worker's store before the
+//! attempt is prepared; how it gets there (the blob operations of the
+//! protocol) is not this module's concern.
 
 use super::host::Host;
 use crate::error::{ApiError, ErrorCode};
@@ -14,6 +14,7 @@ use crate::secrets::key;
 use crate::secrets::place::WorkerSecrets;
 use crate::secrets::vault::Vault;
 use crate::secrets::SecretError;
+use crate::source::classify::ci_id_of;
 use crate::source::SourceStore;
 use crate::storage::AcceptedAttempt;
 use crate::wire::{AttemptPayload, SecretFile};
@@ -55,23 +56,34 @@ impl Machine {
         })
     }
 
+    /// The manifest of the source the attempt's payload names, and only if
+    /// it is the manifest the payload names.
     fn manifest(&self, attempt: &AcceptedAttempt) -> Result<CiManifest, ApiError> {
-        let run = &attempt.run_id;
+        let payload: AttemptPayload = serde_json::from_value(attempt.spec.clone())
+            .map_err(|e| internal("stored payload", e))?;
         let missing = || {
             ApiError::new(
                 ErrorCode::NotFound,
-                format!("the source of run {run} is not in this worker's store"),
+                format!("source {} is not in this worker's store", payload.source_id),
             )
         };
-        let source = self
+        let source = ci_id_of(&payload.source_id).ok_or_else(missing)?;
+        let m = self
             .store
-            .source_of_run(run)
-            .map_err(|e| internal("source store", format!("{e:#}")))?
-            .ok_or_else(missing)?;
-        self.store
             .manifest(&source)
             .map_err(|e| internal("source store", format!("{e:#}")))?
-            .ok_or_else(missing)
+            .ok_or_else(missing)?;
+        let want = payload.manifest_digest.as_str();
+        if m.manifest_digest != want && format!("sha256:{}", m.manifest_digest) != want {
+            return Err(ApiError::new(
+                ErrorCode::Conflict,
+                format!(
+                    "source {} has another manifest than the attempt names",
+                    payload.source_id
+                ),
+            ));
+        }
+        Ok(m)
     }
 }
 

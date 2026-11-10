@@ -25,7 +25,10 @@ pub fn identity(agent: &Agent) -> WorkerIdentity {
         agent_epoch: agent.agent_epoch(),
         profile: cfg.profile.clone(),
         profile_fingerprint: cfg.profile_fingerprint.clone(),
-        coordinator_epoch: CoordinatorEpoch(0),
+        coordinator_epoch: agent
+            .store()
+            .max_coordinator_epoch()
+            .unwrap_or(CoordinatorEpoch(0)),
     }
 }
 
@@ -42,12 +45,13 @@ pub async fn serve_connection(
     };
     let mut incoming = accepted.incoming;
     loop {
-        // Take a permit before a request: what cannot run yet stays queued
-        // where the protocol layer counts it.
-        let Ok(permit) = permits.clone().acquire_owned().await else {
+        let Some(InboundRequest { request, responder }) = incoming.next().await else {
             return Ok(());
         };
-        let Some(InboundRequest { request, responder }) = incoming.next().await else {
+        // No further request is taken from this connection until this one
+        // may run: what cannot run yet stays queued where the protocol layer
+        // counts it. An idle connection holds no permit.
+        let Ok(permit) = permits.clone().acquire_owned().await else {
             return Ok(());
         };
         let agent = agent.clone();

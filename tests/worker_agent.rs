@@ -424,6 +424,13 @@ async fn the_same_attempt_with_another_payload_is_a_conflict() {
         .await
         .unwrap_err();
     assert_eq!(e.code, ErrorCode::InvalidInput);
+    // So is a per-command timeout the supervisor would not apply.
+    let mut timed = p.clone();
+    timed.commands[0].timeout_ms = Some(1_000);
+    let e = call(&c, submit_req(&AttemptId::generate(), &timed))
+        .await
+        .unwrap_err();
+    assert_eq!(e.code, ErrorCode::InvalidInput);
 
     // The stored attempt is still the first payload.
     let stored: AttemptPayload = serde_json::from_value(f.rec(&a).spec).unwrap();
@@ -1141,10 +1148,10 @@ async fn the_real_host_runs_the_command_in_the_snapshot_of_the_run_and_removes_i
     std::fs::create_dir_all(plain.join("sub")).unwrap();
     std::fs::write(plain.join("sub/x.txt"), "from the snapshot\n").unwrap();
 
-    // The source of the run is in the worker's store, bound to the run.
+    // The source of the run is in the worker's store.
     let run = RunId::generate();
     let store = SourceStore::open(&state).unwrap();
-    capture_for_run(
+    let captured = capture_for_run(
         &env,
         &store,
         &run,
@@ -1169,6 +1176,11 @@ async fn the_real_host_runs_the_command_in_the_snapshot_of_the_run_and_removes_i
     let out = f.path("out");
     let mut p = payload(&format!("pwd > {0}; cat x.txt >> {0}", out.display()));
     p.run_id = run;
+    p.source_id = captured.manifest.source_id.clone();
+    let digest = &captured.manifest.manifest_digest;
+    p.manifest_digest = Digest::parse(digest)
+        .or_else(|_| Digest::parse(&format!("sha256:{digest}")))
+        .unwrap();
     p.commands[0].cwd = "sub".into();
     let a = AttemptId::generate();
     submit(&c, &a, &p).await;
@@ -1182,11 +1194,17 @@ async fn the_real_host_runs_the_command_in_the_snapshot_of_the_run_and_removes_i
     wait_for("the workspace to go", || !cwd.exists());
     assert!(plain.join("sub/x.txt").exists());
 
-    // A run whose source never arrived fails as such; nothing is started.
-    let b = AttemptId::generate();
-    let mut q = payload("true");
-    q.task_id = TaskId::generate();
-    submit(&c, &b, &q).await;
-    assert_eq!(f.wait_terminal(&b), Outcome::Failed);
-    assert!(f.store().launches(&b).unwrap().is_empty());
+    // A source that never arrived, and a source whose manifest is not the
+    // one the attempt names, fail as such; nothing is started.
+    let absent = payload("true");
+    let mut other_manifest = p.clone();
+    other_manifest.task_id = TaskId::generate();
+    other_manifest.manifest_digest = Digest::of_bytes(b"another manifest");
+    for q in [absent, other_manifest] {
+        let b = AttemptId::generate();
+        submit(&c, &b, &q).await;
+        assert_eq!(f.wait_terminal(&b), Outcome::Failed);
+        assert!(f.store().launches(&b).unwrap().is_empty());
+        assert!(!state.join("workspaces").join(b.as_str()).exists());
+    }
 }
