@@ -27,7 +27,7 @@ use crate::storage::{
 use crate::supervisor::lock::SupervisorLock;
 use crate::supervisor::outcome::drain_pending_deletes;
 use crate::supervisor::process::spawn_detached;
-use crate::supervisor::spec::{NodeSpec, SuperviseSpec};
+use crate::supervisor::spec::{MaskValues, NodeSpec, SuperviseSpec, DEFAULT_LOG_LIMIT_BYTES};
 use crate::supervisor::spool::{SpoolError, SpoolReader};
 use crate::supervisor::termination::{termination, StopReason};
 use crate::wire::*;
@@ -308,9 +308,13 @@ fn invalid(m: impl Into<String>) -> ApiError {
     ApiError::new(ErrorCode::InvalidInput, m)
 }
 
+/// The file is this user's alone (0600): the supervisor refuses a spec that
+/// anybody else could read or that somebody else wrote.
 fn write_atomic(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let dir = path.parent().expect("a file has a parent");
     let mut tmp = tempfile::NamedTempFile::new_in(dir)?;
+    tmp.as_file()
+        .set_permissions(fs::Permissions::from_mode(0o600))?;
     tmp.write_all(bytes)?;
     tmp.as_file().sync_all()?;
     tmp.persist(path).map_err(|e| e.error)?;
@@ -1013,7 +1017,6 @@ impl Agent {
                 argv: c.argv.clone(),
                 cwd: ws.cwd.join(rel),
                 env: c.env.clone(),
-                stdout_log: None,
                 weight: None,
             });
         }
@@ -1033,6 +1036,13 @@ impl Agent {
             // What is left of it is written when the supervisor is started.
             deadline_ms: payload.deadline_ms,
             inhibit_sleep: self.cfg.inhibit_sleep,
+            // The spool and this file share `<state_dir>/attempts/<attempt>`.
+            spool_root: Some(self.cfg.attempts_root()),
+            log_limit_bytes: DEFAULT_LOG_LIMIT_BYTES,
+            workspace_warnings: ws.warnings.clone(),
+            // Nothing is masked yet: the values of the secret bundle are
+            // passed here once the agent keeps them.
+            mask: MaskValues::default(),
         };
         spec.validate().map_err(|e| invalid(e.to_string()))?;
         let bytes = serde_json::to_vec(&spec).map_err(|e| internal("supervisor spec", e))?;

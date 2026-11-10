@@ -825,32 +825,20 @@ async fn nothing_is_collected_as_garbage_before_ack_collected() {
     let agent = f.start_with(cfg);
     let c = f.connect(&agent).await;
     let a = AttemptId::generate();
-    submit(&c, &a, &payload("true")).await;
+    submit(&c, &a, &payload("echo output")).await;
     assert_eq!(f.wait_terminal(&a), Outcome::Succeeded);
 
-    // A log file of the attempt, referenced the way the supervisor does.
+    // The supervisor stored the command's output and references it.
     let logs = f.state().join("attempts").join(a.as_str()).join("logs");
-    std::fs::create_dir_all(&logs).unwrap();
-    std::fs::write(logs.join("stdout.log"), b"output").unwrap();
-    agent
-        .store()
-        .add_blob_ref(
-            &NewBlobRef {
-                ref_id: format!("{a}/logs"),
-                attempt_id: a.to_string(),
-                kind: BlobKind::Log,
-                locator: format!("{a}/logs"),
-            },
-            1,
-        )
-        .unwrap();
+    let stored = || std::fs::read_dir(&logs).is_ok_and(|mut d| d.next().is_some());
+    assert!(stored(), "the output of the command is in the spool");
 
     std::thread::sleep(Duration::from_millis(5));
     for _ in 0..3 {
         let report = agent.gc().unwrap();
         assert!(report.removed.is_empty(), "{report:?}");
         agent.tick();
-        assert!(logs.join("stdout.log").exists());
+        assert!(stored());
     }
 
     let get = |generation| {
@@ -880,7 +868,7 @@ async fn nothing_is_collected_as_garbage_before_ack_collected() {
     let e = call(&c, ack(Digest::of_bytes(b"other"))).await.unwrap_err();
     assert_eq!(e.code, ErrorCode::Conflict);
     assert!(agent.gc().unwrap().removed.is_empty());
-    assert!(logs.join("stdout.log").exists());
+    assert!(stored());
 
     for _ in 0..2 {
         let Response::AckCollected(r) = call(&c, ack(result.result_digest.clone())).await.unwrap()
