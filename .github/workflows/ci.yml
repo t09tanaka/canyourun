@@ -1,0 +1,73 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: fmt, clippy, test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: cargo fmt --check
+        run: cargo fmt --all --check
+      - name: cargo clippy
+        run: cargo clippy --all-targets -- -D warnings
+      - name: cargo test
+        run: cargo test
+
+  msrv:
+    name: MSRV (1.89)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.89"
+      - run: cargo check --all-targets
+
+  coverage:
+    name: coverage gate (pure modules)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - uses: taiki-e/install-action@cargo-llvm-cov
+      - uses: Swatinem/rust-cache@v2
+      - name: 100% line coverage on the listed pure modules
+        run: ./scripts/coverage-gate.sh
+
+  # The target list is empty until pure modules exist; add files to PURE below
+  # (and to the coverage gate) as they land.
+  mutants-pure:
+    name: mutation gate (pure modules)
+    runs-on: ubuntu-latest
+    env:
+      PURE: ""
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: install cargo-schemata
+        run: command -v cargo-schemata || cargo install cargo-schemata --locked --version 0.1.0
+      - name: every target file has mutants, zero survivors
+        run: |
+          if [ -z "$PURE" ]; then echo "no pure modules yet"; exit 0; fi
+          scripts/mutation-targets-check.sh $PURE
+          args=""; for f in $PURE; do args="$args --file $f"; done
+          cargo schemata $args -- --lib
