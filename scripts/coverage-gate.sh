@@ -31,6 +31,11 @@ want = {
     "src/secrets/plan.rs",
     "src/secrets/envfile.rs",
     "src/secrets/mask.rs",
+    "src/supervisor/lease.rs",
+    "src/supervisor/timeouts.rs",
+    "src/supervisor/escalation.rs",
+    "src/supervisor/identity.rs",
+    "src/supervisor/termination.rs",
 }
 seen = set()
 bad = []

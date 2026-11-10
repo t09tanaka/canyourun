@@ -1,4 +1,18 @@
-//! OS-dependent primitives: monotonic clock, boot ID, process identity, sleep inhibition.
+//! OS-dependent primitives (spec chapter 15): a monotonic clock that counts
+//! suspend, the boot ID, process identity, and sleep inhibition.
+//!
+//! macOS and Linux each have an implementation behind the same functions, so
+//! the supervisor and the worker agent keep one contract on both.
+
+pub mod boot;
+pub mod clock;
+pub mod inhibit;
+pub mod process;
+
+pub use boot::boot_id;
+pub use clock::{monotonic_ms, wall_ms};
+pub use inhibit::{Inhibit, SleepGuard};
+pub use process::{process_start_identity, signal_pid, signal_process_group, GroupSignal};
 
 /// Stop this process from leaving a core dump (and, on Linux, from being
 /// attached to by another process of the same user): a dump of a process that
