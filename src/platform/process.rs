@@ -69,8 +69,16 @@ pub fn parse_proc_stat(text: &str) -> Option<String> {
 /// Send `sig` to `pid` alone. True when the signal was delivered (or the
 /// process is a zombie); false when there is no such process or no right.
 pub fn signal_pid(pid: u32, sig: i32) -> bool {
+    // pid 0 is our own group, 1 is init, and a pid above i32::MAX wraps to a
+    // negative pid_t: -1 would reach every process of the user. Never.
+    let Ok(p) = libc::pid_t::try_from(pid) else {
+        return false;
+    };
+    if p <= 1 {
+        return false;
+    }
     // SAFETY: plain syscall with integer arguments.
-    unsafe { libc::kill(pid as libc::pid_t, sig) == 0 }
+    unsafe { libc::kill(p, sig) == 0 }
 }
 
 /// What a signal to a process group reached.
@@ -134,6 +142,11 @@ mod tests {
         assert_eq!(signal_process_group(0, 0), GroupSignal::Empty);
         assert_eq!(signal_process_group(1, 0), GroupSignal::Empty);
         assert_eq!(signal_process_group(i32::MAX - 1, 0), GroupSignal::Empty);
+        // Never our own group, init, or a pid that wraps to kill(-1).
+        assert!(!signal_pid(0, 0));
+        assert!(!signal_pid(1, 0));
+        assert!(!signal_pid(u32::MAX, 0));
+        assert!(!signal_pid(i32::MAX as u32 + 1, 0));
         assert!(signal_pid(std::process::id(), 0));
     }
 }

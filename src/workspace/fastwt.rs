@@ -135,6 +135,11 @@ impl CliFastWorktree {
 }
 
 fn kill_group(pgid: libc::pid_t) {
+    // Group 0 is our own, 1 is init; killpg with either would hit far more
+    // than the child we made.
+    if pgid <= 1 {
+        return;
+    }
     // SAFETY: killpg only sends a signal to the group we made
     unsafe {
         libc::killpg(pgid, libc::SIGKILL);

@@ -109,6 +109,11 @@ impl Drop for Fx {
             }
         }
         for (pid, group) in all {
+            // pid 0, 1 or a wrapped negative would signal our own group, every
+            // process of the user (kill(-1)) or init: never.
+            if pid <= 1 {
+                continue;
+            }
             unsafe { libc::kill(if group { -pid } else { pid }, libc::SIGKILL) };
         }
     }
