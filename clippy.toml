@@ -1,0 +1,7 @@
+# Raw signals are banned: a pid of 0, 1 or a wrapped negative turns kill()
+# into "our own group", "init" or "every process of the user" (kill(-1)).
+# Use platform::signal_pid / platform::signal_process_group, which refuse them.
+disallowed-methods = [
+    { path = "libc::kill", reason = "use platform::signal_pid (refuses pid <= 1)" },
+    { path = "libc::killpg", reason = "use platform::signal_process_group (refuses pgid <= 1)" },
+]
