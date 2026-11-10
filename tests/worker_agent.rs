@@ -1112,30 +1112,34 @@ async fn list_attempts_filters_in_the_database_and_never_answers_with_a_part() {
     let f = fx();
     let mut cfg = f.cfg("boot-a");
     cfg.max_list_attempts = 3;
+    cfg.secret_wait_ms = 120_000;
     let agent = f.start_with(cfg);
     let c = f.connect(&agent).await;
-    // The two oldest attempts run; four newer ones have ended.
-    let (script, _, _) = stay(&f);
+    // The two oldest attempts are still being prepared (they wait for their
+    // secret bundle); four newer ones have ended. No command runs, so the
+    // test does not depend on how many commands the machine admits at once.
+    f.host.secrets_ready.store(false, Ordering::SeqCst);
     let mut running = Vec::new();
     for _ in 0..2 {
         let a = AttemptId::generate();
-        submit(&c, &a, &payload(&script)).await;
+        submit(&c, &a, &payload("true")).await;
         running.push(a);
     }
-    wait_for("both to run", || {
+    wait_for("both to wait for their secrets", || {
         running
             .iter()
-            .all(|a| f.rec(a).state == AttemptState::Active)
+            .all(|a| f.rec(a).state == AttemptState::Preparing && workspace_record(&f, a).exists())
     });
     for _ in 0..4 {
         let a = AttemptId::generate();
         submit(&c, &a, &payload("true")).await;
-        assert_eq!(f.wait_terminal(&a), Outcome::Succeeded);
+        call(&c, cancel_req(&a)).await.unwrap();
+        f.wait_terminal(&a);
     }
 
     // Six attempts, three fit. The filter runs before the limit: the two
-    // running ones are found behind four newer ones.
-    let mut got = listed(&c, Some(vec![AttemptState::Active]), true).await;
+    // live ones are found behind four newer ones.
+    let mut got = listed(&c, Some(vec![AttemptState::Preparing]), true).await;
     got.sort();
     running.sort();
     assert_eq!(got, running);
