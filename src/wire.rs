@@ -15,7 +15,20 @@
 //! `payload_hash` is `sha256` over the canonical JSON of the submitted
 //! [`AttemptPayload`]; [`content_hash`] gives every other request a comparable
 //! hash that ignores `request_id`, so a replay with the same id but different
-//! content is detectable.
+//! content is detectable. Bulk and secret bytes are never hashed: see
+//! [`content_hash`].
+//!
+//! Retire, cancel and late requests (the contract every worker implements):
+//! * `retire_attempt` writes a tombstone; it is kept for the cluster's
+//!   lifetime;
+//! * `get_attempt` on a retired attempt is never `NOT_FOUND`: it answers the
+//!   status with `retired: true` (or the `RETIRED` error when only a tombstone
+//!   exists, see [`CancelAttemptRequest`]);
+//! * a `submit_attempt` that arrives after the tombstone is refused with
+//!   `RETIRED`, and so is any other mutation of that attempt;
+//! * a `cancel_attempt` for an attempt that has not arrived yet also writes a
+//!   tombstone, and the submit that arrives later is refused with `RETIRED`, so
+//!   a cancelled attempt never spawns late.
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -23,12 +36,15 @@ use std::fmt;
 use base64::Engine as _;
 use serde::de::Error as _;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
-use serde_json::Value;
+use serde_json::{json, Value};
 use thiserror::Error;
 
 use crate::error::ApiError;
 use crate::ids::*;
-use crate::state::{AttemptState, Observation, Outcome, Receipt, StepState};
+use crate::state::{
+    check_termination, AttemptState, Exit, Observation, Receipt, Receipts, StepState, Termination,
+    TerminationStateError,
+};
 
 // ---------------------------------------------------------------------------
 // schema version, canonical JSON, hashing
@@ -37,13 +53,37 @@ use crate::state::{AttemptState, Observation, Outcome, Receipt, StepState};
 /// Version of every wire DTO's shape.
 pub const WIRE_SCHEMA_VERSION: u32 = 1;
 
-/// The `schema_version` field. Serializes as a number; deserialization rejects
-/// any version other than [`WIRE_SCHEMA_VERSION`].
+/// The `schema_version` field. It serializes as a number and deserializes any
+/// number: a peer that speaks another version must still be able to read
+/// `hello` and error replies to learn that. Whether the version is the one this
+/// build speaks is a separate decision for the protocol layer, taken after
+/// `hello`: call [`SchemaVersion::ensure_current`] (or
+/// [`Request::ensure_current_schema`] and friends) on every other message.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct SchemaVersion(pub u32);
 
+/// A schema version this build does not speak.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Error)]
+#[error("unsupported schema_version {got}, expected {expected}")]
+pub struct UnsupportedSchemaVersion {
+    pub got: u32,
+    pub expected: u32,
+}
+
 impl SchemaVersion {
     pub const CURRENT: SchemaVersion = SchemaVersion(WIRE_SCHEMA_VERSION);
+
+    /// The post-`hello` check: only [`WIRE_SCHEMA_VERSION`] is accepted.
+    pub fn ensure_current(self) -> Result<(), UnsupportedSchemaVersion> {
+        if self == Self::CURRENT {
+            Ok(())
+        } else {
+            Err(UnsupportedSchemaVersion {
+                got: self.0,
+                expected: WIRE_SCHEMA_VERSION,
+            })
+        }
+    }
 }
 
 impl Default for SchemaVersion {
@@ -60,14 +100,7 @@ impl Serialize for SchemaVersion {
 
 impl<'de> Deserialize<'de> for SchemaVersion {
     fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
-        let v = u32::deserialize(d)?;
-        if v == WIRE_SCHEMA_VERSION {
-            Ok(SchemaVersion(v))
-        } else {
-            Err(D::Error::custom(format!(
-                "unsupported schema_version {v}, expected {WIRE_SCHEMA_VERSION}"
-            )))
-        }
+        u32::deserialize(d).map(SchemaVersion)
     }
 }
 
@@ -134,13 +167,41 @@ pub fn payload_hash<T: Serialize>(value: &T) -> Result<PayloadHash, CanonicalErr
     Ok(Digest::of_bytes(canonical_json(&v)?.as_bytes()))
 }
 
-/// Hash of a request's content with the top-level `request_id` removed.
-pub fn content_hash(request: &Request) -> Result<PayloadHash, CanonicalError> {
+/// The text [`content_hash`] digests: the request's canonical JSON without
+/// `request_id`, with bulk and secret bytes replaced by what identifies them.
+///
+/// * `secret_bundle_put`: the plaintext `content` is dropped; each file
+///   contributes its `path` and its HMAC digest. No plain hash of secret
+///   content is made anywhere.
+/// * `blob_put`: `data` is dropped; `digest`, `offset` and `total_size` stay.
+///   Chunk bytes are verified against the blob digest, not by this hash.
+fn content_hash_input(request: &Request) -> Result<String, CanonicalError> {
     let mut v = serde_json::to_value(request)?;
     if let Value::Object(map) = &mut v {
         map.remove("request_id");
+        match request {
+            Request::BlobPut(_) => {
+                map.remove("data");
+            }
+            Request::SecretBundlePut(r) => {
+                let files = r
+                    .files
+                    .iter()
+                    .map(|f| json!({"path": f.path, "hmac_digest": f.hmac_digest}))
+                    .collect();
+                map.insert("files".to_string(), Value::Array(files));
+            }
+            _ => {}
+        }
     }
-    Ok(Digest::of_bytes(canonical_json(&v)?.as_bytes()))
+    canonical_json(&v)
+}
+
+/// Hash of a request's content with the top-level `request_id` removed, so a
+/// replay with the same id but different content is detectable. Plaintext
+/// secrets and blob chunk bytes are not hashed; see the input rules above.
+pub fn content_hash(request: &Request) -> Result<PayloadHash, CanonicalError> {
+    Ok(Digest::of_bytes(content_hash_input(request)?.as_bytes()))
 }
 
 // ---------------------------------------------------------------------------
@@ -288,6 +349,8 @@ pub struct HelloRequest {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HelloResponse {
     pub schema_version: SchemaVersion,
+    /// The cluster this worker belongs to.
+    pub cluster_id: ClusterId,
     /// The version chosen from the coordinator's list.
     pub protocol_version: u32,
     pub features: Vec<String>,
@@ -330,27 +393,65 @@ pub struct InspectResponse {
 // forecast
 // ---------------------------------------------------------------------------
 
-/// One node of a [`WorkloadPlan`].
+/// Concurrency caps the real executor applies to a node's group, in the three
+/// places a command can sit (spec chapter 9: 登録中・待機中・実行中). `None` is
+/// no cap on that stage.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConcurrencyLimits {
+    #[serde(default)]
+    pub max_registered: Option<u32>,
+    #[serde(default)]
+    pub max_waiting: Option<u32>,
+    #[serde(default)]
+    pub max_running: Option<u32>,
+}
+
+/// Ties a plan node to the real thing: which attempt and node it is, and the
+/// ledger entry once it is registered. A registered node replaces its
+/// provisional demand, so this is what prevents double counting (spec chapter 9).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Correlation {
+    pub attempt_id: AttemptId,
+    pub node_id: NodeId,
+    /// The real ledger entry, once the node has been registered.
+    #[serde(default)]
+    pub ledger_entry: Option<String>,
+}
+
+/// One node of a [`WorkloadPlan`] (spec chapter 9 "WorkloadPlan"). Every
+/// number is `None` when unknown; an absent value is never read as zero.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkloadNode {
     pub node_id: NodeId,
     #[serde(default)]
     pub depends_on: Vec<NodeId>,
     pub priority: i32,
-    /// `None`: unknown, never read as zero.
+    /// CPU weight for admission.
+    #[serde(default)]
+    pub weight: Option<u32>,
     #[serde(default)]
     pub predicted_rss_bytes: Option<u64>,
     #[serde(default)]
     pub predicted_runtime_ms: Option<u64>,
     /// Preparation outside admission (transfer etc.).
     #[serde(default)]
-    pub external_delay_ms: u64,
+    pub external_delay_ms: Option<u64>,
     /// Relative time until the node may register.
     #[serde(default)]
-    pub ready_in_ms: u64,
+    pub ready_in_ms: Option<u64>,
+    #[serde(default)]
+    pub concurrency: ConcurrencyLimits,
+    pub correlation: Correlation,
     /// A shared setup builder the node waits for.
     #[serde(default)]
     pub shared_builder: Option<BuilderId>,
+}
+
+/// A node whose correlation does not match its plan.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+#[error("node `{node_id}` correlation does not match its plan or node id")]
+pub struct PlanError {
+    pub node_id: NodeId,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -359,6 +460,20 @@ pub struct WorkloadPlan {
     pub plan_digest: PlanDigest,
     pub expansion_seq: u64,
     pub nodes: Vec<WorkloadNode>,
+}
+
+impl WorkloadPlan {
+    /// Every node's correlation names this plan's attempt and its own node id.
+    pub fn check(&self) -> Result<(), PlanError> {
+        for n in &self.nodes {
+            if n.correlation.attempt_id != self.attempt_id || n.correlation.node_id != n.node_id {
+                return Err(PlanError {
+                    node_id: n.node_id.clone(),
+                });
+            }
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -401,10 +516,49 @@ pub enum RuntimeSource {
     Unknown,
 }
 
+/// Why a forecast value is missing or weak (spec chapter 9 "不確実な予測").
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Uncertainty {
+    NoHistory,
+    UnknownRss,
+    /// A running entry went past its history.
+    Overrun,
+    /// Depends on a runtime condition not yet known.
+    Conditional,
+    /// A dynamic matrix has not expanded yet.
+    DynamicMatrix,
+    /// The live memory guard blocks admission.
+    MemoryBlocked,
+    StaleSample,
+    ToolchainChanged,
+}
+
+/// Which [`ForecastTarget`] value a reason is about.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ForecastField {
+    ReadyInMs,
+    QueueWaitAfterReadyMs,
+    ExecutionMs,
+    FinishInMs,
+}
+
+/// Why the node would currently wait.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WaitReason {
+    MemoryBlocked,
+    ConcurrencyLimit,
+    QueueAhead,
+    ExternalDelay,
+    SharedBuilder,
+}
+
 /// The forecast for the requested workload on this worker.
 ///
 /// A value that cannot be computed is `null`, and `null_reasons` maps the field
-/// name to the reason. An existing entry running past its history is
+/// to the reason. An existing entry running past its history is
 /// `overrun`, never rounded to zero.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ForecastTarget {
@@ -422,11 +576,11 @@ pub struct ForecastTarget {
     pub overrun: bool,
     /// Present while the node would currently wait.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub wait_reason: Option<String>,
+    pub wait_reason: Option<WaitReason>,
     #[serde(default)]
     pub assumptions: Vec<String>,
     #[serde(default)]
-    pub null_reasons: BTreeMap<String, String>,
+    pub null_reasons: BTreeMap<ForecastField, Uncertainty>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -458,6 +612,8 @@ pub struct CommandSpec {
     pub env: BTreeMap<String, String>,
     #[serde(default)]
     pub depends_on: Vec<NodeId>,
+    /// Execution timeout of this command; overrides the payload's
+    /// `command_timeout_ms`. Queue wait never counts toward it.
     #[serde(default)]
     pub timeout_ms: Option<u64>,
 }
@@ -476,12 +632,24 @@ pub struct AttemptPayload {
     pub permit_id: Option<PermitId>,
     pub commands: Vec<CommandSpec>,
     pub lease_ms: u64,
+    /// Default execution timeout per command (`CommandSpec::timeout_ms`
+    /// overrides it). Queue wait is not part of it.
+    #[serde(default)]
+    pub command_timeout_ms: Option<u64>,
+    /// Deadline for the whole homework across preparation, waiting, running and
+    /// collection; the termination records which phase it fired in.
     #[serde(default)]
     pub deadline_ms: Option<u64>,
+    /// How long the attempt may wait for resources before it times out.
+    #[serde(default)]
+    pub resource_wait_timeout_ms: Option<u64>,
     #[serde(default)]
     pub has_secret_bundle: bool,
 }
 
+/// Submit an attempt. If the attempt was retired, or cancelled before this
+/// request arrived (a tombstone exists), the worker refuses it with `RETIRED`
+/// and never spawns.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SubmitAttemptRequest {
     pub schema_version: SchemaVersion,
@@ -523,7 +691,7 @@ pub struct SubmitAttemptResponse {
     pub attempt_id: AttemptId,
     pub generation: Generation,
     pub state: AttemptState,
-    pub receipt: Receipt,
+    pub receipts: Receipts,
     /// True when an existing attempt with the same hash was returned.
     pub duplicate: bool,
 }
@@ -534,30 +702,96 @@ pub struct StepStatus {
     pub state: StepState,
 }
 
-/// The worker's view of one attempt.
+/// How one node of an attempt ended (or that it did not start).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum NodeState {
+    Succeeded,
+    Failed,
+    /// Not run on purpose; an explicit reason is required, so a missing result
+    /// is never read as skipped.
+    Skipped {
+        reason: String,
+    },
+    Cancelled,
+    TimedOut,
+    Interrupted,
+    /// The attempt ended before this node began.
+    NotStarted,
+}
+
+/// The result of one node.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NodeResult {
+    pub node_id: NodeId,
+    pub state: NodeState,
+    #[serde(default)]
+    pub exit: Option<Exit>,
+}
+
+/// The worker's view of one attempt.
+///
+/// `state` and `termination` always agree: `Terminal` has exactly one
+/// termination and every other state has none. Deserialization enforces it;
+/// [`AttemptStatus::check`] re-checks a value built by hand.
+///
+/// A retired attempt keeps answering `get_attempt` with this status and
+/// `retired: true`; it is never `NOT_FOUND`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(remote = "Self")]
 pub struct AttemptStatus {
     pub schema_version: SchemaVersion,
     pub attempt_id: AttemptId,
     pub run_id: RunId,
     pub homework_id: HomeworkId,
     pub generation: Generation,
+    /// The boot and agent incarnation that produced this status.
+    pub worker_boot_id: WorkerBootId,
+    pub agent_epoch: AgentEpoch,
     pub state: AttemptState,
-    pub receipt: Receipt,
+    #[serde(default)]
+    pub receipts: Receipts,
+    /// When the user command was started (UTC ms, diagnostic). This, not a
+    /// receipt, says whether the command was launched: `running` may never be
+    /// observed for a very short command.
+    #[serde(default)]
+    pub spawned_at_ms: Option<u64>,
     pub observation: Observation,
+    /// Present exactly when `state` is `Terminal`.
     #[serde(default)]
-    pub outcome: Option<Outcome>,
+    pub termination: Option<Termination>,
     #[serde(default)]
-    pub exit_code: Option<i32>,
-    /// Set when the command was killed by a signal.
-    #[serde(default)]
-    pub signal: Option<i32>,
+    pub nodes: Vec<NodeResult>,
     #[serde(default)]
     pub steps: Vec<StepStatus>,
+    /// A retire tombstone exists for this attempt.
+    #[serde(default)]
+    pub retired: bool,
     #[serde(default)]
     pub log_truncated: bool,
     #[serde(default)]
     pub log_dropped_bytes: u64,
+}
+
+impl AttemptStatus {
+    /// `state` is `Terminal` if and only if `termination` is present.
+    pub fn check(&self) -> Result<(), TerminationStateError> {
+        check_termination(self.state, self.termination.as_ref())
+    }
+}
+
+impl Serialize for AttemptStatus {
+    fn serialize<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        AttemptStatus::serialize(self, s)
+    }
+}
+
+impl<'de> Deserialize<'de> for AttemptStatus {
+    fn deserialize<D: Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let status = AttemptStatus::deserialize(d)?;
+        status.check().map_err(D::Error::custom)?;
+        Ok(status)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -585,6 +819,25 @@ pub struct ListAttemptsResponse {
     pub attempts: Vec<AttemptStatus>,
 }
 
+/// The ordering key of a lease renewal: `(coordinator_epoch, lease_seq)`,
+/// compared lexicographically (the derived order follows the field order, which
+/// is therefore load-bearing). A new coordinator epoch restarts `lease_seq`, and
+/// its renewals still win over every renewal of an older epoch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct LeaseKey {
+    pub coordinator_epoch: CoordinatorEpoch,
+    pub lease_seq: u64,
+}
+
+impl LeaseKey {
+    /// True when a renewal with this key may extend the lease, given the
+    /// highest key already applied. Only a strictly greater key extends:
+    /// a resend of the same key and any smaller key do not.
+    pub fn extends(self, applied: Option<LeaseKey>) -> bool {
+        applied.is_none_or(|current| self > current)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RenewLeaseRequest {
     pub schema_version: SchemaVersion,
@@ -592,20 +845,40 @@ pub struct RenewLeaseRequest {
     pub coordinator_epoch: CoordinatorEpoch,
     pub attempt_id: AttemptId,
     pub generation: Generation,
-    /// Strictly increasing; a replay never extends the lease again.
+    /// Together with `coordinator_epoch` the ordering key
+    /// ([`RenewLeaseRequest::key`]). A replay never extends the lease again.
     pub lease_seq: u64,
     pub lease_ms: u64,
 }
 
+impl RenewLeaseRequest {
+    pub fn key(&self) -> LeaseKey {
+        LeaseKey {
+            coordinator_epoch: self.coordinator_epoch,
+            lease_seq: self.lease_seq,
+        }
+    }
+}
+
+/// A renewal that is not newer than one already applied is answered normally
+/// with `extended: false`; the lease is left as it was. An attempt that can no
+/// longer be renewed (expired, cancelling, finalizing, terminal or retired) is
+/// answered with the `LEASE_NOT_RENEWABLE` error, never by reviving it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RenewLeaseResponse {
     pub schema_version: SchemaVersion,
     pub attempt_id: AttemptId,
     pub lease_seq: u64,
+    /// This request moved the lease deadline.
+    pub extended: bool,
     pub lease_remaining_ms: u64,
     pub state: AttemptState,
 }
 
+/// Cancel an attempt. If the attempt has not arrived at the worker yet, the
+/// worker still records the cancel by writing a tombstone, and the submit that
+/// arrives later is refused with `RETIRED`: a cancelled attempt never spawns
+/// late. The response then has `tombstone: true` and no `state`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CancelAttemptRequest {
     pub schema_version: SchemaVersion,
@@ -630,9 +903,18 @@ pub struct CancelAttemptResponse {
     pub schema_version: SchemaVersion,
     pub attempt_id: AttemptId,
     pub phase: CancelPhase,
-    pub state: AttemptState,
+    /// `None` only when the attempt never arrived and just a tombstone was
+    /// written; no state is invented for it.
+    #[serde(default)]
+    pub state: Option<AttemptState>,
+    /// A tombstone was written for an attempt that had not arrived.
+    #[serde(default)]
+    pub tombstone: bool,
 }
 
+/// Retire an attempt: write the tombstone (kept for the cluster's lifetime) and
+/// confirm it is not running. Afterwards `get_attempt` answers `retired: true`
+/// and any late submit is refused with `RETIRED`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RetireAttemptRequest {
     pub schema_version: SchemaVersion,
@@ -758,16 +1040,20 @@ pub struct GetResultResponse {
     pub schema_version: SchemaVersion,
     pub attempt_id: AttemptId,
     pub generation: Generation,
-    pub outcome: Outcome,
+    pub termination: Termination,
     #[serde(default)]
-    pub exit_code: Option<i32>,
-    #[serde(default)]
-    pub signal: Option<i32>,
+    pub nodes: Vec<NodeResult>,
     pub artifacts: Vec<ArtifactRecord>,
     /// Digest over the whole result; echoed back in `ack_collected`.
     pub result_digest: Digest,
 }
 
+/// Acknowledge a verified, durably saved result.
+///
+/// There is no `coordinator_epoch` here on purpose: after the coordinator
+/// restarts and adopts an attempt, results produced under an older epoch must
+/// still be collected (spec chapter 10), so the acknowledgement is keyed by
+/// `attempt_id`, `generation` and `result_digest`, not by epoch.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AckCollectedRequest {
     pub schema_version: SchemaVersion,
@@ -793,6 +1079,7 @@ pub struct AckCollectedResponse {
 pub struct BlobPutRequest {
     pub schema_version: SchemaVersion,
     pub request_id: RequestId,
+    pub coordinator_epoch: CoordinatorEpoch,
     pub source_id: SourceId,
     /// Digest of the complete blob.
     pub digest: Digest,
@@ -849,12 +1136,11 @@ pub struct BlobVerifyResponse {
 // secret bundle (chapter 22.3)
 // ---------------------------------------------------------------------------
 
-/// One secret file. `Debug` never prints the content.
+/// One secret file. The worker always places it with mode `0600`. `Debug`
+/// never prints the content.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SecretFile {
     pub path: String,
-    /// Unix permission bits; the worker places the file with `0600`.
-    pub mode: u32,
     /// HMAC digest keyed per cluster; never a plain hash of the content.
     pub hmac_digest: Digest,
     pub content: Bytes,
@@ -864,7 +1150,6 @@ impl fmt::Debug for SecretFile {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("SecretFile")
             .field("path", &self.path)
-            .field("mode", &self.mode)
             .field("hmac_digest", &self.hmac_digest)
             .field("content", &"<redacted>")
             .finish()
@@ -875,6 +1160,7 @@ impl fmt::Debug for SecretFile {
 pub struct SecretBundlePutRequest {
     pub schema_version: SchemaVersion,
     pub request_id: RequestId,
+    pub coordinator_epoch: CoordinatorEpoch,
     pub attempt_id: AttemptId,
     pub generation: Generation,
     pub files: Vec<SecretFile>,
@@ -939,6 +1225,7 @@ pub struct EnvReportResponse {
 pub struct EnvSyncRequest {
     pub schema_version: SchemaVersion,
     pub request_id: RequestId,
+    pub coordinator_epoch: CoordinatorEpoch,
     pub tools: Vec<ToolRequirement>,
     pub dry_run: bool,
 }
@@ -993,6 +1280,10 @@ macro_rules! operations {
             pub fn schema_version(&self) -> SchemaVersion {
                 match self { $(Request::$variant(r) => r.schema_version),* }
             }
+            /// The post-`hello` schema check for this request.
+            pub fn ensure_current_schema(&self) -> Result<(), UnsupportedSchemaVersion> {
+                self.schema_version().ensure_current()
+            }
         }
 
         impl Response {
@@ -1001,6 +1292,10 @@ macro_rules! operations {
             }
             pub fn schema_version(&self) -> SchemaVersion {
                 match self { $(Response::$variant(r) => r.schema_version),* }
+            }
+            /// The post-`hello` schema check for this response.
+            pub fn ensure_current_schema(&self) -> Result<(), UnsupportedSchemaVersion> {
+                self.schema_version().ensure_current()
             }
         }
     };
@@ -1066,7 +1361,7 @@ impl Message {
 mod tests {
     use super::*;
     use crate::error::ErrorCode;
-    use serde_json::json;
+    use crate::state::{Outcome, TimeoutInfo, TimeoutKind, TimeoutPhase};
 
     const SV: SchemaVersion = SchemaVersion::CURRENT;
 
@@ -1090,18 +1385,30 @@ mod tests {
     }
 
     fn plan() -> WorkloadPlan {
+        let attempt_id = aid();
         WorkloadPlan {
-            attempt_id: aid(),
+            attempt_id: attempt_id.clone(),
             plan_digest: dg("plan"),
             expansion_seq: 1,
             nodes: vec![WorkloadNode {
                 node_id: node("test"),
                 depends_on: vec![node("setup")],
                 priority: 0,
+                weight: Some(2),
                 predicted_rss_bytes: Some(1 << 20),
                 predicted_runtime_ms: None,
-                external_delay_ms: 10,
-                ready_in_ms: 5,
+                external_delay_ms: Some(10),
+                ready_in_ms: None,
+                concurrency: ConcurrencyLimits {
+                    max_registered: Some(4),
+                    max_waiting: None,
+                    max_running: Some(2),
+                },
+                correlation: Correlation {
+                    attempt_id,
+                    node_id: node("test"),
+                    ledger_entry: Some("entry-1".into()),
+                },
                 shared_builder: Some(BuilderId::generate()),
             }],
         }
@@ -1125,7 +1432,9 @@ mod tests {
                 timeout_ms: Some(1000),
             }],
             lease_ms: 60_000,
-            deadline_ms: None,
+            command_timeout_ms: Some(900_000),
+            deadline_ms: Some(3_600_000),
+            resource_wait_timeout_ms: Some(120_000),
             has_secret_bundle: true,
         }
     }
@@ -1137,18 +1446,73 @@ mod tests {
             run_id: RunId::generate(),
             homework_id: HomeworkId::generate(),
             generation: Generation(2),
+            worker_boot_id: boot(),
+            agent_epoch: AgentEpoch(2),
             state: AttemptState::Active,
-            receipt: Receipt::Running,
+            receipts: receipts(&[Receipt::WorkerAccepted, Receipt::Running]),
+            spawned_at_ms: Some(1_700_000_000_000),
             observation: Observation::Known,
-            outcome: None,
-            exit_code: None,
-            signal: Some(15),
+            termination: None,
+            nodes: vec![NodeResult {
+                node_id: node("setup"),
+                state: NodeState::Succeeded,
+                exit: Some(Exit::Code(0)),
+            }],
             steps: vec![StepStatus {
                 node_id: node("test"),
                 state: StepState::WaitingResources,
             }],
+            retired: false,
             log_truncated: true,
             log_dropped_bytes: 9,
+        }
+    }
+
+    fn receipts(reached: &[Receipt]) -> Receipts {
+        let mut r = Receipts::default();
+        for (i, k) in reached.iter().enumerate() {
+            r.mark(*k, 1000 + i as u64);
+        }
+        r
+    }
+
+    fn timed_out() -> Termination {
+        Termination::new(
+            Outcome::TimedOut,
+            Some(Exit::Signal(9)),
+            Some(TimeoutInfo {
+                kind: TimeoutKind::Command,
+                phase: TimeoutPhase::Running,
+            }),
+        )
+        .unwrap()
+    }
+
+    fn terminal_status() -> AttemptStatus {
+        AttemptStatus {
+            state: AttemptState::Terminal,
+            termination: Some(timed_out()),
+            retired: true,
+            nodes: vec![
+                NodeResult {
+                    node_id: node("test"),
+                    state: NodeState::TimedOut,
+                    exit: Some(Exit::Signal(9)),
+                },
+                NodeResult {
+                    node_id: node("lint"),
+                    state: NodeState::Skipped {
+                        reason: "fail-fast".into(),
+                    },
+                    exit: None,
+                },
+                NodeResult {
+                    node_id: node("deploy"),
+                    state: NodeState::NotStarted,
+                    exit: None,
+                },
+            ],
+            ..status()
         }
     }
 
@@ -1177,9 +1541,12 @@ mod tests {
             history_count: 4,
             conditional: true,
             overrun: false,
-            wait_reason: Some("memory".into()),
+            wait_reason: Some(WaitReason::MemoryBlocked),
             assumptions: vec!["no new external load".into()],
-            null_reasons: BTreeMap::from([("execution_ms".into(), "no history".into())]),
+            null_reasons: BTreeMap::from([
+                (ForecastField::ExecutionMs, Uncertainty::NoHistory),
+                (ForecastField::FinishInMs, Uncertainty::Overrun),
+            ]),
         }
     }
 
@@ -1277,6 +1644,7 @@ mod tests {
             Request::BlobPut(BlobPutRequest {
                 schema_version: SV,
                 request_id: rid(),
+                coordinator_epoch: CoordinatorEpoch(3),
                 source_id: SourceId::generate(),
                 digest: dg("blob"),
                 total_size: 4,
@@ -1298,11 +1666,11 @@ mod tests {
             Request::SecretBundlePut(SecretBundlePutRequest {
                 schema_version: SV,
                 request_id: rid(),
+                coordinator_epoch: CoordinatorEpoch(3),
                 attempt_id: aid.clone(),
                 generation: Generation(1),
                 files: vec![SecretFile {
                     path: ".env".into(),
-                    mode: 0o600,
                     hmac_digest: dg("hmac"),
                     content: Bytes(b"K=V".to_vec()),
                 }],
@@ -1318,6 +1686,7 @@ mod tests {
             Request::EnvSync(EnvSyncRequest {
                 schema_version: SV,
                 request_id: rid(),
+                coordinator_epoch: CoordinatorEpoch(3),
                 tools: vec![ToolRequirement {
                     name: "node".into(),
                     version: "22".into(),
@@ -1331,6 +1700,7 @@ mod tests {
         vec![
             Response::Hello(HelloResponse {
                 schema_version: SV,
+                cluster_id: ClusterId::generate(),
                 protocol_version: 1,
                 features: vec![],
                 worker_id: worker(),
@@ -1375,18 +1745,19 @@ mod tests {
                 attempt_id: aid(),
                 generation: Generation(1),
                 state: AttemptState::Accepted,
-                receipt: Receipt::WorkerAccepted,
+                receipts: receipts(&[Receipt::CoordinatorAccepted, Receipt::WorkerAccepted]),
                 duplicate: true,
             }),
             Response::GetAttempt(status()),
             Response::ListAttempts(ListAttemptsResponse {
                 schema_version: SV,
-                attempts: vec![status()],
+                attempts: vec![status(), terminal_status()],
             }),
             Response::RenewLease(RenewLeaseResponse {
                 schema_version: SV,
                 attempt_id: aid(),
                 lease_seq: 7,
+                extended: true,
                 lease_remaining_ms: 59_000,
                 state: AttemptState::Active,
             }),
@@ -1394,7 +1765,8 @@ mod tests {
                 schema_version: SV,
                 attempt_id: aid(),
                 phase: CancelPhase::Accepted,
-                state: AttemptState::Cancelling,
+                state: Some(AttemptState::Cancelling),
+                tombstone: false,
             }),
             Response::RetireAttempt(RetireAttemptResponse {
                 schema_version: SV,
@@ -1428,9 +1800,8 @@ mod tests {
                 schema_version: SV,
                 attempt_id: aid(),
                 generation: Generation(1),
-                outcome: Outcome::Failed,
-                exit_code: Some(1),
-                signal: None,
+                termination: timed_out(),
+                nodes: terminal_status().nodes,
                 artifacts: vec![artifact()],
                 result_digest: dg("r"),
             }),
@@ -1569,23 +1940,68 @@ mod tests {
     }
 
     #[test]
-    fn schema_version_other_than_current_is_rejected() {
+    fn schema_version_deserializes_any_number_and_is_checked_separately() {
         assert_eq!(SchemaVersion::default(), SchemaVersion::CURRENT);
+        for n in [0u32, 1, 2, 99] {
+            let v: SchemaVersion = serde_json::from_str(&n.to_string()).unwrap();
+            assert_eq!(v, SchemaVersion(n));
+            assert_eq!(serde_json::to_string(&v).unwrap(), n.to_string());
+            assert_eq!(v.ensure_current().is_ok(), n == 1, "{n}");
+        }
+        let e = SchemaVersion(2).ensure_current().unwrap_err();
         assert_eq!(
-            serde_json::from_str::<SchemaVersion>("1").unwrap(),
-            SchemaVersion(1)
+            e,
+            UnsupportedSchemaVersion {
+                got: 2,
+                expected: 1
+            }
         );
-        assert!(serde_json::from_str::<SchemaVersion>("2").is_err());
-        assert!(serde_json::from_str::<SchemaVersion>("0").is_err());
-        let mut v = serde_json::to_value(requests().remove(1)).unwrap();
-        v["schema_version"] = json!(2);
-        let err = serde_json::from_value::<Request>(v)
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("unsupported schema_version 2"), "{err}");
+        assert!(e.to_string().contains("unsupported schema_version 2"));
+        assert!(serde_json::from_str::<SchemaVersion>("-1").is_err());
         let mut v = serde_json::to_value(requests().remove(1)).unwrap();
         v.as_object_mut().unwrap().remove("schema_version");
         assert!(serde_json::from_value::<Request>(v).is_err());
+    }
+
+    #[test]
+    fn other_versions_still_parse_so_hello_and_errors_can_be_read() {
+        let bump = |mut v: Value| {
+            v["schema_version"] = json!(2);
+            v
+        };
+        // hello request and response
+        let hello_req = requests().remove(0);
+        let back: Request =
+            serde_json::from_value(bump(serde_json::to_value(&hello_req).unwrap())).unwrap();
+        assert_eq!(back.schema_version(), SchemaVersion(2));
+        assert_eq!(
+            back.ensure_current_schema().unwrap_err(),
+            UnsupportedSchemaVersion {
+                got: 2,
+                expected: 1
+            }
+        );
+        assert!(hello_req.ensure_current_schema().is_ok());
+        let hello_resp = responses().remove(0);
+        let back: Response =
+            serde_json::from_value(bump(serde_json::to_value(&hello_resp).unwrap())).unwrap();
+        assert!(back.ensure_current_schema().is_err());
+        assert!(hello_resp.ensure_current_schema().is_ok());
+        // error replies, bare and framed
+        let err = ErrorResponse {
+            schema_version: SV,
+            request_id: None,
+            error: ApiError::new(ErrorCode::ProtocolIncompatible, "old"),
+        };
+        let back: ErrorResponse =
+            serde_json::from_value(bump(serde_json::to_value(&err).unwrap())).unwrap();
+        assert_eq!(back.schema_version, SchemaVersion(2));
+        assert_eq!(back.error.code, ErrorCode::ProtocolIncompatible);
+        let framed = bump(serde_json::to_value(Message::Error(err)).unwrap());
+        assert!(matches!(
+            serde_json::from_value::<Message>(framed).unwrap(),
+            Message::Error(_)
+        ));
     }
 
     #[test]
@@ -1718,6 +2134,127 @@ mod tests {
         );
     }
 
+    fn secret_put(content: &[u8], path: &str, hmac: &str, epoch: u64) -> Request {
+        Request::SecretBundlePut(SecretBundlePutRequest {
+            schema_version: SV,
+            request_id: rid(),
+            coordinator_epoch: CoordinatorEpoch(epoch),
+            attempt_id: AttemptId::parse("att_01ARZ3NDEKTSV4RRFFQ69G5FAV").unwrap(),
+            generation: Generation(1),
+            files: vec![SecretFile {
+                path: path.into(),
+                hmac_digest: dg(hmac),
+                content: Bytes(content.to_vec()),
+            }],
+        })
+    }
+
+    #[test]
+    fn secret_bundle_hash_never_covers_the_plaintext() {
+        let secret = b"TOPSECRET=hunter2";
+        let req = secret_put(secret, ".env", "h1", 3);
+        let input = content_hash_input(&req).unwrap();
+        let b64 = base64::engine::general_purpose::STANDARD.encode(secret);
+        assert!(!input.contains(&b64) && !input.contains("hunter2"));
+        assert!(!input.contains("\"content\""));
+        assert!(input.contains(".env") && input.contains(dg("h1").as_str()));
+        // the plain SHA-256 of the content is not in the input either
+        assert!(!input.contains(Digest::of_bytes(secret).as_str()));
+        // changing only the plaintext leaves the hash alone...
+        let base = content_hash(&req).unwrap();
+        assert_eq!(
+            base,
+            content_hash(&secret_put(b"other", ".env", "h1", 3)).unwrap()
+        );
+        // ...while path, HMAC digest and epoch move it
+        assert_ne!(
+            base,
+            content_hash(&secret_put(secret, ".env.test", "h1", 3)).unwrap()
+        );
+        assert_ne!(
+            base,
+            content_hash(&secret_put(secret, ".env", "h2", 3)).unwrap()
+        );
+        assert_ne!(
+            base,
+            content_hash(&secret_put(secret, ".env", "h1", 4)).unwrap()
+        );
+        // the request id is still ignored
+        assert_eq!(
+            base,
+            content_hash(&secret_put(secret, ".env", "h1", 3)).unwrap()
+        );
+    }
+
+    fn blob_put(data: &[u8], digest: &str, offset: u64, total: u64) -> Request {
+        Request::BlobPut(BlobPutRequest {
+            schema_version: SV,
+            request_id: rid(),
+            coordinator_epoch: CoordinatorEpoch(3),
+            source_id: SourceId::parse("src_01ARZ3NDEKTSV4RRFFQ69G5FAV").unwrap(),
+            digest: dg(digest),
+            total_size: total,
+            offset,
+            data: Bytes(data.to_vec()),
+        })
+    }
+
+    #[test]
+    fn blob_put_hash_covers_digest_offset_and_size_not_data() {
+        let req = blob_put(b"PLAINCHUNK", "blob", 0, 10);
+        let input = content_hash_input(&req).unwrap();
+        let b64 = base64::engine::general_purpose::STANDARD.encode(b"PLAINCHUNK");
+        assert!(!input.contains(&b64) && !input.contains("\"data\""));
+        for key in ["digest", "offset", "total_size", "source_id"] {
+            assert!(input.contains(&format!("\"{key}\"")), "{key}");
+        }
+        let base = content_hash(&req).unwrap();
+        assert_eq!(
+            base,
+            content_hash(&blob_put(b"different!", "blob", 0, 10)).unwrap()
+        );
+        assert_ne!(
+            base,
+            content_hash(&blob_put(b"PLAINCHUNK", "blob2", 0, 10)).unwrap()
+        );
+        assert_ne!(
+            base,
+            content_hash(&blob_put(b"PLAINCHUNK", "blob", 5, 10)).unwrap()
+        );
+        assert_ne!(
+            base,
+            content_hash(&blob_put(b"PLAINCHUNK", "blob", 0, 11)).unwrap()
+        );
+    }
+
+    #[test]
+    fn other_requests_hash_their_whole_body() {
+        // only secret and blob puts are special-cased
+        let sync = |dry_run| {
+            Request::EnvSync(EnvSyncRequest {
+                schema_version: SV,
+                request_id: rid(),
+                coordinator_epoch: CoordinatorEpoch(1),
+                tools: vec![],
+                dry_run,
+            })
+        };
+        assert_ne!(
+            content_hash(&sync(true)).unwrap(),
+            content_hash(&sync(false)).unwrap()
+        );
+        let text = content_hash_input(&sync(true)).unwrap();
+        assert!(text.contains("\"op\":\"env_sync\"") && !text.contains("request_id"));
+    }
+
+    #[test]
+    fn every_request_has_a_hashable_content() {
+        // canonical JSON refuses floats, so every request shape must be integers only
+        for req in requests() {
+            content_hash(&req).unwrap();
+        }
+    }
+
     #[test]
     fn forecast_response_matches_the_spec_example_shape() {
         let v = serde_json::to_value(&responses()[2]).unwrap();
@@ -1747,7 +2284,9 @@ mod tests {
             assert!(t.get(key).is_some(), "{key}");
         }
         assert!(t["execution_ms"].is_null());
-        assert_eq!(t["null_reasons"]["execution_ms"], "no history");
+        assert_eq!(t["null_reasons"]["execution_ms"], "no_history");
+        assert_eq!(t["null_reasons"]["finish_in_ms"], "overrun");
+        assert_eq!(t["wait_reason"], "memory_blocked");
         assert_eq!(t["confidence"], "medium");
         assert_eq!(t["runtime_source"], "measured");
         assert_eq!(v["coverage"][0]["expansion_seq"], 1);
@@ -1773,6 +2312,54 @@ mod tests {
                 c
             );
         }
+        for (u, j) in [
+            (Uncertainty::NoHistory, "no_history"),
+            (Uncertainty::UnknownRss, "unknown_rss"),
+            (Uncertainty::Overrun, "overrun"),
+            (Uncertainty::Conditional, "conditional"),
+            (Uncertainty::DynamicMatrix, "dynamic_matrix"),
+            (Uncertainty::MemoryBlocked, "memory_blocked"),
+            (Uncertainty::StaleSample, "stale_sample"),
+            (Uncertainty::ToolchainChanged, "toolchain_changed"),
+        ] {
+            assert_eq!(serde_json::to_string(&u).unwrap(), format!("\"{j}\""));
+            assert_eq!(
+                serde_json::from_str::<Uncertainty>(&format!("\"{j}\"")).unwrap(),
+                u
+            );
+        }
+        for (w, j) in [
+            (WaitReason::MemoryBlocked, "memory_blocked"),
+            (WaitReason::ConcurrencyLimit, "concurrency_limit"),
+            (WaitReason::QueueAhead, "queue_ahead"),
+            (WaitReason::ExternalDelay, "external_delay"),
+            (WaitReason::SharedBuilder, "shared_builder"),
+        ] {
+            assert_eq!(serde_json::to_string(&w).unwrap(), format!("\"{j}\""));
+            assert_eq!(
+                serde_json::from_str::<WaitReason>(&format!("\"{j}\"")).unwrap(),
+                w
+            );
+        }
+        for (f, j) in [
+            (ForecastField::ReadyInMs, "ready_in_ms"),
+            (
+                ForecastField::QueueWaitAfterReadyMs,
+                "queue_wait_after_ready_ms",
+            ),
+            (ForecastField::ExecutionMs, "execution_ms"),
+            (ForecastField::FinishInMs, "finish_in_ms"),
+        ] {
+            assert_eq!(serde_json::to_string(&f).unwrap(), format!("\"{j}\""));
+        }
+        // a reason keyed by an unknown field is refused, free text is refused
+        assert!(
+            serde_json::from_value::<BTreeMap<ForecastField, Uncertainty>>(
+                json!({"ready": "no_history"})
+            )
+            .is_err()
+        );
+        assert!(serde_json::from_str::<WaitReason>("\"memory\"").is_err());
         // optional target fields default; wait_reason is omitted when None
         let mut t = target();
         t.wait_reason = None;
@@ -1866,7 +2453,6 @@ mod tests {
     fn secret_file_debug_is_redacted() {
         let f = SecretFile {
             path: ".env".into(),
-            mode: 0o600,
             hmac_digest: dg("h"),
             content: Bytes(b"TOPSECRET".to_vec()),
         };
@@ -1876,6 +2462,7 @@ mod tests {
         let req = Request::SecretBundlePut(SecretBundlePutRequest {
             schema_version: SV,
             request_id: rid(),
+            coordinator_epoch: CoordinatorEpoch(1),
             attempt_id: aid(),
             generation: Generation(1),
             files: vec![f],
@@ -1889,8 +2476,264 @@ mod tests {
         let o = v.as_object_mut().unwrap();
         o.remove("permit_id");
         o.remove("deadline_ms");
+        o.remove("command_timeout_ms");
+        o.remove("resource_wait_timeout_ms");
         o.remove("has_secret_bundle");
         let p: AttemptPayload = serde_json::from_value(v).unwrap();
         assert!(p.permit_id.is_none() && p.deadline_ms.is_none() && !p.has_secret_bundle);
+        assert!(p.command_timeout_ms.is_none() && p.resource_wait_timeout_ms.is_none());
+    }
+
+    #[test]
+    fn the_three_timeouts_are_separate_payload_fields() {
+        let v = serde_json::to_value(payload()).unwrap();
+        assert_eq!(v["command_timeout_ms"], 900_000);
+        assert_eq!(v["deadline_ms"], 3_600_000);
+        assert_eq!(v["resource_wait_timeout_ms"], 120_000);
+        let mut p = payload();
+        let h = payload_hash(&p).unwrap();
+        p.resource_wait_timeout_ms = None;
+        assert_ne!(h, payload_hash(&p).unwrap());
+    }
+
+    #[test]
+    fn terminal_status_must_carry_a_termination() {
+        let ok = terminal_status();
+        assert!(ok.check().is_ok());
+        let v = serde_json::to_value(&ok).unwrap();
+        assert_eq!(v["termination"]["outcome"], "timed_out");
+        assert_eq!(v["termination"]["timeout"]["kind"], "command");
+        assert_eq!(v["retired"], true);
+        assert_eq!(
+            serde_json::from_value::<AttemptStatus>(v.clone()).unwrap(),
+            ok
+        );
+
+        // Terminal without a termination, and a live state with one, both fail
+        let mut missing = v.clone();
+        missing["termination"] = Value::Null;
+        let e = serde_json::from_value::<AttemptStatus>(missing.clone()).unwrap_err();
+        assert!(e.to_string().contains("requires a termination"), "{e}");
+        let mut live = v.clone();
+        live["state"] = json!("finalizing");
+        let e = serde_json::from_value::<AttemptStatus>(live.clone()).unwrap_err();
+        assert!(e.to_string().contains("must not carry"), "{e}");
+        let mut absent = v.clone();
+        absent.as_object_mut().unwrap().remove("termination");
+        assert!(serde_json::from_value::<AttemptStatus>(absent).is_err());
+        assert_eq!(
+            AttemptStatus {
+                termination: None,
+                ..ok.clone()
+            }
+            .check(),
+            Err(TerminationStateError::Missing(AttemptState::Terminal))
+        );
+        assert_eq!(
+            AttemptStatus {
+                termination: Some(timed_out()),
+                ..status()
+            }
+            .check(),
+            Err(TerminationStateError::Unexpected(AttemptState::Active))
+        );
+
+        // the same check fires when the status is nested in a response or frame
+        let list = json!({"op": "list_attempts", "schema_version": 1, "attempts": [live.clone()]});
+        assert!(serde_json::from_value::<Response>(list).is_err());
+        let list = json!({"schema_version": 1, "attempts": [missing.clone()]});
+        assert!(serde_json::from_value::<ListAttemptsResponse>(list).is_err());
+        let mut get = missing.clone();
+        get["op"] = json!("get_attempt");
+        assert!(serde_json::from_value::<Response>(get.clone()).is_err());
+        let framed = json!({"type": "response", "request_id": rid(), "response": get});
+        assert!(serde_json::from_value::<Message>(framed).is_err());
+        // a contradictory termination inside a status is refused too
+        let mut bad = v;
+        bad["termination"]["exit"] = json!({"code": 999});
+        assert!(serde_json::from_value::<AttemptStatus>(bad).is_err());
+    }
+
+    #[test]
+    fn get_result_carries_a_validated_termination() {
+        let resp = match responses().remove(11) {
+            Response::GetResult(r) => r,
+            other => panic!("{other:?}"),
+        };
+        let mut v = serde_json::to_value(&resp).unwrap();
+        assert_eq!(v["termination"]["outcome"], "timed_out");
+        assert!(v.get("outcome").is_none() && v.get("exit_code").is_none());
+        v["termination"] = json!({"outcome": "timed_out"});
+        assert!(serde_json::from_value::<GetResultResponse>(v).is_err());
+    }
+
+    #[test]
+    fn node_results_serialize_with_an_explicit_state() {
+        let r = NodeResult {
+            node_id: node("lint"),
+            state: NodeState::Skipped {
+                reason: "fail-fast".into(),
+            },
+            exit: None,
+        };
+        let v = serde_json::to_value(&r).unwrap();
+        assert_eq!(
+            v["state"],
+            json!({"kind": "skipped", "reason": "fail-fast"})
+        );
+        assert_eq!(serde_json::from_value::<NodeResult>(v).unwrap(), r);
+        for (state, kind) in [
+            (NodeState::Succeeded, "succeeded"),
+            (NodeState::Failed, "failed"),
+            (NodeState::Cancelled, "cancelled"),
+            (NodeState::TimedOut, "timed_out"),
+            (NodeState::Interrupted, "interrupted"),
+            (NodeState::NotStarted, "not_started"),
+        ] {
+            let v = serde_json::to_value(&state).unwrap();
+            assert_eq!(v, json!({ "kind": kind }));
+            assert_eq!(serde_json::from_value::<NodeState>(v).unwrap(), state);
+        }
+        // a skip without a reason is refused
+        assert!(serde_json::from_value::<NodeState>(json!({"kind": "skipped"})).is_err());
+        let r: NodeResult = serde_json::from_value(
+            json!({"node_id": "t", "state": {"kind": "failed"}, "exit": {"code": 2}}),
+        )
+        .unwrap();
+        assert_eq!(r.exit, Some(Exit::Code(2)));
+    }
+
+    #[test]
+    fn lease_key_orders_by_epoch_then_sequence() {
+        let k = |e, s| LeaseKey {
+            coordinator_epoch: CoordinatorEpoch(e),
+            lease_seq: s,
+        };
+        assert!(k(1, 9) < k(2, 0));
+        assert!(k(2, 0) < k(2, 1));
+        // nothing applied yet: any key extends
+        assert!(k(0, 0).extends(None));
+        let applied = Some(k(2, 5));
+        assert!(!k(2, 5).extends(applied), "same key is a resend");
+        assert!(!k(2, 4).extends(applied), "smaller sequence");
+        assert!(
+            !k(1, 99).extends(applied),
+            "older epoch, however large the sequence"
+        );
+        assert!(k(2, 6).extends(applied));
+        assert!(
+            k(3, 0).extends(applied),
+            "a new epoch restarts the sequence"
+        );
+        let req = match &requests()[6] {
+            Request::RenewLease(r) => r.clone(),
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(req.key(), k(3, 7));
+        let v = serde_json::to_value(k(3, 7)).unwrap();
+        assert_eq!(v, json!({"coordinator_epoch": 3, "lease_seq": 7}));
+    }
+
+    #[test]
+    fn renew_response_says_whether_it_extended() {
+        let v = serde_json::to_value(&responses()[6]).unwrap();
+        assert_eq!(v["extended"], true);
+        let mut v = v;
+        v.as_object_mut().unwrap().remove("extended");
+        assert!(serde_json::from_value::<Response>(v).is_err());
+    }
+
+    #[test]
+    fn cancel_before_arrival_answers_with_a_tombstone_and_no_state() {
+        let r = CancelAttemptResponse {
+            schema_version: SV,
+            attempt_id: aid(),
+            phase: CancelPhase::Completed,
+            state: None,
+            tombstone: true,
+        };
+        let v = serde_json::to_value(&r).unwrap();
+        assert!(v["state"].is_null());
+        assert_eq!(
+            serde_json::from_value::<CancelAttemptResponse>(v).unwrap(),
+            r
+        );
+        let minimal = json!({
+            "schema_version": 1, "attempt_id": r.attempt_id, "phase": "accepted"
+        });
+        let m: CancelAttemptResponse = serde_json::from_value(minimal).unwrap();
+        assert!(m.state.is_none() && !m.tombstone);
+    }
+
+    #[test]
+    fn plan_correlation_must_match_attempt_and_node() {
+        let p = plan();
+        assert_eq!(p.check(), Ok(()));
+        let mut wrong_attempt = p.clone();
+        wrong_attempt.nodes[0].correlation.attempt_id = aid();
+        assert_eq!(wrong_attempt.check().unwrap_err().node_id, node("test"));
+        assert!(wrong_attempt
+            .check()
+            .unwrap_err()
+            .to_string()
+            .contains("test"));
+        let mut wrong_node = p;
+        wrong_node.nodes[0].correlation.node_id = node("other");
+        assert!(wrong_node.check().is_err());
+        assert_eq!(
+            WorkloadPlan {
+                nodes: vec![],
+                ..wrong_node
+            }
+            .check(),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn unknown_forecast_numbers_stay_unknown() {
+        let mut v = serde_json::to_value(plan()).unwrap();
+        let n = v["nodes"][0].as_object_mut().unwrap();
+        for k in ["external_delay_ms", "ready_in_ms", "weight", "concurrency"] {
+            n.remove(k);
+        }
+        let p: WorkloadPlan = serde_json::from_value(v).unwrap();
+        let n = &p.nodes[0];
+        assert_eq!(
+            (n.external_delay_ms, n.ready_in_ms, n.weight),
+            (None, None, None)
+        );
+        assert_eq!(n.concurrency, ConcurrencyLimits::default());
+        // null and absent are the same unknown, and zero is a real value
+        let mut v = serde_json::to_value(plan()).unwrap();
+        v["nodes"][0]["ready_in_ms"] = json!(0);
+        let p: WorkloadPlan = serde_json::from_value(v).unwrap();
+        assert_eq!(p.nodes[0].ready_in_ms, Some(0));
+        assert_eq!(
+            serde_json::to_value(plan()).unwrap()["nodes"][0]["ready_in_ms"],
+            Value::Null
+        );
+    }
+
+    #[test]
+    fn hello_response_names_its_cluster() {
+        let v = serde_json::to_value(&responses()[0]).unwrap();
+        assert!(v["cluster_id"].as_str().unwrap().starts_with("cl_"));
+        let s = serde_json::to_value(status()).unwrap();
+        assert_eq!(s["worker_boot_id"], "boot-1");
+        assert_eq!(s["agent_epoch"], 2);
+        assert_eq!(s["spawned_at_ms"], 1_700_000_000_000u64);
+    }
+
+    #[test]
+    fn running_is_not_a_proxy_for_spawned() {
+        // a quick command can be spawned and finish without `running` ever observed
+        let st = AttemptStatus {
+            receipts: receipts(&[Receipt::WorkerAccepted, Receipt::CommandRegistered]),
+            spawned_at_ms: Some(5),
+            ..status()
+        };
+        assert!(!st.receipts.reached(Receipt::Running));
+        assert!(st.spawned_at_ms.is_some());
     }
 }
