@@ -1,8 +1,8 @@
 //! Identifiers and digests shared by every component (spec chapter 10).
 //!
 //! Generated identifiers are `<kind prefix>_<ULID>` (for example `run_01J...`).
-//! Names that come from outside (worker, boot, node) are validated free-form
-//! strings. Epochs and generations are plain `u64`. Every type serializes as a
+//! Names that come from outside (worker, boot, node) are validated strings
+//! over `[A-Za-z0-9._-]`. Epochs and generations are plain `u64`. Every type serializes as a
 //! bare string or number and validates on deserialization.
 
 use std::fmt;
@@ -19,7 +19,9 @@ pub enum IdError {
     WrongPrefix { expected: &'static str, got: String },
     #[error("`{0}` does not carry a valid ULID after the prefix")]
     BadUlid(String),
-    #[error("name must be 1..={max} characters without control characters or whitespace")]
+    #[error(
+        "name must be 1..={max} characters of [A-Za-z0-9._-], not start with `.`, and not contain `..`"
+    )]
     BadName { max: usize },
     #[error("digest must look like `sha256:<64 lowercase hex>`, got `{0}`")]
     BadDigest(String),
@@ -41,7 +43,9 @@ macro_rules! prefixed_id {
                 Self(format!("{}_{}", $prefix, Ulid::new()))
             }
 
-            /// Parse and validate `<prefix>_<ULID>`.
+            /// Parse and validate `<prefix>_<ULID>`. The ULID part is re-encoded
+            /// in its canonical upper-case form, so equal identifiers compare
+            /// and hash equal whatever case they arrived in.
             pub fn parse(s: &str) -> Result<Self, IdError> {
                 let rest = s
                     .strip_prefix($prefix)
@@ -50,8 +54,9 @@ macro_rules! prefixed_id {
                         expected: $prefix,
                         got: s.to_string(),
                     })?;
-                Ulid::from_string(rest).map_err(|_| IdError::BadUlid(s.to_string()))?;
-                Ok(Self(s.to_string()))
+                let ulid = Ulid::from_string(rest).map_err(|_| IdError::BadUlid(s.to_string()))?;
+                // Re-encode so that `run_01j...` and `run_01J...` are one identifier.
+                Ok(Self(format!("{}_{}", $prefix, ulid)))
             }
 
             pub fn as_str(&self) -> &str {
@@ -124,6 +129,18 @@ prefixed_id!(
 /// Longest accepted free-form name.
 pub const MAX_NAME_LEN: usize = 128;
 
+/// A name is `[A-Za-z0-9._-]{1,128}`, does not start with `.`, and has no `..`.
+/// Names end up in file names and process arguments, so path-like and
+/// whitespace-bearing forms are refused up front.
+fn is_valid_name(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= MAX_NAME_LEN
+        && !s.starts_with('.')
+        && !s.contains("..")
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+}
+
 macro_rules! name_id {
     ($(#[$doc:meta])* $name:ident) => {
         $(#[$doc])*
@@ -134,10 +151,7 @@ macro_rules! name_id {
         impl $name {
             /// Validate a free-form name.
             pub fn parse(s: &str) -> Result<Self, IdError> {
-                let ok = !s.is_empty()
-                    && s.chars().count() <= MAX_NAME_LEN
-                    && !s.chars().any(|c| c.is_control() || c.is_whitespace());
-                if ok {
+                if is_valid_name(s) {
                     Ok(Self(s.to_string()))
                 } else {
                     Err(IdError::BadName { max: MAX_NAME_LEN })
@@ -335,6 +349,25 @@ mod tests {
     );
 
     #[test]
+    fn parse_canonicalizes_the_ulid_case() {
+        let id = RunId::generate();
+        let lower = format!("run_{}", id.as_str()[4..].to_lowercase());
+        assert_ne!(lower, id.as_str());
+        let parsed = RunId::parse(&lower).unwrap();
+        assert_eq!(parsed, id);
+        assert_eq!(parsed.as_str(), id.as_str());
+        assert_eq!(
+            serde_json::from_str::<RunId>(&format!("\"{lower}\"")).unwrap(),
+            id
+        );
+        let mut set = std::collections::HashSet::new();
+        set.insert(id.clone());
+        assert!(set.contains(&parsed));
+        // the prefix itself stays case-sensitive
+        assert!(RunId::parse(&format!("RUN_{}", &id.as_str()[4..])).is_err());
+    }
+
+    #[test]
     fn generated_ids_are_distinct_and_other_kinds_are_rejected() {
         assert_ne!(RunId::generate(), RunId::generate());
         let run = RunId::generate();
@@ -376,6 +409,12 @@ mod tests {
                     assert!($t::parse("a b").is_err());
                     assert!($t::parse("a\nb").is_err());
                     assert!($t::parse("a\u{0}b").is_err());
+                    for bad in ["a/b", "a:b", "a\\b", "a$b", "a*b", "é", ".hidden", ".", "..", "a..b", "a..", "-.."] {
+                        assert!($t::parse(bad).is_err(), "{bad}");
+                    }
+                    for ok in ["a.b", "a-b", "a_b", "A9", "-a", "a.", "_x", "x-1.2_3"] {
+                        assert!($t::parse(ok).is_ok(), "{ok}");
+                    }
                     assert!($t::parse(&"x".repeat(MAX_NAME_LEN)).is_ok());
                     assert!($t::parse(&"x".repeat(MAX_NAME_LEN + 1)).is_err());
                     assert!(serde_json::from_str::<$t>("\"\"").is_err());

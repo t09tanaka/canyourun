@@ -38,6 +38,11 @@ pub mod exit {
     pub const SIGNAL_BASE: i32 = 128;
 }
 
+/// Highest signal number accepted by [`ErrorCode::exit_code_with`].
+pub const MAX_SIGNAL: i32 = 64;
+/// Highest exit code a process can report.
+pub const MAX_EXIT_CODE: i32 = 255;
+
 /// Machine-readable error code, serialized as `SCREAMING_SNAKE_CASE`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
@@ -55,6 +60,17 @@ pub enum ErrorCode {
     CommandFailed,
     Signal,
     Internal,
+    /// The attempt was retired (a tombstone exists). A late `submit_attempt`
+    /// and any other mutation are refused with this code. `get_attempt` on an
+    /// attempt the worker knows answers a status with `retired: true`; on a
+    /// tombstone that has no accepted attempt behind it (a cancel or retire
+    /// that arrived first) there is no status to build, so the worker answers
+    /// this error. Neither case is `NOT_FOUND`.
+    Retired,
+    /// `renew_lease` could not extend the lease: the attempt is expired,
+    /// cancelling, finalizing, terminal or retired. A merely stale or replayed
+    /// renew is not an error; it answers `extended: false`.
+    LeaseNotRenewable,
 }
 
 /// Why a homework is blocked (accompanies `ErrorCode::Blocked`).
@@ -68,7 +84,7 @@ pub enum BlockedReason {
 
 impl ErrorCode {
     /// Every code.
-    pub const ALL: [ErrorCode; 13] = [
+    pub const ALL: [ErrorCode; 15] = [
         ErrorCode::NotImplemented,
         ErrorCode::InvalidInput,
         ErrorCode::SourceBusy,
@@ -82,6 +98,8 @@ impl ErrorCode {
         ErrorCode::CommandFailed,
         ErrorCode::Signal,
         ErrorCode::Internal,
+        ErrorCode::Retired,
+        ErrorCode::LeaseNotRenewable,
     ];
 
     /// The wire string, identical to the serde form.
@@ -100,6 +118,8 @@ impl ErrorCode {
             ErrorCode::CommandFailed => "COMMAND_FAILED",
             ErrorCode::Signal => "SIGNAL",
             ErrorCode::Internal => "INTERNAL",
+            ErrorCode::Retired => "RETIRED",
+            ErrorCode::LeaseNotRenewable => "LEASE_NOT_RENEWABLE",
         }
     }
 
@@ -121,15 +141,28 @@ impl ErrorCode {
             ErrorCode::CommandFailed => exit::FAILURE,
             ErrorCode::Signal => exit::SIGNAL_BASE,
             ErrorCode::Internal => exit::INTERNAL,
+            // Both are "the addressed attempt no longer accepts this", the
+            // same family as a payload conflict; the JSON code tells them apart.
+            ErrorCode::Retired | ErrorCode::LeaseNotRenewable => exit::CONFLICT,
         }
     }
 
-    /// Like [`ErrorCode::exit_code`], but `Signal` with `detail = N` gives
-    /// `128 + N` and `CommandFailed` with the command's code passes it through.
+    /// Like [`ErrorCode::exit_code`], but with the command's own detail:
+    ///
+    /// * `Signal` with `n` in `1..=64` gives `128 + n`;
+    /// * `CommandFailed` with `n` in `1..=255` passes `n` through;
+    /// * a detail outside those ranges (including `0`, which would read as
+    ///   success) is a broken report and becomes `INTERNAL`.
+    ///
+    /// A command may exit with any code, including `70..=79`, which this
+    /// crate reserves for its own errors, so the process exit code alone never
+    /// tells a command failure from a runner error. Decide the settled state
+    /// from the JSON `code` (and `--json` output), not from the exit code.
     pub fn exit_code_with(self, detail: Option<i32>) -> i32 {
         match (self, detail) {
-            (ErrorCode::Signal, Some(n)) => exit::SIGNAL_BASE + n,
-            (ErrorCode::CommandFailed, Some(n)) => n,
+            (ErrorCode::Signal, Some(n)) if (1..=MAX_SIGNAL).contains(&n) => exit::SIGNAL_BASE + n,
+            (ErrorCode::CommandFailed, Some(n)) if (1..=MAX_EXIT_CODE).contains(&n) => n,
+            (ErrorCode::Signal | ErrorCode::CommandFailed, Some(_)) => exit::INTERNAL,
             _ => self.exit_code(),
         }
     }
@@ -188,7 +221,11 @@ mod tests {
     fn exit_codes_are_unique_except_documented_overlaps() {
         let mut seen = HashSet::new();
         for c in ErrorCode::ALL {
-            assert!(seen.insert(c.exit_code()), "duplicate exit code for {c}");
+            let documented_overlap = matches!(c, ErrorCode::Retired | ErrorCode::LeaseNotRenewable);
+            assert!(
+                seen.insert(c.exit_code()) || documented_overlap,
+                "duplicate exit code for {c}"
+            );
             assert_ne!(c.exit_code(), exit::SUCCESS);
         }
     }
@@ -208,6 +245,8 @@ mod tests {
         assert_eq!(ErrorCode::CommandFailed.exit_code(), 1);
         assert_eq!(ErrorCode::Signal.exit_code(), 128);
         assert_eq!(ErrorCode::Internal.exit_code(), 79);
+        assert_eq!(ErrorCode::Retired.exit_code(), 72);
+        assert_eq!(ErrorCode::LeaseNotRenewable.exit_code(), 72);
         assert_eq!(exit::SUCCESS, 0);
     }
 
@@ -218,6 +257,28 @@ mod tests {
         assert_eq!(ErrorCode::CommandFailed.exit_code_with(Some(42)), 42);
         assert_eq!(ErrorCode::CommandFailed.exit_code_with(None), 1);
         assert_eq!(ErrorCode::Conflict.exit_code_with(Some(9)), 72);
+    }
+
+    #[test]
+    fn command_failure_detail_is_range_checked() {
+        let f = |n| ErrorCode::CommandFailed.exit_code_with(Some(n));
+        assert_eq!(f(1), 1);
+        assert_eq!(f(255), 255);
+        assert_eq!(f(0), exit::INTERNAL);
+        assert_eq!(f(256), exit::INTERNAL);
+        assert_eq!(f(-1), exit::INTERNAL);
+        // a command exit code may collide with the reserved range; it passes through
+        assert_eq!(f(exit::CONFLICT), exit::CONFLICT);
+    }
+
+    #[test]
+    fn signal_detail_is_range_checked() {
+        let f = |n| ErrorCode::Signal.exit_code_with(Some(n));
+        assert_eq!(f(1), 129);
+        assert_eq!(f(64), 192);
+        assert_eq!(f(0), exit::INTERNAL);
+        assert_eq!(f(65), exit::INTERNAL);
+        assert_eq!(f(-9), exit::INTERNAL);
     }
 
     #[test]
