@@ -52,6 +52,16 @@ pub enum Command {
     /// Run as a worker (internal).
     #[command(hide = true)]
     Worker(WorkerArgs),
+    /// Supervise one attempt as its own process (internal).
+    #[command(hide = true)]
+    Supervise(SuperviseArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct SuperviseArgs {
+    /// JSON spec file written by the agent.
+    #[arg(long)]
+    pub spec: std::path::PathBuf,
 }
 
 #[derive(Debug, Args)]
@@ -197,6 +207,9 @@ pub fn run(cli: Cli) -> i32 {
         if args.stdio && !args.ephemeral {
             return run_worker_stdio();
         }
+    }
+    if let Command::Supervise(args) = &cli.command {
+        return crate::supervisor::process::main(&args.spec);
     }
     let envelope = Envelope::not_implemented();
     if cli.json {
