@@ -446,6 +446,27 @@ impl SourceStore {
         Ok(f)
     }
 
+    /// Where local-ci puts the plaintext secret bundle of a capture of this
+    /// source (0600), until the parent's vault has taken it.
+    pub fn secrets_path(&self, ci_source_id: &str) -> PathBuf {
+        self.inner.secrets_path(ci_source_id)
+    }
+
+    /// Hold the store's plaintext secret bundles for the life of the returned
+    /// file: they are named by source, so two captures of the same source
+    /// (two runs) would otherwise write, adopt and remove the same file. The
+    /// source id is not known before the capture, so this is one lock for all
+    /// captures that carry secret files.
+    pub fn lock_secrets(&self) -> Result<std::fs::File> {
+        let f = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(self.inner.root().join("secrets.lock"))?;
+        f.lock()?;
+        Ok(f)
+    }
+
     /// What a run captured, if anything (spec: one capture per run).
     pub fn run_record(&self, run: &RunId) -> Result<Option<RunRecord>> {
         match std::fs::read(self.run_record_path(run)) {

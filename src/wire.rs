@@ -1136,13 +1136,59 @@ pub struct BlobVerifyResponse {
 // secret bundle (chapter 22.3)
 // ---------------------------------------------------------------------------
 
+/// `hmac-sha256:<64 lowercase hex>`: the keyed digest of a secret file. A
+/// different type from [`Digest`] on purpose: a `sha256:` hash of data can be
+/// checked by anyone who guesses the data, an HMAC only by the key holders,
+/// and the two must never be taken for one another.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(try_from = "String", into = "String")]
+pub struct HmacDigest(String);
+
+impl HmacDigest {
+    pub const PREFIX: &'static str = "hmac-sha256:";
+
+    pub fn parse(s: &str) -> Result<Self, IdError> {
+        let ok = s.strip_prefix(Self::PREFIX).is_some_and(|hex| {
+            hex.len() == 64 && hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+        });
+        if ok {
+            Ok(Self(s.to_string()))
+        } else {
+            Err(IdError::BadDigest(s.to_string()))
+        }
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for HmacDigest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl TryFrom<String> for HmacDigest {
+    type Error = IdError;
+    fn try_from(s: String) -> Result<Self, IdError> {
+        Self::parse(&s)
+    }
+}
+
+impl From<HmacDigest> for String {
+    fn from(d: HmacDigest) -> String {
+        d.0
+    }
+}
+
 /// One secret file. The worker always places it with mode `0600`. `Debug`
 /// never prints the content.
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SecretFile {
     pub path: String,
     /// HMAC digest keyed per cluster; never a plain hash of the content.
-    pub hmac_digest: Digest,
+    pub hmac_digest: HmacDigest,
     pub content: Bytes,
 }
 
@@ -1376,6 +1422,10 @@ mod tests {
     }
     fn dg(s: &str) -> Digest {
         Digest::of_bytes(s.as_bytes())
+    }
+    fn hdg(s: &str) -> HmacDigest {
+        let d = Digest::of_bytes(s.as_bytes());
+        HmacDigest::parse(&format!("hmac-sha256:{}", &d.as_str()["sha256:".len()..])).unwrap()
     }
     fn worker() -> WorkerId {
         WorkerId::parse("mini-a").unwrap()
@@ -1671,7 +1721,7 @@ mod tests {
                 generation: Generation(1),
                 files: vec![SecretFile {
                     path: ".env".into(),
-                    hmac_digest: dg("hmac"),
+                    hmac_digest: hdg("hmac"),
                     content: Bytes(b"K=V".to_vec()),
                 }],
             }),
@@ -2143,7 +2193,7 @@ mod tests {
             generation: Generation(1),
             files: vec![SecretFile {
                 path: path.into(),
-                hmac_digest: dg(hmac),
+                hmac_digest: hdg(hmac),
                 content: Bytes(content.to_vec()),
             }],
         })
@@ -2450,10 +2500,33 @@ mod tests {
     }
 
     #[test]
+    fn hmac_digest_is_its_own_type_and_form() {
+        let h = hdg("x");
+        assert!(h.as_str().starts_with("hmac-sha256:"));
+        assert_eq!(h.to_string(), h.as_str());
+        let j = serde_json::to_string(&h).unwrap();
+        assert_eq!(serde_json::from_str::<HmacDigest>(&j).unwrap(), h);
+        // a plain blob digest is not an HMAC digest, and the other way round
+        let plain = dg("x").to_string();
+        assert!(HmacDigest::parse(&plain).is_err());
+        assert!(serde_json::from_str::<HmacDigest>(&format!("\"{plain}\"")).is_err());
+        assert!(Digest::parse(h.as_str()).is_err());
+        assert!(HmacDigest::parse(&format!("hmac-sha256:{}", "A".repeat(64))).is_err());
+        assert!(HmacDigest::parse("hmac-sha256:abc").is_err());
+        // content_hash follows the HMAC, and the wire form carries the prefix
+        let a = secret_put(b"v", ".env", "h1", 1);
+        let b = secret_put(b"v", ".env", "h2", 1);
+        assert_ne!(content_hash(&a).unwrap(), content_hash(&b).unwrap());
+        let wire = serde_json::to_string(&a).unwrap();
+        assert!(wire.contains("\"hmac-sha256:"));
+        assert!(!wire.contains("\"sha256:"));
+    }
+
+    #[test]
     fn secret_file_debug_is_redacted() {
         let f = SecretFile {
             path: ".env".into(),
-            hmac_digest: dg("h"),
+            hmac_digest: hdg("h"),
             content: Bytes(b"TOPSECRET".to_vec()),
         };
         let dbg = format!("{f:?}");

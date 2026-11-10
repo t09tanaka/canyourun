@@ -21,10 +21,12 @@ pub mod store;
 
 use crate::error::{ApiError, ErrorCode};
 use crate::ids::RunId;
-use local_ci::source::{capture_directory, capture_source, CaptureOptions, Hook, SourceKind};
+use local_ci::source::{
+    capture_directory, capture_source, CaptureOptions, Hook, SecretSpec, SourceKind,
+};
 use local_ci::ExecContext;
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 pub use manifest::SourceManifest;
 pub use store::{
@@ -65,12 +67,35 @@ pub struct CaptureParams {
     /// A test seam, called between the steps of a capture (see
     /// [`local_ci::source::Stage`]).
     pub hook: Option<Hook>,
+    /// Ignored files to send as secrets (chapter 22.3); built by
+    /// [`crate::secrets::capture`], which adds what `.worktreeinclude` matches.
+    pub secret_files: Vec<SecretSpec>,
+    /// The cluster key the secret files' HMACs are made with.
+    pub secret_key: Vec<u8>,
+}
+
+impl std::fmt::Debug for CaptureParams {
+    /// The key is not shown.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CaptureParams")
+            .field("base", &self.base)
+            .field("include", &self.include)
+            .field("exclude", &self.exclude)
+            .field("max_attempts", &self.max_attempts)
+            .field("secret_files", &self.secret_files)
+            .field("secret_key", &"<redacted>")
+            .finish_non_exhaustive()
+    }
 }
 
 /// A source that is fixed and published.
 #[derive(Debug, Clone)]
 pub struct Captured {
     pub manifest: SourceManifest,
+    /// Where local-ci put the secret files of this capture (0600, in the
+    /// source store, keyed by source). `None` when there are none, and for a
+    /// run whose capture was made before: its bundle is already with the run.
+    pub secrets: Option<PathBuf>,
     /// Things worth saying that did not stop the capture.
     pub warnings: Vec<String>,
 }
@@ -90,9 +115,8 @@ pub fn capture(
         base: params.base.clone(),
         include: params.include.clone(),
         exclude: params.exclude.clone(),
-        // the secret bundle is captured by the secret path (chapter 22.3)
-        secret_files: vec![],
-        secret_key: vec![],
+        secret_files: params.secret_files.clone(),
+        secret_key: params.secret_key.clone(),
         max_attempts: classify::attempt_budget(params.max_attempts),
         hook: params.hook.clone(),
     };
@@ -117,17 +141,38 @@ pub fn capture(
         }
         SourceRequest::Directory { dir } => capture_directory(&ctx, dir, &opts).map_err(ci_err)?,
     };
-    refuse_uninitialized_submodules(store, &snap.manifest)?;
-    let manifest = SourceManifest::from_ci(&snap.manifest, request.kind()).ok_or_else(|| {
-        ApiError::new(
-            ErrorCode::Internal,
-            format!("unexpected source id {}", snap.manifest.source_id),
-        )
-    })?;
+    // from here on the store holds a plaintext secret bundle: every way out
+    // that does not hand it to the caller removes it
+    let checked = refuse_uninitialized_submodules(store, &snap.manifest).and_then(|()| {
+        SourceManifest::from_ci(&snap.manifest, request.kind()).ok_or_else(|| {
+            ApiError::new(
+                ErrorCode::Internal,
+                format!("unexpected source id {}", snap.manifest.source_id),
+            )
+        })
+    });
+    let manifest = match checked {
+        Ok(m) => m,
+        Err(e) => {
+            remove_secret_copy(snap.secrets.as_deref());
+            return Err(e);
+        }
+    };
     Ok(Captured {
         manifest,
+        secrets: snap.secrets,
         warnings: snap.warnings,
     })
+}
+
+/// Remove the store's plaintext secret bundle, if there is one. Best effort:
+/// it is called on the way out of an error, which it must not replace; a copy
+/// that stays is found by the sweep at start
+/// ([`crate::secrets::capture::sweep_store_copies`]).
+fn remove_secret_copy(path: Option<&Path>) {
+    if let Some(p) = path {
+        let _ = std::fs::remove_file(p);
+    }
 }
 
 /// A submodule that was not initialized in the original has no files to
@@ -220,6 +265,7 @@ pub fn capture_for_run(
             })?;
         return Ok(Captured {
             manifest: from_ci(&m)?,
+            secrets: None,
             warnings: vec![],
         });
     }
@@ -228,8 +274,15 @@ pub fn capture_for_run(
         ci_source_id: got.manifest.ci_source_id.clone(),
         ..wanted
     };
-    let bound = store.bind_run(run, &record).map_err(internal)?;
+    let bound = match store.bind_run(run, &record) {
+        Ok(b) => b,
+        Err(e) => {
+            remove_secret_copy(got.secrets.as_deref());
+            return Err(internal(e));
+        }
+    };
     if bound != record {
+        remove_secret_copy(got.secrets.as_deref());
         return Err(ApiError::new(
             ErrorCode::Internal,
             format!(
