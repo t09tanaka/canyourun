@@ -21,6 +21,14 @@ CREATE TRIGGER event_no_update BEFORE UPDATE ON event
 BEGIN SELECT RAISE(ABORT, 'event journal is append-only'); END;
 CREATE TRIGGER event_no_delete BEFORE DELETE ON event
 BEGIN SELECT RAISE(ABORT, 'event journal is append-only'); END;
+-- A file whose last reference GC dropped. The row is written in the same
+-- transaction that drops the reference, and removed only after the file is
+-- gone; add_blob_ref refuses a locator listed here, so a new reference can
+-- never point at a file that is about to be deleted.
+CREATE TABLE pending_delete (
+    locator      TEXT PRIMARY KEY,
+    queued_at_ms INTEGER NOT NULL
+);
 ";
 
 const COORDINATOR_V1: &str = "
@@ -74,10 +82,16 @@ CREATE TABLE attempt (
         CHECK (observation IN ('known','reconciling','unknown')),
     cancel_requested_at_ms INTEGER,
     retired                INTEGER NOT NULL DEFAULT 0 CHECK (retired IN (0, 1)),
+    -- When the retire was confirmed: where GC measures retention from for an
+    -- attempt that never became terminal.
+    retired_at_ms          INTEGER,
+    -- The coordinator gave up collecting the outputs: GC no longer waits.
+    collection_failed_at_ms INTEGER,
     created_at_ms          INTEGER NOT NULL,
     terminal_at_ms         INTEGER,
     CHECK ((state = 'terminal') = (termination_json IS NOT NULL)),
     CHECK ((state = 'terminal') = (terminal_at_ms IS NOT NULL)),
+    CHECK ((retired = 1) = (retired_at_ms IS NOT NULL)),
     UNIQUE (homework_id, generation)
 );
 -- At most one attempt per homework that is neither terminal nor confirmed retired.
@@ -103,6 +117,12 @@ CREATE TABLE retire_tombstone (
 );
 CREATE TRIGGER retire_tombstone_no_delete BEFORE DELETE ON retire_tombstone
 BEGIN SELECT RAISE(ABORT, 'retire tombstones are kept for the life of the cluster'); END;
+-- Only the confirmation may be added; what was asked for never changes.
+CREATE TRIGGER retire_tombstone_fixed BEFORE UPDATE ON retire_tombstone
+WHEN NEW.attempt_id <> OLD.attempt_id OR NEW.worker_id <> OLD.worker_id
+    OR NEW.reason <> OLD.reason OR NEW.requested_at_ms <> OLD.requested_at_ms
+    OR (OLD.confirmed_at_ms IS NOT NULL AND NEW.confirmed_at_ms IS NOT OLD.confirmed_at_ms)
+BEGIN SELECT RAISE(ABORT, 'a retire tombstone only gains its confirmation'); END;
 CREATE TABLE matrix_group (
     group_id      TEXT PRIMARY KEY,
     run_id        TEXT NOT NULL REFERENCES run(run_id),
@@ -170,8 +190,9 @@ CREATE TABLE worker_attempt (
     CHECK ((state = 'terminal') = (termination_json IS NOT NULL)),
     CHECK ((state = 'terminal') = (terminal_at_ms IS NOT NULL))
 );
+-- A retired attempt still counts until it is terminal (confirmed stopped).
 CREATE UNIQUE INDEX worker_attempt_one_live ON worker_attempt(homework_id)
-    WHERE state <> 'terminal' AND retired = 0;
+    WHERE state <> 'terminal';
 -- A cancel or retire that arrived before (or without) the submit. Never deleted.
 CREATE TABLE tombstone (
     attempt_id        TEXT PRIMARY KEY,
@@ -181,6 +202,13 @@ CREATE TABLE tombstone (
 );
 CREATE TRIGGER tombstone_no_delete BEFORE DELETE ON tombstone
 BEGIN SELECT RAISE(ABORT, 'tombstones are kept for the life of the cluster'); END;
+-- A cancel may become a retire; the attempt and the epoch it was recorded
+-- under never change, and a retire never goes back to a cancel.
+CREATE TRIGGER tombstone_fixed BEFORE UPDATE ON tombstone
+WHEN NEW.attempt_id <> OLD.attempt_id OR NEW.coordinator_epoch <> OLD.coordinator_epoch
+    OR NEW.recorded_at_ms <> OLD.recorded_at_ms
+    OR (OLD.kind = 'retire' AND NEW.kind <> 'retire')
+BEGIN SELECT RAISE(ABORT, 'a tombstone keeps its attempt, epoch and time; a retire stays a retire'); END;
 CREATE TABLE command_launch (
     attempt_id       TEXT NOT NULL REFERENCES worker_attempt(attempt_id),
     node_id          TEXT NOT NULL,

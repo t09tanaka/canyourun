@@ -22,7 +22,7 @@ mod schema;
 mod tests;
 mod worker;
 
-pub use common::{BlobKind, BlobRef, Event, GcReport, NewBlobRef};
+pub use common::{BlobKind, BlobRef, Event, GcReport, NewBlobRef, DEFAULT_GC_BATCH};
 pub use coordinator::{
     ArtifactReceipt, AttemptRecord, CoordinatorStore, NewAttempt, Permit, Placement,
 };
@@ -30,7 +30,7 @@ pub use db::Db;
 pub use lock::ProcessLock;
 pub use worker::{
     AcceptedAttempt, CancelOutcome, LaunchClaim, LeaseOutcome, LogPosition, NewAcceptance,
-    ProcessIdentity, SubmitOutcome, WorkerStore,
+    ProcessIdentity, SubmitOutcome, WorkerStore, DEFAULT_ACK_WAIT_MS,
 };
 
 use crate::error::ErrorCode;
@@ -59,7 +59,15 @@ impl DbKind {
 #[derive(Debug, Error)]
 pub enum StorageError {
     #[error("sqlite: {0}")]
-    Sqlite(#[from] rusqlite::Error),
+    Sqlite(rusqlite::Error),
+    /// Another connection held the database past the busy timeout. Nothing of
+    /// this call was committed; the caller may retry it.
+    #[error("database is busy (retry)")]
+    Busy,
+    /// The locator's last reference was dropped by GC and the file is being
+    /// deleted. Make a new file under another locator.
+    #[error("locator {0} is queued for deletion")]
+    LocatorPendingDelete(String),
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
     #[error("database is not usable by this binary: {0:?}")]
@@ -103,7 +111,24 @@ pub enum StorageError {
     Panicked,
 }
 
+impl From<rusqlite::Error> for StorageError {
+    fn from(e: rusqlite::Error) -> Self {
+        match e.sqlite_error_code() {
+            Some(rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked) => {
+                StorageError::Busy
+            }
+            _ => StorageError::Sqlite(e),
+        }
+    }
+}
+
 impl StorageError {
+    /// True when the same call may succeed later without any change (a busy
+    /// database). Everything else is a verdict or a fault.
+    pub fn is_retryable(&self) -> bool {
+        matches!(self, StorageError::Busy)
+    }
+
     /// The wire error code this maps to.
     pub fn code(&self) -> ErrorCode {
         match self {
@@ -113,7 +138,8 @@ impl StorageError {
             StorageError::Locked(_)
             | StorageError::PayloadConflict(_)
             | StorageError::Immutable(_)
-            | StorageError::LiveAttemptExists(_) => ErrorCode::Conflict,
+            | StorageError::LiveAttemptExists(_)
+            | StorageError::LocatorPendingDelete(_) => ErrorCode::Conflict,
             StorageError::NotFound { .. } => ErrorCode::NotFound,
             StorageError::Retired(_) => ErrorCode::Retired,
             StorageError::StaleEpoch { .. } => ErrorCode::StaleEpoch,
@@ -121,6 +147,7 @@ impl StorageError {
             StorageError::Invalid(_) | StorageError::Transition(_) => ErrorCode::InvalidInput,
             StorageError::IllegalState { .. } => ErrorCode::Conflict,
             StorageError::Sqlite(_)
+            | StorageError::Busy
             | StorageError::Io(_)
             | StorageError::Corrupt(_)
             | StorageError::Closed

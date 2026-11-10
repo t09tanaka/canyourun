@@ -9,23 +9,28 @@
 use super::common::{self, from_json, json, parse_state};
 use super::policy::{
     decide_claim, decide_lease, decide_submit, Access, ClaimDecision, ExistingAttempt, GcCandidate,
-    LeaseDecision, SubmitDecision,
+    LeaseDecision, SubmitDecision, SubmitKey,
 };
 use super::{
     to_i64, to_u64, BlobRef, Db, DbKind, Event, Finalized, GcReport, NewBlobRef, Result,
-    StorageError,
+    StorageError, DEFAULT_GC_BATCH,
 };
 use crate::ids::{
     AgentEpoch, AttemptId, CoordinatorEpoch, Generation, HomeworkId, IdError, NodeId, PayloadHash,
     RunId, WorkerBootId, WorkerId,
 };
 use crate::state::{AttemptState, Receipt, Receipts, Termination};
-use crate::wire::LeaseKey;
-use rusqlite::{params, Connection, OptionalExtension, Row};
+use crate::wire::{canonical_json, LeaseKey};
+use rusqlite::{params, Connection, OptionalExtension, Row, Transaction};
 use serde_json::Value;
 use std::path::Path;
 
 const ATTEMPT: &str = "worker_attempt";
+
+/// How long a worker waits for `ack_collected` after an attempt ended before
+/// it stops protecting the attempt's files from GC (spec chapter 13: seven
+/// days after terminal).
+pub const DEFAULT_ACK_WAIT_MS: u64 = 7 * 24 * 60 * 60 * 1000;
 
 fn id<T>(what: &str, r: std::result::Result<T, IdError>) -> Result<T> {
     r.map_err(|e| StorageError::Corrupt(format!("{what}: {e}")))
@@ -167,6 +172,34 @@ fn require(conn: &Connection, attempt_id: &str) -> Result<AcceptedAttempt> {
     })
 }
 
+/// Run `body` for a request that carries a coordinator epoch, in one
+/// transaction. The epoch is checked first (an older one is `StaleEpoch` and
+/// nothing is written) and a newer one is remembered. That remembering is
+/// committed even when `body` fails with a verdict (conflict, retired, not
+/// renewable, ...): the worker has seen the newer coordinator and must refuse
+/// the older one from then on. `body`'s own writes are rolled back on failure
+/// (a savepoint), so a failed request leaves nothing but the epoch.
+fn under_epoch<T, F>(db: &Db, epoch: CoordinatorEpoch, body: F) -> Result<T>
+where
+    T: Send + 'static,
+    F: FnOnce(&Transaction<'_>) -> Result<T> + Send + 'static,
+{
+    db.write_then(move |tx| {
+        observe_epoch(tx, epoch)?;
+        tx.execute_batch("SAVEPOINT body")?;
+        match body(tx) {
+            Ok(v) => {
+                tx.execute_batch("RELEASE body")?;
+                Ok(Ok(v))
+            }
+            Err(e) => {
+                tx.execute_batch("ROLLBACK TO body; RELEASE body")?;
+                Ok(Err(e))
+            }
+        }
+    })
+}
+
 /// Reject a request from an older coordinator epoch; remember the newest.
 fn observe_epoch(conn: &Connection, epoch: CoordinatorEpoch) -> Result<()> {
     let current: i64 =
@@ -283,14 +316,17 @@ impl WorkerStore {
 
     // -------------------------------------------------------------- accept
 
-    /// Persist an attempt before answering. The same attempt and payload again
-    /// returns the existing record; another payload is a conflict; an attempt
+    /// Persist an attempt before answering. The same attempt id with the same
+    /// payload, run, homework and generation returns the existing record; any
+    /// difference in those is a conflict; an attempt
     /// with a tombstone (a cancel or retire arrived first, or it was retired)
-    /// is refused with `Retired`. Nothing here starts a command.
+    /// is refused with `Retired`. A homework that has an attempt which is not
+    /// terminal refuses another one (`LiveAttemptExists`), a retired attempt
+    /// included: it counts until it is confirmed stopped (terminal). Nothing
+    /// here starts a command.
     pub fn submit(&self, new: NewAcceptance, at_ms: u64) -> Result<SubmitOutcome> {
-        self.db.write(move |tx| {
+        under_epoch(&self.db, new.coordinator_epoch, move |tx| {
             let aid = new.attempt_id.to_string();
-            observe_epoch(tx, new.coordinator_epoch)?;
             let existing = load(tx, &aid)?;
             let tombstoned = tx
                 .query_row(
@@ -302,11 +338,21 @@ impl WorkerStore {
                 .is_some();
             let verdict = decide_submit(
                 existing.as_ref().map(|e| ExistingAttempt {
-                    payload_hash: &e.payload_hash,
+                    key: SubmitKey {
+                        run_id: &e.run_id,
+                        homework_id: &e.homework_id,
+                        generation: e.generation,
+                        payload_hash: &e.payload_hash,
+                    },
                     retired: e.retired,
                 }),
                 tombstoned,
-                &new.payload_hash,
+                SubmitKey {
+                    run_id: &new.run_id,
+                    homework_id: &new.homework_id,
+                    generation: new.generation,
+                    payload_hash: &new.payload_hash,
+                },
             );
             match (verdict, existing) {
                 (SubmitDecision::Existing, Some(e)) => Ok(SubmitOutcome::Existing(e)),
@@ -317,7 +363,7 @@ impl WorkerStore {
                     let live: Option<String> = tx
                         .query_row(
                             "SELECT attempt_id FROM worker_attempt
-                             WHERE homework_id = ?1 AND state <> 'terminal' AND retired = 0",
+                             WHERE homework_id = ?1 AND state <> 'terminal'",
                             [&hw],
                             |r| r.get(0),
                         )
@@ -385,8 +431,7 @@ impl WorkerStore {
         at_ms: u64,
     ) -> Result<CancelOutcome> {
         let a = attempt_id.to_string();
-        self.db.write(move |tx| {
-            observe_epoch(tx, epoch)?;
+        under_epoch(&self.db, epoch, move |tx| {
             let Some(existing) = load(tx, &a)? else {
                 tx.execute(
                     "INSERT OR IGNORE INTO tombstone (attempt_id, kind, coordinator_epoch, recorded_at_ms)
@@ -424,8 +469,7 @@ impl WorkerStore {
         at_ms: u64,
     ) -> Result<Option<AcceptedAttempt>> {
         let a = attempt_id.to_string();
-        self.db.write(move |tx| {
-            observe_epoch(tx, epoch)?;
+        under_epoch(&self.db, epoch, move |tx| {
             tx.execute(
                 "INSERT INTO tombstone (attempt_id, kind, coordinator_epoch, recorded_at_ms)
                  VALUES (?1,'retire',?2,?3)
@@ -519,8 +563,9 @@ impl WorkerStore {
     /// Claim the right to spawn the command of `node`. The launch intent is
     /// persisted in the same commit (and the first claim moves the attempt
     /// `Ready -> Starting`), so a crash after this never loses the fact that a
-    /// spawn may have happened. Refused (an error) after a cancel or retire and
-    /// in states that cannot start commands.
+    /// spawn may have happened. Refused (an error) after a cancel or retire,
+    /// once the lease expired, and in states that cannot start commands. The
+    /// lease is read in the same transaction as the claim.
     pub fn claim_launch(
         &self,
         attempt_id: &AttemptId,
@@ -538,10 +583,19 @@ impl WorkerStore {
                     |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
                 )
                 .optional()?;
+            let lease_expired: Option<Option<i64>> = tx
+                .query_row(
+                    "SELECT expired_at_ms FROM lease WHERE attempt_id = ?1",
+                    [&a],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            let expired = lease_expired.flatten().is_some();
             let decision = decide_claim(
                 rec.state,
                 rec.cancel_requested_at_ms.is_some(),
                 rec.retired,
+                expired,
                 launch.is_some(),
             );
             match decision {
@@ -555,7 +609,11 @@ impl WorkerStore {
                 ClaimDecision::Refused => Err(StorageError::IllegalState {
                     attempt: a,
                     state: rec.state,
-                    why: "no command may start (cancelled, or not ready)",
+                    why: if expired {
+                        "the lease expired: no command may start"
+                    } else {
+                        "no command may start (cancelled, or not ready)"
+                    },
                 }),
                 ClaimDecision::StartAndGrant | ClaimDecision::Grant => {
                     if decision == ClaimDecision::StartAndGrant {
@@ -672,9 +730,8 @@ impl WorkerStore {
         at_ms: u64,
     ) -> Result<LeaseOutcome> {
         let a = attempt_id.clone();
-        self.db.write(move |tx| {
+        under_epoch(&self.db, key.coordinator_epoch, move |tx| {
             let aid = a.to_string();
-            observe_epoch(tx, key.coordinator_epoch)?;
             let rec = require(tx, &aid)?;
             let row: Option<(i64, i64, Option<i64>)> = tx
                 .query_row(
@@ -791,9 +848,14 @@ impl WorkerStore {
         self.db.call(move |c| read_log(c, &a, &s))
     }
 
-    /// Store the result of a terminal attempt, once.
+    /// Store the result of a terminal attempt, once. It is kept as canonical
+    /// JSON (the wire form: sorted keys, integers only), and a second call is
+    /// the same result when the canonical forms are equal, whatever the key
+    /// order or spacing it was built with.
     pub fn record_result(&self, attempt_id: &AttemptId, result: &Value) -> Result<()> {
-        let (a, text) = (attempt_id.to_string(), result.to_string());
+        let text = canonical_json(result)
+            .map_err(|e| StorageError::Invalid(format!("result is not canonical JSON: {e}")))?;
+        let a = attempt_id.to_string();
         self.db.write(move |tx| {
             let rec = require(tx, &a)?;
             if !rec.state.is_terminal() {
@@ -816,8 +878,16 @@ impl WorkerStore {
                     )?;
                     Ok(())
                 }
-                Some(e) if e == text => Ok(()),
-                Some(_) => Err(StorageError::Immutable(format!("result of {a}"))),
+                Some(e) => {
+                    let stored: Value = from_json("result", &e)?;
+                    let stored = canonical_json(&stored)
+                        .map_err(|e| StorageError::Corrupt(format!("result: {e}")))?;
+                    if stored == text {
+                        Ok(())
+                    } else {
+                        Err(StorageError::Immutable(format!("result of {a}")))
+                    }
+                }
             }
         })
     }
@@ -846,8 +916,7 @@ impl WorkerStore {
         at_ms: u64,
     ) -> Result<bool> {
         let a = attempt_id.to_string();
-        self.db.write(move |tx| {
-            observe_epoch(tx, epoch)?;
+        under_epoch(&self.db, epoch, move |tx| {
             let rec = require(tx, &a)?;
             if !rec.state.is_terminal() {
                 return Err(StorageError::IllegalState {
@@ -916,26 +985,58 @@ impl WorkerStore {
         self.db.write(move |tx| common::pin(tx, &r, -1))
     }
 
-    pub fn locator_in_use(&self, locator: &str) -> Result<bool> {
+    /// The files waiting to be deleted: their last reference was dropped by
+    /// GC. Delete each file, then call [`Self::complete_delete`].
+    pub fn pending_deletes(&self) -> Result<Vec<String>> {
+        self.db.call(|c| common::pending_deletes(c))
+    }
+
+    /// The file of `locator` is deleted: forget it, so the name may be used
+    /// again. Idempotent; returns whether a queued locator was removed.
+    pub fn complete_delete(&self, locator: &str) -> Result<bool> {
         let l = locator.to_string();
-        self.db.call(move |c| common::locator_in_use(c, &l))
+        self.db.write(move |tx| common::complete_delete(tx, &l))
     }
 
     /// Drop the references of attempts that ended at least `retention_ms` ago
-    /// and whose `ack_collected` arrived. Running, awaiting-collection and
-    /// pinned ones stay. Tombstones, dedup records and the journal are kept.
-    pub fn gc(&self, now_ms: u64, retention_ms: u64) -> Result<GcReport> {
-        self.db.write(move |tx| {
-            common::gc(tx, now_ms, retention_ms, |conn, r: &BlobRef| {
+    /// and whose `ack_collected` arrived, or that have waited `ack_wait_ms`
+    /// since their end without one ([`DEFAULT_ACK_WAIT_MS`]: spec chapter 13's
+    /// seven days after terminal). Running, awaiting-collection (within
+    /// that wait) and pinned ones stay. A file whose last reference goes is
+    /// queued in `pending_delete` in the same transaction; a new reference to
+    /// it is refused until `complete_delete`. Tombstones, dedup records and
+    /// the journal are kept. The pass is a series of transactions of
+    /// [`DEFAULT_GC_BATCH`] references; a busy database is
+    /// [`StorageError::Busy`] and the pass can simply be run again.
+    pub fn gc(&self, now_ms: u64, retention_ms: u64, ack_wait_ms: u64) -> Result<GcReport> {
+        self.gc_batched(now_ms, retention_ms, ack_wait_ms, DEFAULT_GC_BATCH)
+    }
+
+    pub(crate) fn gc_batched(
+        &self,
+        now_ms: u64,
+        retention_ms: u64,
+        ack_wait_ms: u64,
+        batch: u32,
+    ) -> Result<GcReport> {
+        common::gc_all(
+            &self.db,
+            now_ms,
+            retention_ms,
+            Some(ack_wait_ms),
+            batch,
+            |conn, r: &BlobRef| {
                 let rec = require(conn, &r.attempt_id)?;
                 Ok(GcCandidate {
                     terminal_at_ms: rec.terminal_at_ms,
+                    retired_at_ms: None,
                     collected: rec.acked_at_ms.is_some(),
+                    collection_failed_at_ms: None,
                     missing_required_artifacts: 0,
                     pins: r.pins,
                 })
-            })
-        })
+            },
+        )
     }
 }
 

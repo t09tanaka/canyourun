@@ -184,7 +184,7 @@ fn a_new_attempt_waits_for_a_confirmed_retire_with_a_persisted_tombstone() {
 }
 
 #[test]
-fn terminal_is_fixed_once_when_natural_end_and_cancel_race() {
+fn terminal_is_fixed_once_whichever_finalize_comes_first() {
     let f = fx();
     let a = f.attempt('a').unwrap();
     f.to_finalizing(&a.attempt_id);
@@ -624,9 +624,14 @@ fn coordinator_gc_keeps_everything_that_is_not_safely_finished() {
     assert_eq!(kept("unc-in"), Some(AwaitingCollection));
     assert_eq!(kept("fresh-in"), Some(WithinRetention));
     assert_eq!(kept("pin-in"), Some(Pinned));
-    // `blob/fresh` is still named by fresh-in, so its file must stay.
-    assert!(f.store.locator_in_use("blob/fresh").unwrap());
-    assert!(!f.store.locator_in_use("blob/old").unwrap());
+    // `blob/fresh` is still named by fresh-in, so its file must stay: it is
+    // not queued. The files nobody names any more are queued, atomically.
+    let mut queued = report.queued.clone();
+    queued.sort();
+    assert_eq!(queued, vec!["blob/old", "log/old", "log/pin"]);
+    let mut pending = f.store.pending_deletes().unwrap();
+    pending.sort();
+    assert_eq!(pending, queued);
     // After the pin is released the rest follows once old enough.
     assert_eq!(f.store.unpin_blob("pin-in").unwrap(), 0);
     let report = f.store.gc(now, 7 * DAY).unwrap();
@@ -698,15 +703,34 @@ fn wx() -> Wx {
     Wx { dir, store, id }
 }
 
+/// The run of a homework in these tests: the same homework always names the
+/// same run, so a resend is a true replay.
+fn run_of_hw(hw: &HomeworkId) -> RunId {
+    RunId::parse(&format!("run_{}", &hw.as_str()["hw_".len()..])).unwrap()
+}
+
 fn acceptance(a: &AttemptId, hw: &HomeworkId, h: char, epoch: u64) -> NewAcceptance {
     NewAcceptance {
         attempt_id: a.clone(),
-        run_id: RunId::generate(),
+        run_id: run_of_hw(hw),
         homework_id: hw.clone(),
         generation: Generation(1),
         payload_hash: hash(h),
         coordinator_epoch: CoordinatorEpoch(epoch),
         spec: json!({"cmd": "true"}),
+    }
+}
+
+/// The submit that produced `a`, byte for byte.
+fn resend_of(a: &AcceptedAttempt) -> NewAcceptance {
+    NewAcceptance {
+        attempt_id: a.attempt_id.clone(),
+        run_id: a.run_id.clone(),
+        homework_id: a.homework_id.clone(),
+        generation: a.generation,
+        payload_hash: a.payload_hash.clone(),
+        coordinator_epoch: a.coordinator_epoch,
+        spec: a.spec.clone(),
     }
 }
 
@@ -784,11 +808,54 @@ fn a_second_live_attempt_for_a_homework_is_refused() {
         .err()
         .unwrap();
     assert!(matches!(e, StorageError::LiveAttemptExists(_)), "{e:?}");
-    // Once the first is retired the next generation may come.
+    // A retired attempt still counts until it is confirmed stopped: a new
+    // submit for the homework is refused, not just delayed by the coordinator.
     w.store.retire(&a1, CoordinatorEpoch(1), 3).unwrap();
-    w.store
+    let e = w
+        .store
         .submit(acceptance(&AttemptId::generate(), &hw, 'a', 1), 4)
+        .err()
         .unwrap();
+    assert!(matches!(e, StorageError::LiveAttemptExists(ref l) if *l == a1.to_string()));
+    // The stop is confirmed by the terminal write; then the next one may come.
+    drive(
+        &w,
+        &a1,
+        &[
+            AttemptState::Preparing,
+            AttemptState::Ready,
+            AttemptState::Starting,
+            AttemptState::Active,
+            AttemptState::Finalizing,
+        ],
+    );
+    w.store.finalize(&a1, done(Outcome::Cancelled), 5).unwrap();
+    w.store
+        .submit(acceptance(&AttemptId::generate(), &hw, 'a', 1), 6)
+        .unwrap();
+}
+
+#[test]
+fn a_resend_that_differs_in_run_homework_or_generation_conflicts() {
+    let w = wx();
+    let first = accepted(&w);
+    let mut other_gen = resend_of(&first);
+    other_gen.generation = Generation(2);
+    let mut other_run = resend_of(&first);
+    other_run.run_id = RunId::generate();
+    let mut other_hw = resend_of(&first);
+    other_hw.homework_id = HomeworkId::generate();
+    for bad in [other_gen, other_run, other_hw] {
+        let e = w.store.submit(bad, 11).err().unwrap();
+        assert!(matches!(e, StorageError::PayloadConflict(_)), "{e:?}");
+        assert_eq!(e.code(), ErrorCode::Conflict);
+    }
+    // The true replay still answers, and nothing changed.
+    assert_eq!(
+        w.store.submit(resend_of(&first), 12).unwrap(),
+        SubmitOutcome::Existing(first.clone())
+    );
+    assert_eq!(w.store.get(&first.attempt_id).unwrap().unwrap(), first);
 }
 
 #[test]
@@ -879,8 +946,7 @@ fn a_retired_attempt_refuses_submit_launch_and_lease() {
         .unwrap()
         .unwrap();
     assert!(rec.retired);
-    let mut resend = acceptance(&a.attempt_id, &a.homework_id, 'a', 1);
-    resend.payload_hash = a.payload_hash.clone();
+    let resend = resend_of(&a);
     assert!(matches!(
         w.store.submit(resend, 31).err().unwrap(),
         StorageError::Retired(_)
@@ -1205,12 +1271,12 @@ fn worker_gc_waits_for_the_ack_and_the_retention_and_skips_pins() {
     w.store.pin_blob("r2").unwrap();
     let now = 1_000 + 7 * DAY;
     // r3 would be old enough too; make it recent by giving it a later terminal.
-    let report = w.store.gc(now - 1, 7 * DAY).unwrap();
+    let report = w.store.gc(now - 1, 7 * DAY, 30 * DAY).unwrap();
     assert!(
         report.removed.is_empty(),
         "one ms short of retention: {report:?}"
     );
-    let report = w.store.gc(now, 7 * DAY).unwrap();
+    let report = w.store.gc(now, 7 * DAY, 30 * DAY).unwrap();
     let removed: Vec<_> = report.removed.iter().map(|r| r.ref_id.as_str()).collect();
     assert_eq!(removed, vec!["r0", "r3"]);
     assert!(report
@@ -1224,8 +1290,7 @@ fn worker_gc_waits_for_the_ack_and_the_retention_and_skips_pins() {
         .contains(&("r4".to_string(), policy::KeepReason::NotTerminal)));
     // The dedup record of a GC'd attempt stays: an old submit is not new work.
     let old = w.store.get(&ids[0]).unwrap().unwrap();
-    let mut again = acceptance(&old.attempt_id, &old.homework_id, 'a', 1);
-    again.payload_hash = old.payload_hash.clone();
+    let again = resend_of(&old);
     assert!(matches!(
         w.store.submit(again, now).unwrap(),
         SubmitOutcome::Existing(_)
@@ -1334,4 +1399,902 @@ fn error_codes_map_to_the_wire_codes() {
     for (e, c) in cases {
         assert_eq!(e.code(), c, "{e}");
     }
+}
+
+// ======================================================= review hardening
+
+fn to_finalizing_w(w: &WorkerStore, id: &AttemptId) {
+    for s in [
+        AttemptState::Preparing,
+        AttemptState::Ready,
+        AttemptState::Starting,
+        AttemptState::Active,
+        AttemptState::Finalizing,
+    ] {
+        w.transition(id, s, 20).unwrap();
+    }
+}
+
+/// `n` independent handles on one worker database, opened at the same moment
+/// by `n` threads: each has its own connection and thread, as the agent and
+/// the supervisors do.
+fn open_together(dir: &std::path::Path, id: &WorkerId, n: usize) -> Vec<Result<WorkerStore>> {
+    let barrier = std::sync::Barrier::new(n);
+    std::thread::scope(|s| {
+        let hs: Vec<_> = (0..n)
+            .map(|_| {
+                let b = &barrier;
+                s.spawn(move || {
+                    b.wait();
+                    WorkerStore::open(dir, id)
+                })
+            })
+            .collect();
+        hs.into_iter().map(|h| h.join().unwrap()).collect()
+    })
+}
+
+fn open_many(n: usize) -> (TempDir, WorkerId, Vec<WorkerStore>) {
+    let dir = tempfile::tempdir().unwrap();
+    let id = WorkerId::parse("mini-a").unwrap();
+    let stores = open_together(dir.path(), &id, n)
+        .into_iter()
+        .map(|r| r.expect("a concurrent open must not fail"))
+        .collect();
+    (dir, id, stores)
+}
+
+/// Run `f(i, store)` on every handle at the same moment.
+fn together<T: Send>(
+    stores: &[WorkerStore],
+    f: impl Fn(usize, &WorkerStore) -> T + Sync,
+) -> Vec<T> {
+    let barrier = std::sync::Barrier::new(stores.len());
+    std::thread::scope(|s| {
+        let hs: Vec<_> = stores
+            .iter()
+            .enumerate()
+            .map(|(i, st)| {
+                let (b, f) = (&barrier, &f);
+                s.spawn(move || {
+                    b.wait();
+                    f(i, st)
+                })
+            })
+            .collect();
+        hs.into_iter().map(|h| h.join().unwrap()).collect()
+    })
+}
+
+fn no_busy<T>(rs: &[Result<T>]) {
+    for r in rs {
+        if let Err(e) = r {
+            assert!(!e.is_retryable(), "a busy error leaked: {e:?}");
+        }
+    }
+}
+
+#[test]
+fn many_connections_opening_a_fresh_worker_database_at_once_all_succeed() {
+    for _ in 0..5 {
+        let dir = tempfile::tempdir().unwrap();
+        let id = WorkerId::parse("mini-a").unwrap();
+        let opened = open_together(dir.path(), &id, 8);
+        no_busy(&opened);
+        let stores: Vec<_> = opened.into_iter().map(|r| r.unwrap()).collect();
+        let rows: i64 = stores[0]
+            .db
+            .call(|c| Ok(c.query_row("SELECT count(*) FROM worker_state", [], |r| r.get(0))?))
+            .unwrap();
+        assert_eq!(rows, 1);
+        let version: String = stores[0]
+            .db
+            .call(|c| {
+                Ok(c.query_row(
+                    "SELECT value FROM schema_meta WHERE key='schema_version'",
+                    [],
+                    |r| r.get(0),
+                )?)
+            })
+            .unwrap();
+        assert_eq!(version, "1");
+    }
+}
+
+#[test]
+fn concurrent_finalize_from_separate_connections_has_one_winner() {
+    let (_dir, _id, stores) = open_many(6);
+    let acc = acceptance(&AttemptId::generate(), &HomeworkId::generate(), 'a', 1);
+    let a = acc.attempt_id.clone();
+    stores[0].submit(acc, 1).unwrap();
+    to_finalizing_w(&stores[0], &a);
+    let outcomes = [
+        Outcome::Succeeded,
+        Outcome::Cancelled,
+        Outcome::Failed,
+        Outcome::Interrupted,
+        Outcome::Succeeded,
+        Outcome::Failed,
+    ];
+    let results = together(&stores, |i, st| st.finalize(&a, done(outcomes[i]), 40));
+    no_busy(&results);
+    let results: Vec<Finalized> = results.into_iter().map(|r| r.unwrap()).collect();
+    assert_eq!(results.iter().filter(|r| r.won()).count(), 1);
+    let winner = results.iter().find(|r| r.won()).unwrap().termination();
+    assert!(results.iter().all(|r| r.termination() == winner));
+    assert_eq!(
+        stores[0].get(&a).unwrap().unwrap().termination,
+        Some(winner)
+    );
+    let terminal_events = stores[0]
+        .events_after(0, 1000)
+        .unwrap()
+        .into_iter()
+        .filter(|e| e.kind == "attempt_terminal")
+        .count();
+    assert_eq!(terminal_events, 1);
+}
+
+#[test]
+fn concurrent_claim_launch_grants_each_node_once() {
+    let (_dir, _id, stores) = open_many(6);
+    let acc = acceptance(&AttemptId::generate(), &HomeworkId::generate(), 'a', 1);
+    let a = acc.attempt_id.clone();
+    stores[0].submit(acc, 1).unwrap();
+    for s in TO_READY {
+        stores[0].transition(&a, s, 2).unwrap();
+    }
+    // The same node from six connections: one grant, five already-claimed.
+    let results = together(&stores, |_, st| st.claim_launch(&a, &node("build"), 30));
+    no_busy(&results);
+    let results: Vec<LaunchClaim> = results.into_iter().map(|r| r.unwrap()).collect();
+    assert_eq!(
+        results
+            .iter()
+            .filter(|c| **c == LaunchClaim::Granted)
+            .count(),
+        1
+    );
+    assert_eq!(
+        results
+            .iter()
+            .filter(|c| matches!(c, LaunchClaim::AlreadyClaimed { .. }))
+            .count(),
+        5
+    );
+    assert_eq!(
+        stores[0].get(&a).unwrap().unwrap().state,
+        AttemptState::Starting
+    );
+    // Six different nodes at once: every one is granted, the attempt moves to
+    // Starting only once.
+    let acc = acceptance(&AttemptId::generate(), &HomeworkId::generate(), 'a', 1);
+    let b = acc.attempt_id.clone();
+    stores[0].submit(acc, 3).unwrap();
+    for s in TO_READY {
+        stores[0].transition(&b, s, 4).unwrap();
+    }
+    let results = together(&stores, |i, st| {
+        st.claim_launch(&b, &node(&format!("n{i}")), 31)
+    });
+    no_busy(&results);
+    assert!(results
+        .into_iter()
+        .all(|r| r.unwrap() == LaunchClaim::Granted));
+    assert_eq!(stores[0].launches(&b).unwrap().len(), 6);
+    let starts = stores[0]
+        .events_after(0, 1000)
+        .unwrap()
+        .into_iter()
+        .filter(|e| {
+            e.attempt_id.as_deref() == Some(b.as_str())
+                && e.kind == "attempt_state"
+                && e.payload["to"] == "starting"
+        })
+        .count();
+    assert_eq!(starts, 1);
+}
+
+#[test]
+fn concurrent_submits_have_one_winner_and_no_busy_errors() {
+    let (_dir, _id, stores) = open_many(6);
+    // The same attempt six times: one Accepted, five Existing.
+    let acc = acceptance(&AttemptId::generate(), &HomeworkId::generate(), 'a', 1);
+    let results = together(&stores, |_, st| st.submit(acc.clone(), 5));
+    no_busy(&results);
+    let results: Vec<SubmitOutcome> = results.into_iter().map(|r| r.unwrap()).collect();
+    assert_eq!(
+        results
+            .iter()
+            .filter(|r| matches!(r, SubmitOutcome::Accepted(_)))
+            .count(),
+        1
+    );
+    assert_eq!(
+        results
+            .iter()
+            .filter(|r| matches!(r, SubmitOutcome::Existing(_)))
+            .count(),
+        5
+    );
+    // Six different attempts for one homework: exactly one gets in.
+    let hw = HomeworkId::generate();
+    let results = together(&stores, |_, st| {
+        st.submit(acceptance(&AttemptId::generate(), &hw, 'a', 1), 6)
+    });
+    no_busy(&results);
+    assert_eq!(results.iter().filter(|r| r.is_ok()).count(), 1);
+    assert!(results
+        .iter()
+        .filter_map(|r| r.as_ref().err())
+        .all(|e| matches!(e, StorageError::LiveAttemptExists(_))));
+}
+
+#[test]
+fn a_busy_database_is_a_retryable_error_and_changes_nothing() {
+    let (_dir, id, stores) = open_many(2);
+    let (holder, other) = (&stores[0], &stores[1]);
+    // A short wait on the second connection, so the test is quick.
+    other
+        .db
+        .call(|c| {
+            c.busy_timeout(std::time::Duration::from_millis(20))?;
+            Ok(())
+        })
+        .unwrap();
+    let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+    let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+    let acc = acceptance(&AttemptId::generate(), &HomeworkId::generate(), 'a', 1);
+    std::thread::scope(|s| {
+        s.spawn(|| {
+            holder
+                .db
+                .write(move |_tx| {
+                    locked_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                    Ok(())
+                })
+                .unwrap();
+        });
+        locked_rx.recv().unwrap();
+        let e = other.submit(acc.clone(), 1).err().unwrap();
+        assert!(matches!(e, StorageError::Busy), "{e:?}");
+        assert!(e.is_retryable());
+        assert_eq!(e.code(), ErrorCode::Internal);
+        assert!(!StorageError::Closed.is_retryable());
+        let e = other.gc(1, 1, 1).err().unwrap();
+        assert!(e.is_retryable());
+        release_tx.send(()).unwrap();
+    });
+    // The same call, retried, goes through; the failed one left nothing.
+    assert!(other.get(&acc.attempt_id).unwrap().is_none());
+    assert!(matches!(
+        other.submit(acc, 2).unwrap(),
+        SubmitOutcome::Accepted(_)
+    ));
+    assert_eq!(other.worker_id(), &id);
+}
+
+#[test]
+fn a_failed_request_still_remembers_the_newer_coordinator_epoch() {
+    let w = wx();
+    // submit: a payload conflict at epoch 5 must not forget epoch 5.
+    let (a, hw) = (AttemptId::generate(), HomeworkId::generate());
+    w.store.submit(acceptance(&a, &hw, 'a', 1), 1).unwrap();
+    let e = w
+        .store
+        .submit(acceptance(&a, &hw, 'b', 5), 2)
+        .err()
+        .unwrap();
+    assert!(matches!(e, StorageError::PayloadConflict(_)));
+    let e = w
+        .store
+        .submit(acceptance(&a, &hw, 'a', 4), 3)
+        .err()
+        .unwrap();
+    assert!(matches!(e, StorageError::StaleEpoch { .. }), "{e:?}");
+    // A live-attempt refusal rolls back its own writes and keeps the epoch.
+    let e = w
+        .store
+        .submit(acceptance(&AttemptId::generate(), &hw, 'a', 7), 4)
+        .err()
+        .unwrap();
+    assert!(matches!(e, StorageError::LiveAttemptExists(_)));
+    assert_eq!(w.store.list_nonterminal().unwrap().len(), 1);
+    let e = w.store.cancel(&a, CoordinatorEpoch(6), 5).err().unwrap();
+    assert!(matches!(e, StorageError::StaleEpoch { .. }), "{e:?}");
+    // renew_lease on a retired attempt fails at epoch 9 and still raises it.
+    w.store.retire(&a, CoordinatorEpoch(7), 6).unwrap();
+    let e = w.store.renew_lease(&a, key(9, 1), 7).err().unwrap();
+    assert!(matches!(e, StorageError::LeaseNotRenewable(_)));
+    let e = w.store.retire(&a, CoordinatorEpoch(8), 8).err().unwrap();
+    assert!(matches!(e, StorageError::StaleEpoch { .. }), "{e:?}");
+    // ack_collected on a non-terminal attempt, same.
+    let e = w
+        .store
+        .ack_collected(&a, CoordinatorEpoch(12), 9)
+        .err()
+        .unwrap();
+    assert!(matches!(e, StorageError::IllegalState { .. }));
+    let e = w.store.cancel(&a, CoordinatorEpoch(11), 10).err().unwrap();
+    assert!(matches!(e, StorageError::StaleEpoch { .. }), "{e:?}");
+    // And the same epoch is still fine.
+    w.store.cancel(&a, CoordinatorEpoch(12), 11).unwrap();
+}
+
+#[test]
+fn an_expired_lease_refuses_a_new_launch_claim_but_not_a_replay() {
+    let w = wx();
+    let a = accepted(&w);
+    let id = &a.attempt_id;
+    drive(&w, id, &TO_READY);
+    w.store.renew_lease(id, key(1, 1), 25).unwrap();
+    assert_eq!(
+        w.store.claim_launch(id, &node("build"), 30).unwrap(),
+        LaunchClaim::Granted
+    );
+    w.store.expire_lease(id, 40).unwrap();
+    let e = w.store.claim_launch(id, &node("test"), 41).err().unwrap();
+    assert!(
+        matches!(e, StorageError::IllegalState { why, .. } if why.contains("lease expired")),
+        "{e:?}"
+    );
+    assert_eq!(w.store.launches(id).unwrap().len(), 1);
+    // The earlier claim is still reported, so recovery can check the process.
+    assert_eq!(
+        w.store.claim_launch(id, &node("build"), 42).unwrap(),
+        LaunchClaim::AlreadyClaimed { identity: None }
+    );
+    // The first claim of a ready attempt is refused too once it expired.
+    let b = accepted(&w);
+    drive(&w, &b.attempt_id, &TO_READY);
+    w.store.expire_lease(&b.attempt_id, 50).unwrap();
+    assert!(w.store.claim_launch(&b.attempt_id, &node("n"), 51).is_err());
+    assert_eq!(
+        w.store.get(&b.attempt_id).unwrap().unwrap().state,
+        AttemptState::Ready
+    );
+}
+
+#[test]
+fn a_result_is_the_same_when_its_canonical_form_is_the_same() {
+    let w = wx();
+    let a = accepted(&w);
+    to_finalizing_w(&w.store, &a.attempt_id);
+    w.store
+        .finalize(&a.attempt_id, done(Outcome::Succeeded), 9)
+        .unwrap();
+    let one: serde_json::Value =
+        serde_json::from_str(r#"{"b": 2, "a": {"y": 1, "x": [1, 2]}}"#).unwrap();
+    let same: serde_json::Value =
+        serde_json::from_str(r#"{ "a":{"x":[1,2],"y":1},"b":2 }"#).unwrap();
+    w.store.record_result(&a.attempt_id, &one).unwrap();
+    w.store.record_result(&a.attempt_id, &same).unwrap();
+    let different: serde_json::Value =
+        serde_json::from_str(r#"{"a":{"x":[2,1],"y":1},"b":2}"#).unwrap();
+    assert!(matches!(
+        w.store
+            .record_result(&a.attempt_id, &different)
+            .err()
+            .unwrap(),
+        StorageError::Immutable(_)
+    ));
+    // What is stored is the canonical text.
+    let text: String = w
+        .store
+        .db
+        .call(|c| {
+            Ok(c.query_row(
+                "SELECT result_json FROM worker_attempt WHERE result_json IS NOT NULL",
+                [],
+                |r| r.get(0),
+            )?)
+        })
+        .unwrap();
+    assert_eq!(text, r#"{"a":{"x":[1,2],"y":1},"b":2}"#);
+    // Floats are not wire JSON.
+    assert!(matches!(
+        w.store
+            .record_result(&a.attempt_id, &json!({"x": 1.5}))
+            .err()
+            .unwrap(),
+        StorageError::Invalid(_)
+    ));
+}
+
+#[test]
+fn tombstones_keep_their_identity_even_against_sql() {
+    let w = wx();
+    let (a, hw) = (AttemptId::generate(), HomeworkId::generate());
+    w.store.cancel(&a, CoordinatorEpoch(3), 5).unwrap();
+    let exec = |sql: &'static str| {
+        let a = a.to_string();
+        w.store.db.call(move |c| Ok(c.execute(sql, [&a])?))
+    };
+    assert!(exec("UPDATE tombstone SET attempt_id = 'att_other' WHERE attempt_id = ?1").is_err());
+    assert!(exec("UPDATE tombstone SET coordinator_epoch = 9 WHERE attempt_id = ?1").is_err());
+    assert!(exec("UPDATE tombstone SET recorded_at_ms = 1 WHERE attempt_id = ?1").is_err());
+    assert!(exec("DELETE FROM tombstone WHERE attempt_id = ?1").is_err());
+    // A cancel may grow into a retire (what `retire` does), and no further back.
+    assert_eq!(
+        exec("UPDATE tombstone SET kind = 'retire' WHERE attempt_id = ?1").unwrap(),
+        1
+    );
+    assert!(exec("UPDATE tombstone SET kind = 'cancel' WHERE attempt_id = ?1").is_err());
+    w.store.retire(&a, CoordinatorEpoch(3), 6).unwrap();
+    assert_eq!(w.store.tombstone(&a).unwrap().as_deref(), Some("retire"));
+    let _ = hw;
+}
+
+#[test]
+fn a_retire_tombstone_only_gains_its_confirmation() {
+    let f = fx();
+    let a = f.attempt('a').unwrap();
+    f.store.begin_retire(&a.attempt_id, "lost", 5).unwrap();
+    let exec = |sql: &'static str| {
+        let id = a.attempt_id.to_string();
+        f.store.db.call(move |c| Ok(c.execute(sql, [&id])?))
+    };
+    assert!(exec("UPDATE retire_tombstone SET reason = 'x' WHERE attempt_id = ?1").is_err());
+    assert!(exec("UPDATE retire_tombstone SET requested_at_ms = 1 WHERE attempt_id = ?1").is_err());
+    assert!(exec("UPDATE retire_tombstone SET worker_id = 'w' WHERE attempt_id = ?1").is_err());
+    f.store.confirm_retire(&a.attempt_id, 7).unwrap();
+    // A second confirmation is a no-op through the API, and SQL cannot move it.
+    f.store.confirm_retire(&a.attempt_id, 9).unwrap();
+    assert_eq!(
+        f.store.retire_tombstone(&a.attempt_id).unwrap(),
+        Some((5, Some(7)))
+    );
+    assert!(
+        exec("UPDATE retire_tombstone SET confirmed_at_ms = 99 WHERE attempt_id = ?1").is_err()
+    );
+    assert_eq!(
+        f.store
+            .get_attempt(&a.attempt_id)
+            .unwrap()
+            .unwrap()
+            .retired_at_ms,
+        Some(7)
+    );
+}
+
+#[test]
+fn a_released_permit_asked_for_again_is_returned_as_released() {
+    let f = fx();
+    f.store.create_matrix_group("g", &f.run, 1, 1).unwrap();
+    let p = PermitId::generate();
+    assert!(f.store.acquire_permit("g", &p, 2).unwrap().unwrap().held);
+    f.store.release_permit(&p, 3).unwrap();
+    let again = f.store.acquire_permit("g", &p, 4).unwrap().unwrap();
+    assert!(!again.held, "a released permit is not given back");
+    assert_eq!(f.store.held_permits("g").unwrap(), 0);
+    // It took no slot: a new id still gets the only one.
+    assert!(f
+        .store
+        .acquire_permit("g", &PermitId::generate(), 5)
+        .unwrap()
+        .is_some());
+}
+
+// ------------------------------------------------------------ gc: files
+
+#[test]
+fn the_last_reference_queues_the_file_and_a_new_reference_to_it_is_refused() {
+    let w = wx();
+    let a = accepted(&w);
+    let id = &a.attempt_id;
+    to_finalizing_w(&w.store, id);
+    w.store
+        .finalize(id, done(Outcome::Succeeded), 1_000)
+        .unwrap();
+    w.store
+        .ack_collected(id, CoordinatorEpoch(1), 1_001)
+        .unwrap();
+    let live = accepted(&w);
+    w.store
+        .add_blob_ref(&blob("r1", id, BlobKind::Log, "log/one"), 1)
+        .unwrap();
+    // A second reference to the same file, held by an attempt that is still running.
+    w.store
+        .add_blob_ref(&blob("r2", &live.attempt_id, BlobKind::Input, "log/one"), 1)
+        .unwrap();
+    w.store
+        .add_blob_ref(&blob("r3", id, BlobKind::Result, "res/two"), 1)
+        .unwrap();
+    let now = 1_000 + 7 * DAY;
+    let report = w.store.gc(now, 7 * DAY, 30 * DAY).unwrap();
+    // log/one is still named by r2; only res/two is queued.
+    assert_eq!(report.queued, vec!["res/two"]);
+    assert_eq!(w.store.pending_deletes().unwrap(), vec!["res/two"]);
+    // The file's name cannot be taken again before the deletion is confirmed.
+    let e = w
+        .store
+        .add_blob_ref(&blob("r4", &live.attempt_id, BlobKind::Log, "res/two"), now)
+        .err()
+        .unwrap();
+    assert!(matches!(e, StorageError::LocatorPendingDelete(ref l) if l == "res/two"));
+    assert_eq!(e.code(), ErrorCode::Conflict);
+    // Another name is fine.
+    w.store
+        .add_blob_ref(
+            &blob("r5", &live.attempt_id, BlobKind::Log, "res/three"),
+            now,
+        )
+        .unwrap();
+    // After the file is deleted and confirmed the name is free; confirming twice is harmless.
+    assert!(w.store.complete_delete("res/two").unwrap());
+    assert!(!w.store.complete_delete("res/two").unwrap());
+    assert!(w.store.pending_deletes().unwrap().is_empty());
+    w.store
+        .add_blob_ref(&blob("r4", &live.attempt_id, BlobKind::Log, "res/two"), now)
+        .unwrap();
+    // A second pass does not queue anything that still has a reference.
+    assert!(w
+        .store
+        .gc(now, 7 * DAY, 30 * DAY)
+        .unwrap()
+        .queued
+        .is_empty());
+}
+
+#[test]
+fn gc_and_a_new_reference_from_another_connection_never_leave_a_dangling_file() {
+    let (_dir, _id, stores) = open_many(2);
+    for round in 0..30 {
+        let acc = acceptance(&AttemptId::generate(), &HomeworkId::generate(), 'a', 1);
+        let a = acc.attempt_id.clone();
+        stores[0].submit(acc, 1).unwrap();
+        to_finalizing_w(&stores[0], &a);
+        stores[0]
+            .finalize(&a, done(Outcome::Succeeded), 1_000)
+            .unwrap();
+        stores[0]
+            .ack_collected(&a, CoordinatorEpoch(1), 1_001)
+            .unwrap();
+        let loc = format!("file/{round}");
+        stores[0]
+            .add_blob_ref(&blob(&format!("old{round}"), &a, BlobKind::Log, &loc), 1)
+            .unwrap();
+        let now = 1_000 + 7 * DAY;
+        let new_ref = blob(&format!("new{round}"), &a, BlobKind::Log, &loc);
+        let barrier = std::sync::Barrier::new(2);
+        let (gc_result, add_result) = std::thread::scope(|s| {
+            let g = s.spawn(|| {
+                barrier.wait();
+                stores[0].gc(now, 7 * DAY, 30 * DAY)
+            });
+            let ad = s.spawn(|| {
+                barrier.wait();
+                stores[1].add_blob_ref(&new_ref, now)
+            });
+            (g.join().unwrap(), ad.join().unwrap())
+        });
+        gc_result.unwrap();
+        // Either the new reference got in first (then the file is not queued
+        // by anyone who saw it) or it was refused. Never both a live
+        // reference and a queued deletion for the same file.
+        let (refs, queued): (i64, i64) = stores[0]
+            .db
+            .call({
+                let loc = loc.clone();
+                move |c| {
+                    Ok((
+                        c.query_row(
+                            "SELECT count(*) FROM blob_ref WHERE locator = ?1",
+                            [&loc],
+                            |r| r.get(0),
+                        )?,
+                        c.query_row(
+                            "SELECT count(*) FROM pending_delete WHERE locator = ?1",
+                            [&loc],
+                            |r| r.get(0),
+                        )?,
+                    ))
+                }
+            })
+            .unwrap();
+        assert!(
+            !(refs > 0 && queued > 0),
+            "round {round}: {refs} refs, {queued} queued"
+        );
+        match add_result {
+            Ok(()) => {}
+            Err(StorageError::LocatorPendingDelete(_)) => assert_eq!(queued, 1),
+            Err(e) => panic!("round {round}: {e:?}"),
+        }
+    }
+}
+
+#[test]
+fn gc_runs_in_batches_and_a_failed_batch_keeps_what_the_earlier_ones_did() {
+    let w = wx();
+    let a = accepted(&w);
+    let id = &a.attempt_id;
+    to_finalizing_w(&w.store, id);
+    w.store
+        .finalize(id, done(Outcome::Succeeded), 1_000)
+        .unwrap();
+    w.store
+        .ack_collected(id, CoordinatorEpoch(1), 1_001)
+        .unwrap();
+    for i in 0..25 {
+        w.store
+            .add_blob_ref(
+                &blob(&format!("r{i:02}"), id, BlobKind::Log, &format!("f/{i:02}")),
+                1,
+            )
+            .unwrap();
+    }
+    w.store.pin_blob("r03").unwrap();
+    let now = 1_000 + 7 * DAY;
+    // Batches of 10: 10 + 10 + 5 references examined, one transaction each.
+    let report = w.store.gc_batched(now, 7 * DAY, 30 * DAY, 10).unwrap();
+    assert_eq!(report.removed.len(), 24);
+    assert_eq!(report.kept.len(), 1);
+    assert_eq!(report.queued.len(), 24);
+    assert_eq!(w.store.pending_deletes().unwrap().len(), 24);
+    assert!(w.store.gc_batched(now, 7 * DAY, 30 * DAY, 0).is_err());
+
+    // A pass that fails in its second batch: the first batch is committed and
+    // its files are queued, so nothing is lost and nothing is half-done.
+    let w2 = wx();
+    let a2 = accepted(&w2);
+    to_finalizing_w(&w2.store, &a2.attempt_id);
+    w2.store
+        .finalize(&a2.attempt_id, done(Outcome::Succeeded), 1_000)
+        .unwrap();
+    for i in 0..6 {
+        w2.store
+            .add_blob_ref(
+                &blob(
+                    &format!("r{i}"),
+                    &a2.attempt_id,
+                    BlobKind::Log,
+                    &format!("g/{i}"),
+                ),
+                1,
+            )
+            .unwrap();
+    }
+    let calls = std::sync::atomic::AtomicU32::new(0);
+    let calls = std::sync::Arc::new(calls);
+    let c2 = calls.clone();
+    let failing = super::common::gc_all(&w2.store.db, now, 7 * DAY, None, 3, move |_, _| {
+        if c2.fetch_add(1, std::sync::atomic::Ordering::SeqCst) >= 3 {
+            Err(StorageError::Busy)
+        } else {
+            Ok(policy::GcCandidate {
+                terminal_at_ms: Some(1_000),
+                retired_at_ms: None,
+                collected: true,
+                collection_failed_at_ms: None,
+                missing_required_artifacts: 0,
+                pins: 0,
+            })
+        }
+    });
+    assert!(failing.unwrap_err().is_retryable());
+    assert_eq!(
+        w2.store.pending_deletes().unwrap().len(),
+        3,
+        "first batch kept"
+    );
+    let rest: i64 = w2
+        .store
+        .db
+        .call(|c| Ok(c.query_row("SELECT count(*) FROM blob_ref", [], |r| r.get(0))?))
+        .unwrap();
+    assert_eq!(rest, 3, "the failed batch rolled back");
+}
+
+// -------------------------------------------- gc: every end has a deadline
+
+#[test]
+fn coordinator_gc_reaches_a_deadline_for_every_way_an_attempt_can_end() {
+    let f = fx();
+    let mk = || -> AttemptRecord {
+        let hw = HomeworkId::generate();
+        f.store.create_homework(&hw, &f.run, &json!({}), 1).unwrap();
+        f.store
+            .create_attempt(
+                NewAttempt {
+                    attempt_id: AttemptId::generate(),
+                    homework_id: hw,
+                    worker_id: f.worker.clone(),
+                    payload_hash: hash('a'),
+                    permit_id: None,
+                },
+                1,
+            )
+            .unwrap()
+    };
+    let end = |a: &AttemptRecord, at: u64| {
+        f.to_finalizing(&a.attempt_id);
+        f.store
+            .finalize_attempt(&a.attempt_id, done(Outcome::Failed), at)
+            .unwrap();
+    };
+    let add = |r: &str, a: &AttemptRecord| {
+        f.store
+            .add_blob_ref(&blob(r, &a.attempt_id, BlobKind::Log, &format!("l/{r}")), 1)
+            .unwrap();
+    };
+    // 1. terminal, outputs never recovered, collection given up.
+    let given_up = mk();
+    end(&given_up, 1_000);
+    f.store
+        .declare_artifact(&given_up.attempt_id, "bin", true)
+        .unwrap();
+    add("given-up", &given_up);
+    // 2. terminal, nobody has given up yet: still waited for.
+    let waiting = mk();
+    end(&waiting, 1_000);
+    f.store
+        .declare_artifact(&waiting.attempt_id, "bin", true)
+        .unwrap();
+    add("waiting", &waiting);
+    // 3. never terminal, retire confirmed.
+    let retired = mk();
+    f.store
+        .begin_retire(&retired.attempt_id, "unknown", 2)
+        .unwrap();
+    f.store.confirm_retire(&retired.attempt_id, 3_000).unwrap();
+    add("retired", &retired);
+    // 4. never terminal, retire only requested: it may still run.
+    let unconfirmed = mk();
+    f.store
+        .begin_retire(&unconfirmed.attempt_id, "unknown", 2)
+        .unwrap();
+    add("unconfirmed", &unconfirmed);
+    // 5. running.
+    let running = mk();
+    add("running", &running);
+    // 6. retired and pinned.
+    let pinned = mk();
+    f.store.begin_retire(&pinned.attempt_id, "x", 2).unwrap();
+    f.store.confirm_retire(&pinned.attempt_id, 3_000).unwrap();
+    add("pinned", &pinned);
+    f.store.pin_blob("pinned").unwrap();
+
+    // The recording API: terminal only, first time wins, never for collected.
+    assert!(matches!(
+        f.store
+            .record_collection_failed(&running.attempt_id, 5)
+            .err()
+            .unwrap(),
+        StorageError::IllegalState { .. }
+    ));
+    assert!(f
+        .store
+        .record_collection_failed(&given_up.attempt_id, 5_000)
+        .unwrap());
+    assert!(!f
+        .store
+        .record_collection_failed(&given_up.attempt_id, 6_000)
+        .unwrap());
+    let rec = f.store.get_attempt(&given_up.attempt_id).unwrap().unwrap();
+    assert_eq!(rec.collection_failed_at_ms, Some(5_000));
+    let collected = mk();
+    end(&collected, 1_000);
+    f.store
+        .mark_collected(&collected.attempt_id, 2_000)
+        .unwrap();
+    assert!(f
+        .store
+        .record_collection_failed(&collected.attempt_id, 3)
+        .is_err());
+    assert!(f
+        .store
+        .record_collection_failed(&AttemptId::generate(), 3)
+        .is_err());
+
+    // Within the retention measured from the later of the end events: nothing.
+    let r = 7 * DAY;
+    let report = f.store.gc(3_000 + r - 1, r).unwrap();
+    assert!(report.removed.is_empty(), "{report:?}");
+    // Retired (3_000) is old enough before given-up (5_000) is.
+    let report = f.store.gc(3_000 + r, r).unwrap();
+    let removed: Vec<_> = report.removed.iter().map(|x| x.ref_id.as_str()).collect();
+    assert_eq!(removed, vec!["retired"]);
+    let report = f.store.gc(5_000 + r, r).unwrap();
+    let removed: Vec<_> = report.removed.iter().map(|x| x.ref_id.as_str()).collect();
+    assert_eq!(removed, vec!["given-up"]);
+    // Much later still: only what may legitimately still be needed is left.
+    let report = f.store.gc(u64::MAX / 2, r).unwrap();
+    assert!(report.removed.is_empty(), "{report:?}");
+    let kept = |id: &str| report.kept.iter().find(|(r, _)| r == id).map(|(_, k)| *k);
+    use policy::KeepReason::*;
+    assert_eq!(kept("waiting"), Some(AwaitingCollection));
+    assert_eq!(kept("unconfirmed"), Some(NotTerminal));
+    assert_eq!(kept("running"), Some(NotTerminal));
+    assert_eq!(kept("pinned"), Some(Pinned));
+    // The pin goes, the retired attempt follows.
+    f.store.unpin_blob("pinned").unwrap();
+    assert_eq!(f.store.gc(u64::MAX / 2, r).unwrap().removed.len(), 1);
+    // Once the waiting one is given up it follows as well.
+    f.store
+        .record_collection_failed(&waiting.attempt_id, 9_000)
+        .unwrap();
+    assert_eq!(f.store.gc(9_000 + r - 1, r).unwrap().removed.len(), 0);
+    assert_eq!(f.store.gc(9_000 + r, r).unwrap().removed.len(), 1);
+}
+
+#[test]
+fn worker_gc_gives_up_waiting_for_an_ack_that_never_comes() {
+    let w = wx();
+    let finish = |outcome: Outcome, retire: bool| -> AttemptId {
+        let a = accepted(&w);
+        to_finalizing_w(&w.store, &a.attempt_id);
+        if retire {
+            w.store
+                .retire(&a.attempt_id, CoordinatorEpoch(1), 500)
+                .unwrap();
+        }
+        w.store
+            .finalize(&a.attempt_id, done(outcome), 1_000)
+            .unwrap();
+        a.attempt_id
+    };
+    let plain = finish(Outcome::Succeeded, false);
+    let retired = finish(Outcome::Cancelled, true);
+    let acked = finish(Outcome::Succeeded, false);
+    w.store
+        .ack_collected(&acked, CoordinatorEpoch(1), 1_001)
+        .unwrap();
+    let running = accepted(&w).attempt_id;
+    let pinned = finish(Outcome::Failed, false);
+    for (i, a) in [&plain, &retired, &acked, &running, &pinned]
+        .into_iter()
+        .enumerate()
+    {
+        w.store
+            .add_blob_ref(
+                &blob(&format!("r{i}"), a, BlobKind::Result, &format!("res/{i}")),
+                1,
+            )
+            .unwrap();
+    }
+    w.store.pin_blob("r4").unwrap();
+    let (retention, wait) = (7 * DAY, 7 * DAY);
+    // The acked one is collectable at retention; the others are still awaited.
+    let rep = w.store.gc(1_000 + retention, retention, wait + 1).unwrap();
+    assert_eq!(
+        rep.removed
+            .iter()
+            .map(|r| r.ref_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["r2"]
+    );
+    // Once the wait has passed too, the unacked and the retired ones go; the
+    // running one and the pinned one never.
+    let rep = w.store.gc(1_000 + wait - 1, retention, wait).unwrap();
+    assert!(rep.removed.is_empty());
+    let rep = w.store.gc(1_000 + wait, retention, wait).unwrap();
+    let mut removed: Vec<_> = rep.removed.iter().map(|r| r.ref_id.as_str()).collect();
+    removed.sort();
+    assert_eq!(removed, vec!["r0", "r1"]);
+    let rep = w.store.gc(u64::MAX / 2, retention, wait).unwrap();
+    assert!(rep.removed.is_empty());
+    assert_eq!(rep.kept.len(), 2);
+    assert_eq!(DEFAULT_ACK_WAIT_MS, 7 * DAY);
+}
+
+#[test]
+fn a_retired_attempt_blocks_a_new_submit_until_it_is_terminal_even_on_the_database() {
+    let w = wx();
+    let a = accepted(&w);
+    w.store
+        .retire(&a.attempt_id, CoordinatorEpoch(1), 5)
+        .unwrap();
+    // The index itself says so, not only the check in `submit`.
+    let hw = a.homework_id.to_string();
+    let second = w.store.db.write(move |tx| {
+        Ok(tx.execute(
+            "INSERT INTO worker_attempt (attempt_id, run_id, homework_id, generation, payload_hash,
+                coordinator_epoch, spec_json, state, receipts_json, accepted_at_ms)
+             VALUES ('att_x','run_x',?1,2,'h',1,'{}','accepted','{}',1)",
+            [&hw],
+        )?)
+    });
+    assert!(second.is_err());
 }

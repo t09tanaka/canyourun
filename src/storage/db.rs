@@ -92,6 +92,26 @@ impl Db {
     }
 }
 
+impl Db {
+    /// Like [`Db::write`], for a call whose business verdict may be an error
+    /// that must not undo the writes made before it (a remembered epoch). `f`
+    /// returns the verdict as a value: `Ok(verdict)` commits and then yields
+    /// the verdict, whatever it is. An `Err` from `f` itself (a storage fault)
+    /// rolls back as in `write`.
+    pub fn write_then<T, F>(&self, f: F) -> Result<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(&rusqlite::Transaction<'_>) -> Result<Result<T>> + Send + 'static,
+    {
+        self.call(move |conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let verdict = f(&tx)?;
+            tx.commit()?;
+            verdict
+        })
+    }
+}
+
 fn spawn(conn: Connection, path: &Path) -> Db {
     let (tx, rx) = mpsc::channel::<Job>();
     let join = std::thread::Builder::new()
@@ -164,6 +184,16 @@ fn read_version(tx: &rusqlite::Transaction<'_>) -> Result<u32> {
 }
 
 /// `open` with an explicit step list and table (tests use their own).
+///
+/// Several processes open one database at about the same moment (the agent
+/// and the supervisors; the very first open creates the file). SQLite does
+/// not apply the busy timeout to every step of that (switching to WAL, the
+/// first read of a file another connection is creating, which can even look
+/// foreign half-way), so a read-write open holds an exclusive file lock
+/// (`<db>.init-lock`) while it sets the file up, and a `Busy` that still
+/// escapes is retried with a fresh connection until the busy timeout has
+/// passed. Nothing has been written when the setup fails: every step is its
+/// own transaction.
 pub(crate) fn open_with(
     path: &Path,
     kind: &str,
@@ -171,6 +201,50 @@ pub(crate) fn open_with(
     table: CompatTable,
     access: Access,
 ) -> Result<Db> {
+    let started = std::time::Instant::now();
+    let mut pause = Duration::from_millis(2);
+    loop {
+        match open_once(path, kind, steps, table, access) {
+            Err(e) if e.is_retryable() && started.elapsed() < BUSY_TIMEOUT => {
+                std::thread::sleep(pause);
+                pause = (pause * 2).min(Duration::from_millis(50));
+            }
+            other => return other,
+        }
+    }
+}
+
+/// Block until this process holds the setup lock of the database at `path`.
+/// It is released when the returned file is dropped or the process dies.
+fn init_lock(path: &Path) -> Result<std::fs::File> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut name = path.as_os_str().to_owned();
+    name.push(".init-lock");
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(PathBuf::from(name))?;
+    file.lock()?;
+    Ok(file)
+}
+
+fn open_once(
+    path: &Path,
+    kind: &str,
+    steps: &[String],
+    table: CompatTable,
+    access: Access,
+) -> Result<Db> {
+    // Held until the setup below is done (dropped on return).
+    let _init = if access == Access::ReadWrite {
+        Some(init_lock(path)?)
+    } else {
+        None
+    };
     let flags = match access {
         Access::ReadOnly => OpenFlags::SQLITE_OPEN_READ_ONLY,
         Access::ReadWrite => OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_CREATE,

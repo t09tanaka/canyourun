@@ -7,7 +7,7 @@ use super::policy::{Access, GcCandidate};
 use super::Db;
 use super::{
     to_i64, to_u64, BlobRef, DbKind, Event, Finalized, GcReport, NewBlobRef, ProcessLock, Result,
-    StorageError,
+    StorageError, DEFAULT_GC_BATCH,
 };
 use crate::ids::{
     AttemptId, ClusterId, CoordinatorEpoch, CoordinatorId, Digest, Generation, HomeworkId, IdError,
@@ -51,13 +51,18 @@ pub struct AttemptRecord {
     pub observation: Observation,
     pub cancel_requested_at_ms: Option<u64>,
     pub retired: bool,
+    /// When the retire was confirmed.
+    pub retired_at_ms: Option<u64>,
+    /// When the coordinator gave up collecting the outputs.
+    pub collection_failed_at_ms: Option<u64>,
     pub created_at_ms: u64,
     pub terminal_at_ms: Option<u64>,
 }
 
 const ATTEMPT_COLS: &str = "attempt_id, homework_id, worker_id, generation, payload_hash,
     coordinator_epoch, permit_id, state, termination_json, receipts_json, observation,
-    cancel_requested_at_ms, retired, created_at_ms, terminal_at_ms";
+    cancel_requested_at_ms, retired, created_at_ms, terminal_at_ms, retired_at_ms,
+    collection_failed_at_ms";
 
 fn observation_str(o: Observation) -> &'static str {
     match o {
@@ -104,6 +109,8 @@ fn attempt_from_row(r: &Row<'_>) -> Result<AttemptRecord> {
         retired: r.get::<_, i64>(12)? == 1,
         created_at_ms: to_u64(r.get(13)?)?,
         terminal_at_ms: r.get::<_, Option<i64>>(14)?.map(to_u64).transpose()?,
+        retired_at_ms: r.get::<_, Option<i64>>(15)?.map(to_u64).transpose()?,
+        collection_failed_at_ms: r.get::<_, Option<i64>>(16)?.map(to_u64).transpose()?,
     })
 }
 
@@ -601,8 +608,9 @@ impl CoordinatorStore {
                 return Err(not_found(format!("retire tombstone for {aid}")));
             }
             tx.execute(
-                "UPDATE attempt SET retired = 1 WHERE attempt_id = ?1",
-                [&aid],
+                "UPDATE attempt SET retired = 1, retired_at_ms = COALESCE(retired_at_ms, ?2)
+                 WHERE attempt_id = ?1",
+                params![aid, to_i64(at_ms)?],
             )?;
             let run = run_of(tx, &aid)?;
             common::append_event(
@@ -730,7 +738,10 @@ impl CoordinatorStore {
 
     /// Take one permit of the group, durably, before submitting. `None` when
     /// every permit is held. Asking again with a permit id that exists returns
-    /// that permit.
+    /// that permit as it is, without taking another slot: a retry after a
+    /// crash gets its permit back. That includes a permit that was already
+    /// released (`held == false`); it no longer counts against the group and
+    /// the caller must not submit under it (use a new permit id).
     pub fn acquire_permit(
         &self,
         group_id: &str,
@@ -986,30 +997,97 @@ impl CoordinatorStore {
         self.db.write(move |tx| common::pin(tx, &r, -1))
     }
 
-    /// Whether any remaining reference names `locator`; check before deleting
-    /// the file a GC pass released.
-    pub fn locator_in_use(&self, locator: &str) -> Result<bool> {
+    /// The files waiting to be deleted: their last reference was dropped by
+    /// GC. Delete each file, then call [`Self::complete_delete`].
+    pub fn pending_deletes(&self) -> Result<Vec<String>> {
+        self.db.call(|c| common::pending_deletes(c))
+    }
+
+    /// The file of `locator` is deleted: forget it, so the name may be used
+    /// again. Idempotent; returns whether a queued locator was removed.
+    pub fn complete_delete(&self, locator: &str) -> Result<bool> {
         let l = locator.to_string();
-        self.db.call(move |c| common::locator_in_use(c, &l))
+        self.db.write(move |tx| common::complete_delete(tx, &l))
+    }
+
+    /// Record that the coordinator gave up collecting the outputs of a
+    /// terminal attempt (`COLLECTION_FAILED` is final). From then on GC no
+    /// longer waits for the `collected` receipt or the missing artifacts: the
+    /// retention is measured from this moment (or the terminal time, if
+    /// later). Refused for an attempt that is not terminal or is already
+    /// collected. First time wins; returns whether this call recorded it.
+    pub fn record_collection_failed(&self, attempt_id: &AttemptId, at_ms: u64) -> Result<bool> {
+        let a = attempt_id.to_string();
+        self.db.write(move |tx| {
+            let core = common::read_core(tx, ATTEMPT, &a)?;
+            if !core.state.is_terminal() || core.receipts.reached(Receipt::Collected) {
+                return Err(StorageError::IllegalState {
+                    attempt: a,
+                    state: core.state,
+                    why: "collection can only fail for a terminal attempt that is not collected",
+                });
+            }
+            let n = tx.execute(
+                "UPDATE attempt SET collection_failed_at_ms = ?1
+                 WHERE attempt_id = ?2 AND collection_failed_at_ms IS NULL",
+                params![to_i64(at_ms)?, a],
+            )?;
+            if n == 1 {
+                let run = run_of(tx, &a)?;
+                common::append_event(
+                    tx,
+                    run.as_deref(),
+                    Some(&a),
+                    "collection_failed",
+                    &Value::Null,
+                    at_ms,
+                )?;
+            }
+            Ok(n == 1)
+        })
     }
 
     /// Drop the references of attempts that ended at least `retention_ms`
-    /// ago and whose required outputs are collected. Running, awaiting,
-    /// pinned and incomplete ones stay; retire tombstones, dedup records and
-    /// the event journal are never touched.
+    /// ago and whose required outputs are collected, or that ended without
+    /// anything to wait for: the retire was confirmed
+    /// ([`Self::confirm_retire`]) or collection was given up
+    /// ([`Self::record_collection_failed`]). Running, awaiting-collection,
+    /// pinned and incomplete ones stay. A file whose last reference goes is
+    /// queued in `pending_delete` in the same transaction; a new reference to
+    /// it is refused until `complete_delete`. Retire tombstones, dedup records
+    /// and the event journal are never touched. The pass is a series of
+    /// transactions of [`DEFAULT_GC_BATCH`] references; a busy database is
+    /// [`StorageError::Busy`] and the pass can simply be run again.
     pub fn gc(&self, now_ms: u64, retention_ms: u64) -> Result<GcReport> {
-        self.db.write(move |tx| {
-            common::gc(tx, now_ms, retention_ms, |conn, r: &BlobRef| {
-                let core = common::read_core(conn, ATTEMPT, &r.attempt_id)?;
+        self.gc_batched(now_ms, retention_ms, DEFAULT_GC_BATCH)
+    }
+
+    pub(crate) fn gc_batched(
+        &self,
+        now_ms: u64,
+        retention_ms: u64,
+        batch: u32,
+    ) -> Result<GcReport> {
+        common::gc_all(
+            &self.db,
+            now_ms,
+            retention_ms,
+            None,
+            batch,
+            |conn, r: &BlobRef| {
+                let rec = load_attempt(conn, &r.attempt_id)?
+                    .ok_or_else(|| not_found(format!("attempt {}", r.attempt_id)))?;
                 let (required, persisted) = artifact_counts(conn, &r.attempt_id)?;
                 Ok(GcCandidate {
-                    terminal_at_ms: core.terminal_at_ms,
-                    collected: core.receipts.reached(Receipt::Collected),
+                    terminal_at_ms: rec.terminal_at_ms,
+                    retired_at_ms: rec.retired_at_ms,
+                    collected: rec.receipts.reached(Receipt::Collected),
+                    collection_failed_at_ms: rec.collection_failed_at_ms,
                     missing_required_artifacts: required - persisted,
                     pins: r.pins,
                 })
-            })
-        })
+            },
+        )
     }
 }
 

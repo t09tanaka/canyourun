@@ -4,10 +4,11 @@
 //! name it differently.
 
 use super::policy::{decide_gc, GcCandidate, GcVerdict, KeepReason};
-use super::{to_i64, to_u64, Finalized, Result, StorageError};
+use super::{to_i64, to_u64, Db, Finalized, Result, StorageError};
 use crate::state::{check_termination, AttemptState, Receipt, Receipts, Termination};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::Value;
+use std::sync::Arc;
 
 /// One journal entry. `seq` only grows and is never reused.
 #[derive(Debug, Clone, PartialEq)]
@@ -106,14 +107,13 @@ pub(crate) struct Core {
     pub state: AttemptState,
     pub termination: Option<Termination>,
     pub receipts: Receipts,
-    pub terminal_at_ms: Option<u64>,
 }
 
 pub(crate) fn read_core(conn: &Connection, table: &str, attempt_id: &str) -> Result<Core> {
     let row = conn
         .query_row(
             &format!(
-                "SELECT state, termination_json, receipts_json, terminal_at_ms
+                "SELECT state, termination_json, receipts_json
                  FROM {table} WHERE attempt_id = ?1"
             ),
             [attempt_id],
@@ -122,7 +122,6 @@ pub(crate) fn read_core(conn: &Connection, table: &str, attempt_id: &str) -> Res
                     r.get::<_, String>(0)?,
                     r.get::<_, Option<String>>(1)?,
                     r.get::<_, String>(2)?,
-                    r.get::<_, Option<i64>>(3)?,
                 ))
             },
         )
@@ -142,7 +141,6 @@ pub(crate) fn read_core(conn: &Connection, table: &str, attempt_id: &str) -> Res
         state,
         termination,
         receipts: from_json("receipts", &row.2)?,
-        terminal_at_ms: row.3.map(to_u64).transpose()?,
     })
 }
 
@@ -294,16 +292,33 @@ pub struct BlobRef {
     pub pins: u32,
 }
 
-/// What a GC pass did. Storage only drops the references; the caller deletes
-/// the files named by `removed`, after checking
-/// [`locator_in_use`](crate::storage::CoordinatorStore::locator_in_use).
+/// What a GC pass did. Storage drops the references and queues files whose
+/// last reference went away in `pending_delete`; the caller deletes those
+/// files and then calls `complete_delete` for each. `removed` is informational:
+/// the list to act on is `pending_deletes()`, which also survives a crash or a
+/// pass that stopped early.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct GcReport {
     pub removed: Vec<BlobRef>,
     pub kept: Vec<(String, KeepReason)>,
+    /// Locators queued for deletion by this pass (no reference names them any
+    /// more).
+    pub queued: Vec<String>,
 }
 
+/// References one GC transaction examines, so a large backlog never holds the
+/// write lock for long.
+pub const DEFAULT_GC_BATCH: u32 = 200;
+
 pub(crate) fn add_blob_ref(conn: &Connection, r: &NewBlobRef, at_ms: u64) -> Result<()> {
+    let queued: i64 = conn.query_row(
+        "SELECT count(*) FROM pending_delete WHERE locator = ?1",
+        [&r.locator],
+        |row| row.get(0),
+    )?;
+    if queued > 0 {
+        return Err(StorageError::LocatorPendingDelete(r.locator.clone()));
+    }
     conn.execute(
         "INSERT INTO blob_ref (ref_id, attempt_id, kind, locator, created_at_ms)
          VALUES (?1,?2,?3,?4,?5)",
@@ -335,27 +350,41 @@ pub(crate) fn pin(conn: &Connection, ref_id: &str, delta: i64) -> Result<u32> {
     )?)
 }
 
-pub(crate) fn locator_in_use(conn: &Connection, locator: &str) -> Result<bool> {
-    Ok(conn.query_row(
-        "SELECT count(*) FROM blob_ref WHERE locator = ?1",
-        [locator],
-        |r| r.get::<_, i64>(0),
-    )? > 0)
+/// The locators waiting for their file to be deleted, oldest first.
+pub(crate) fn pending_deletes(conn: &Connection) -> Result<Vec<String>> {
+    let mut s =
+        conn.prepare("SELECT locator FROM pending_delete ORDER BY queued_at_ms, locator")?;
+    let rows = s.query_map([], |r| r.get::<_, String>(0))?;
+    Ok(rows.collect::<std::result::Result<_, _>>()?)
 }
 
-/// Select the references to drop and delete them, in the caller's transaction.
-/// `facts` yields the owner's [`GcCandidate`] for a reference.
-pub(crate) fn gc(
+/// The file of `locator` is gone: forget it. Idempotent; returns whether a
+/// row was removed.
+pub(crate) fn complete_delete(conn: &Connection, locator: &str) -> Result<bool> {
+    Ok(conn.execute("DELETE FROM pending_delete WHERE locator = ?1", [locator])? == 1)
+}
+
+/// Select up to `batch` references after `after` and drop the collectable
+/// ones, in the caller's transaction. A locator that no reference names after
+/// that is queued in `pending_delete` in the same transaction, so "last
+/// reference gone" and "file may be deleted" are one atomic fact. `facts`
+/// yields the owner's [`GcCandidate`] for a reference. Returns the report and
+/// the last reference id examined (`None` when the table is exhausted).
+pub(crate) fn gc_batch(
     conn: &Connection,
     now_ms: u64,
     retention_ms: u64,
-    facts: impl Fn(&Connection, &BlobRef) -> Result<GcCandidate>,
-) -> Result<GcReport> {
+    ack_wait_ms: Option<u64>,
+    after: &str,
+    batch: u32,
+    facts: &impl Fn(&Connection, &BlobRef) -> Result<GcCandidate>,
+) -> Result<(GcReport, Option<String>)> {
     let refs: Vec<BlobRef> = {
         let mut s = conn.prepare(
-            "SELECT ref_id, attempt_id, kind, locator, pins FROM blob_ref ORDER BY ref_id",
+            "SELECT ref_id, attempt_id, kind, locator, pins FROM blob_ref
+             WHERE ref_id > ?1 ORDER BY ref_id LIMIT ?2",
         )?;
-        let rows = s.query_map([], |r| {
+        let rows = s.query_map(params![after, batch], |r| {
             Ok((
                 r.get::<_, String>(0)?,
                 r.get::<_, String>(1)?,
@@ -377,16 +406,71 @@ pub(crate) fn gc(
         }
         v
     };
+    let last = if refs.len() as u64 == u64::from(batch) {
+        refs.last().map(|r| r.ref_id.clone())
+    } else {
+        None
+    };
     let mut report = GcReport::default();
     for r in refs {
         let candidate = facts(conn, &r)?;
-        match decide_gc(&candidate, now_ms, retention_ms) {
+        match decide_gc(&candidate, now_ms, retention_ms, ack_wait_ms) {
             GcVerdict::Collect => {
                 conn.execute("DELETE FROM blob_ref WHERE ref_id = ?1", [&r.ref_id])?;
+                let remaining: i64 = conn.query_row(
+                    "SELECT count(*) FROM blob_ref WHERE locator = ?1",
+                    [&r.locator],
+                    |row| row.get(0),
+                )?;
+                if remaining == 0 {
+                    let n = conn.execute(
+                        "INSERT OR IGNORE INTO pending_delete (locator, queued_at_ms)
+                         VALUES (?1, ?2)",
+                        params![r.locator, to_i64(now_ms)?],
+                    )?;
+                    if n == 1 {
+                        report.queued.push(r.locator.clone());
+                    }
+                }
                 report.removed.push(r);
             }
             GcVerdict::Keep(why) => report.kept.push((r.ref_id, why)),
         }
     }
-    Ok(report)
+    Ok((report, last))
+}
+
+/// Run GC as a series of transactions of at most `batch` references each. A
+/// failure (a busy database is [`StorageError::Busy`], retryable) stops the
+/// pass: the batches already committed stay committed and their files are in
+/// `pending_delete`, so a later pass or `pending_deletes()` picks them up.
+pub(crate) fn gc_all<F>(
+    db: &Db,
+    now_ms: u64,
+    retention_ms: u64,
+    ack_wait_ms: Option<u64>,
+    batch: u32,
+    facts: F,
+) -> Result<GcReport>
+where
+    F: Fn(&Connection, &BlobRef) -> Result<GcCandidate> + Send + Sync + 'static,
+{
+    if batch == 0 {
+        return Err(StorageError::Invalid("gc batch must be positive".into()));
+    }
+    let facts = Arc::new(facts);
+    let mut total = GcReport::default();
+    let mut after = String::new();
+    loop {
+        let (f, a) = (Arc::clone(&facts), after.clone());
+        let (rep, last) =
+            db.write(move |tx| gc_batch(tx, now_ms, retention_ms, ack_wait_ms, &a, batch, &*f))?;
+        total.removed.extend(rep.removed);
+        total.kept.extend(rep.kept);
+        total.queued.extend(rep.queued);
+        match last {
+            Some(l) => after = l,
+            None => return Ok(total),
+        }
+    }
 }
