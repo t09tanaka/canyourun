@@ -67,6 +67,17 @@ pub fn after_spool_failure(intended: Termination) -> Termination {
     Termination::new(Outcome::Interrupted, intended.exit(), None).expect("valid")
 }
 
+/// The stop reason of a command once its output is accounted for: when
+/// output was lost (`output_lost`: the spool or the thread feeding it failed)
+/// and nothing else stopped the command, the lost output does, so its exit
+/// can never be recorded as a success.
+pub fn after_output(reason: Option<StopReason>, output_lost: bool) -> Option<StopReason> {
+    match reason {
+        None if output_lost => Some(StopReason::SpoolFailed),
+        other => other,
+    }
+}
+
 /// True when the next node of the attempt may run after a node ended this way.
 pub fn may_continue(reason: Option<StopReason>, exit: Option<Exit>) -> bool {
     reason.is_none() && exit == Some(Exit::Code(0))
@@ -167,6 +178,23 @@ mod tests {
         // The user's cancel is still what ended it.
         let c = termination(Some(StopReason::Cancel), Some(Exit::Signal(15)));
         assert_eq!(after_spool_failure(c), c);
+    }
+
+    #[test]
+    fn lost_output_stops_a_command_that_nothing_else_stopped() {
+        assert_eq!(after_output(None, false), None);
+        assert_eq!(after_output(None, true), Some(StopReason::SpoolFailed));
+        assert_eq!(
+            after_output(Some(StopReason::Cancel), true),
+            Some(StopReason::Cancel)
+        );
+        assert_eq!(
+            after_output(Some(StopReason::LeaseExpired), false),
+            Some(StopReason::LeaseExpired)
+        );
+        // Whatever the exit was, it is not a success then.
+        let t = termination(after_output(None, true), Some(Exit::Code(0)));
+        assert_eq!(t.outcome(), Outcome::Interrupted);
     }
 
     #[test]

@@ -29,22 +29,26 @@
 //! the stop of the group (S10/S12 implement that loop).
 
 use super::error::{Result, SupervisorError};
-use super::outcome::{finish_attempt, sync_log_position, OutcomeError};
+use super::outcome::{add_ref, finish_attempt, sync_log_position, OutcomeError, SpoolEnd};
 use super::pump::{pump, Pipe};
 use super::spec::{command_id, spec_digest, NodeSpec, SuperviseSpec};
-use super::spool::{AttemptSpool, SpoolError};
-use super::spool_plan::{attempt_limit, warning_texts, MAX_WARNINGS, MAX_WARNING_BYTES};
+use super::spool::{closed_status, AttemptSpool, SpoolError, SpoolReader, StreamStatus};
+use super::spool_plan::{
+    attempt_limit, logs_locator, warning_texts, MAX_WARNINGS, MAX_WARNING_BYTES,
+};
 use super::stop::{
     group_alive, retries_for, stop_group_retrying, StopResult, StopTarget, StopTimes,
 };
-use super::termination::{after_spool_failure, may_continue, pick_reason, termination, StopReason};
+use super::termination::{
+    after_output, after_spool_failure, may_continue, pick_reason, termination, StopReason,
+};
 use super::{lease::LeaseClock, lease::LeaseStatus, timeouts};
 use crate::ids::{AttemptId, NodeId, WorkerBootId};
 use crate::platform::{self, Inhibit};
 use crate::secrets::mask::Masker;
 use crate::state::{AttemptState, Exit, Receipt, Termination};
 use crate::storage::{
-    Finalized, LaunchClaim, LogPosition, ProcessIdentity, StorageError, WorkerStore,
+    BlobKind, Finalized, LaunchClaim, LogPosition, ProcessIdentity, StorageError, WorkerStore,
 };
 use crate::wire::LogStream;
 use serde_json::json;
@@ -193,21 +197,51 @@ fn to_finalizing(store: &WorkerStore, attempt: &AttemptId) -> Result<()> {
     Ok(())
 }
 
+/// The attempt's spool as the supervisor finds it.
+#[derive(Debug)]
+pub(crate) enum Spool {
+    Open(AttemptSpool),
+    /// Closed by a supervisor that did not live to settle the attempt: the
+    /// final positions `(stdout, stderr)`.
+    Closed(StreamStatus, StreamStatus),
+}
+
+impl Spool {
+    pub fn end(&self) -> SpoolEnd<'_> {
+        match self {
+            Spool::Open(s) => SpoolEnd::Open(s),
+            Spool::Closed(out, err) => SpoolEnd::Closed(*out, *err),
+        }
+    }
+}
+
 /// Open (or, after a crash, resume) the attempt's spool with what the task's
 /// limit leaves it: the limit less what the task's other attempts stored.
-/// The inner error is the spool's own: the caller settles the attempt
+/// A spool that is closed already (the supervisor crashed between closing it
+/// and settling the attempt) is [`Spool::Closed`], which settles like an open
+/// one. The inner error is the spool's own: the caller settles the attempt
 /// without a spool then ([`settle_without_spool`]).
+///
+/// The limit is a known approximation when two attempts of one task run at
+/// the same time: each sees only what the other had stored when it opened
+/// its spool, so together they may exceed the task's limit (by at most the
+/// limit itself). Attempts of a task normally run one after another.
 pub(crate) fn open_spool(
     spec: &SuperviseSpec,
     store: &WorkerStore,
-) -> Result<std::result::Result<AttemptSpool, SpoolError>> {
+) -> Result<std::result::Result<Spool, SpoolError>> {
     let others = store.log_bytes_of_other_attempts(&spec.attempt_id)?;
     let limit = attempt_limit(spec.log_limit_bytes, others);
-    Ok(AttemptSpool::open(
-        &spec.spool_dir(),
-        &spec.attempt_id,
-        limit,
-    ))
+    let root = spec.spool_dir();
+    Ok(match AttemptSpool::open(&root, &spec.attempt_id, limit) {
+        Ok(s) => Ok(Spool::Open(s)),
+        Err(SpoolError::Finished) => match closed_status(&root, &spec.attempt_id) {
+            Ok(Some((out, err))) => Ok(Spool::Closed(out, err)),
+            Ok(None) => Err(SpoolError::Finished),
+            Err(e) => Err(e),
+        },
+        Err(e) => Err(e),
+    })
 }
 
 /// Record that the spool failed at `stage`, once per stage.
@@ -235,14 +269,17 @@ fn note_spool_failure(
 /// store the result ([`finish_attempt`]). When the spool cannot be completed
 /// the attempt is settled without it. Returns the termination that holds and
 /// whether this call fixed it.
-pub(crate) fn settle(
+pub(crate) fn settle<'a>(
     store: &WorkerStore,
     root: &Path,
     attempt: &AttemptId,
-    spool: &AttemptSpool,
+    spool: impl Into<SpoolEnd<'a>>,
     term: Termination,
 ) -> Result<(Termination, bool)> {
     to_finalizing(store, attempt)?;
+    // TODO(S10b): `SuperviseSpec` gets the list of artifacts to keep and the
+    // supervisor stores them (`store_artifact`) before settling; until then an
+    // attempt has none.
     match finish_attempt(store, root, attempt, spool, term, &[], platform::wall_ms()) {
         Ok(recorded) => {
             let fixed = store
@@ -256,7 +293,7 @@ pub(crate) fn settle(
             Ok((fixed, recorded.finalized))
         }
         Err(OutcomeError::SpoolFailed(e)) => {
-            settle_without_spool(store, attempt, "finish", &e.to_string(), term)
+            settle_without_spool(store, root, attempt, "finish", &e.to_string(), term)
         }
         Err(OutcomeError::Storage(e)) => Err(e.into()),
         Err(OutcomeError::Io(e)) => Err(e.into()),
@@ -266,17 +303,71 @@ pub(crate) fn settle(
 
 /// Settle an attempt whose spool failed at `stage`: say so in the journal and
 /// fix what [`after_spool_failure`] makes of `term` (never a success). No
-/// result is stored: there is no complete output to describe.
+/// result is stored: there is no complete output to describe, and the
+/// `spool_failed` event (written first) is what tells this terminal attempt
+/// from one whose supervisor crashed before storing its result
+/// ([`complete_terminal`]). The spool is not marked closed either, so a
+/// reader gets no `eof` from it and goes by the attempt's termination.
+///
+/// What the spool holds stays accounted for: the positions its index
+/// publishes are stored (as far as they can be read), and its directory is
+/// referenced before the termination is fixed, so GC collects it like any
+/// other attempt's.
 pub(crate) fn settle_without_spool(
     store: &WorkerStore,
+    root: &Path,
     attempt: &AttemptId,
     stage: &str,
     why: &str,
     term: Termination,
 ) -> Result<(Termination, bool)> {
     note_spool_failure(store, attempt, stage, why)?;
+    if let Ok(reader) = SpoolReader::open(root, attempt) {
+        for (stream, name) in [(LogStream::Stdout, "stdout"), (LogStream::Stderr, "stderr")] {
+            if let Ok(st) = reader.status(stream) {
+                store.update_log_position(attempt, name, st.into())?;
+            }
+        }
+    }
+    let at = platform::wall_ms();
+    match add_ref(
+        store,
+        attempt,
+        format!("{attempt}:logs"),
+        BlobKind::Log,
+        logs_locator(attempt),
+        at,
+    ) {
+        Ok(()) => {}
+        Err(OutcomeError::Storage(e)) => return Err(e.into()),
+        Err(e) => return Err(SupervisorError::State(e.to_string())),
+    }
     let fin = finalize(store, attempt, after_spool_failure(term))?;
     Ok((fin.termination(), fin.won()))
+}
+
+/// Finish what a supervisor that crashed while settling left of a terminal
+/// attempt: one whose termination is fixed but which has no result (the crash
+/// came between the two). The spool is closed or found closed, its files
+/// referenced and the result stored for the termination that holds. An
+/// attempt that has its result, or that was settled without its spool (it
+/// has a `spool_failed` event and no result by design), is left as it is.
+pub(crate) fn complete_terminal(
+    spec: &SuperviseSpec,
+    store: &WorkerStore,
+    fixed: Termination,
+) -> Result<()> {
+    let attempt = &spec.attempt_id;
+    if store.get_result(attempt)?.is_some() || !store.events_of(attempt, "spool_failed")?.is_empty()
+    {
+        return Ok(());
+    }
+    let root = spec.spool_dir();
+    match open_spool(spec, store)? {
+        Ok(spool) => settle(store, &root, attempt, spool.end(), fixed)?,
+        Err(e) => settle_without_spool(store, &root, attempt, "open", &e.to_string(), fixed)?,
+    };
+    Ok(())
 }
 
 /// The spool side of the supervisor's heartbeat.
@@ -344,6 +435,15 @@ fn move_to(store: &WorkerStore, attempt: &crate::ids::AttemptId, to: AttemptStat
     match store.transition(attempt, to, platform::wall_ms()) {
         Ok(_) | Err(StorageError::Transition(_)) | Err(StorageError::IllegalState { .. }) => Ok(()),
         Err(e) => Err(e.into()),
+    }
+}
+
+/// Sets the flag when dropped: by the normal end of its scope or by a panic.
+struct SetOnDrop<'a>(&'a AtomicBool);
+
+impl Drop for SetOnDrop<'_> {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::SeqCst);
     }
 }
 
@@ -538,10 +638,12 @@ impl Control<'_> {
         let end = std::thread::scope(|s| {
             let mask = self.masker.stream();
             let feeder = s.spawn(|| pump(pipe, out, mask, &done, &error));
+            // The command is over (or given up on) when this is dropped, also
+            // by a panic on the way: what it wrote is read to the end, within
+            // a bound, and the reader never waits for a supervisor that is gone.
+            let over = SetOnDrop(&done);
             let end = self.run_admitted(guard, opts, node, id, limits);
-            // The command is over (or given up on): what it wrote is read to
-            // the end, within a bound.
-            done.store(true, Ordering::SeqCst);
+            drop(over);
             if feeder.join().is_err() {
                 error
                     .lock()
@@ -556,19 +658,25 @@ impl Control<'_> {
             Err(SupervisorError::Storage(e)) if e.is_retryable() => {}
             other => other?,
         }
-        if self.beat.failure.is_some() {
-            // Output was lost: whatever the command did, nothing follows it.
-            end.reason.get_or_insert(StopReason::SpoolFailed);
-        }
+        // Output was lost: whatever the command did, nothing follows it and
+        // it is not a success. The reader's own report is looked at here, not
+        // only what the heartbeat made of it: that one may have been skipped
+        // (a busy database), and its event is then written before settling.
+        let lost = self.beat.failure.is_some() || self.pump_failure().is_some();
+        end.reason = after_output(end.reason, lost);
         Ok(end)
     }
 
-    fn heartbeat(&mut self) -> Result<()> {
-        let pump_error = self
-            .pump_error
+    /// What the thread feeding the spool reported, if anything.
+    fn pump_failure(&self) -> Option<String> {
+        self.pump_error
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .clone();
+            .clone()
+    }
+
+    fn heartbeat(&mut self) -> Result<()> {
+        let pump_error = self.pump_failure();
         self.beat
             .beat(self.store, &self.spec.attempt_id, self.spool, pump_error)
     }
@@ -809,6 +917,8 @@ pub fn run(spec: &SuperviseSpec) -> Result<Report> {
         )));
     };
     if let Some(t) = rec.termination {
+        // Fixed already; a crash may have kept its result from being stored.
+        complete_terminal(spec, &store, t)?;
         return Ok(Report {
             termination: Some(t),
             finalized_here: false,
@@ -840,25 +950,44 @@ pub fn run(spec: &SuperviseSpec) -> Result<Report> {
     )?;
 
     let masker = spec.mask.masker();
-    let warnings: Vec<_> = warning_texts(&spec.workspace_warnings, MAX_WARNINGS, MAX_WARNING_BYTES)
-        .into_iter()
-        // A warning may quote what a tool printed.
-        .map(|m| String::from_utf8_lossy(&masker.mask(m.as_bytes())).into_owned())
-        .map(|m| (m.clone(), json!({ "message": m })))
-        .collect();
+    // A warning may quote what a tool printed: it is masked whole and cut
+    // after, so no part of a secret is left at the cut. The position is the
+    // key: two warnings that read the same once masked are both kept, and a
+    // second start of this supervisor adds none.
+    let warnings: Vec<_> = warning_texts(
+        &spec.workspace_warnings,
+        MAX_WARNINGS,
+        MAX_WARNING_BYTES,
+        |w| String::from_utf8_lossy(&masker.mask(w.as_bytes())).into_owned(),
+    )
+    .into_iter()
+    .enumerate()
+    .map(|(i, m)| {
+        (
+            i.to_string(),
+            json!({ "index": i.to_string(), "message": m }),
+        )
+    })
+    .collect();
     store.append_events_unseen(
         Some(&rec.run_id),
         attempt,
         "workspace_warning",
-        "message",
+        "index",
         &warnings,
         platform::wall_ms(),
     )?;
 
+    let root = spec.spool_dir();
     let spool = match open_spool(spec, &store)? {
-        Ok(s) => s,
-        Err(e) => {
-            // Nothing is started without a place for its output.
+        Ok(Spool::Open(s)) => s,
+        other => {
+            // Nothing is started without a place for its output; a spool
+            // that is closed before anything ran is not one.
+            let why = match other {
+                Err(e) => e.to_string(),
+                Ok(_) => SpoolError::Finished.to_string(),
+            };
             let reason =
                 (rec.cancel_requested_at_ms.is_some() || rec.retired).then_some(StopReason::Cancel);
             if reason.is_some() {
@@ -866,9 +995,10 @@ pub fn run(spec: &SuperviseSpec) -> Result<Report> {
             }
             let (termination, finalized_here) = settle_without_spool(
                 &store,
+                &root,
                 attempt,
                 "open",
-                &e.to_string(),
+                &why,
                 termination(reason, None),
             )?;
             return Ok(Report {
@@ -918,8 +1048,12 @@ pub fn run(spec: &SuperviseSpec) -> Result<Report> {
             sleep_inhibit,
         );
     }
+    if let (Some(why), None) = (ctl.pump_failure(), &ctl.beat.failure) {
+        // The heartbeat that would have recorded it did not get through.
+        note_spool_failure(&store, attempt, "write", &why)?;
+    }
     let term = termination(end.reason, end.exit);
-    let (termination, finalized_here) = settle(&store, &spec.spool_dir(), attempt, &spool, term)?;
+    let (termination, finalized_here) = settle(&store, &root, attempt, &spool, term)?;
     Ok(Report {
         termination: Some(termination),
         finalized_here,
@@ -931,6 +1065,59 @@ pub fn run(spec: &SuperviseSpec) -> Result<Report> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_flag_is_set_when_its_guard_goes_also_by_a_panic() {
+        let done = AtomicBool::new(false);
+        {
+            let _over = SetOnDrop(&done);
+            assert!(!done.load(Ordering::SeqCst));
+        }
+        assert!(done.load(Ordering::SeqCst));
+        // A thread that waits for the flag (the output reader does) is not
+        // left waiting when the code between panics: the scope returns.
+        let done = AtomicBool::new(false);
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            std::thread::scope(|s| {
+                s.spawn(|| {
+                    while !done.load(Ordering::SeqCst) {
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                });
+                let _over = SetOnDrop(&done);
+                panic!("the supervisor's own fault");
+            })
+        }));
+        assert!(panicked.is_err());
+        assert!(done.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn the_done_flag_is_set_also_when_the_supervising_side_panics() {
+        // The thread that waits for the flag is joined by the scope: were
+        // the flag not set by the unwinding, this test would never return.
+        let done = AtomicBool::new(false);
+        let waited = AtomicBool::new(false);
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            std::thread::scope(|s| {
+                s.spawn(|| {
+                    while !done.load(Ordering::SeqCst) {
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    waited.store(true, Ordering::SeqCst);
+                });
+                let _over = SetOnDrop(&done);
+                assert!(!done.load(Ordering::SeqCst));
+                panic!("the command runner panicked");
+            })
+        }));
+        assert!(r.is_err());
+        assert!(waited.load(Ordering::SeqCst));
+        // The normal end sets it as well.
+        let flag = AtomicBool::new(false);
+        drop(SetOnDrop(&flag));
+        assert!(flag.load(Ordering::SeqCst));
+    }
 
     #[test]
     fn a_busy_database_is_absorbed_and_other_errors_are_not() {

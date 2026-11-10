@@ -850,7 +850,11 @@ impl WorkerStore {
 
     /// The log bytes stored by the other attempts of `attempt_id`'s task, as
     /// their stored positions say (both streams). The task's spool limit is
-    /// shared by its attempts, so this is what the attempt cannot use.
+    /// shared by its attempts, so this is what the attempt cannot use. An
+    /// attempt counts while its files can be on disk: until it is terminal,
+    /// and after that as long as it has a `log` reference. Once GC dropped
+    /// that reference the files are deleted (or queued for it) and their
+    /// bytes are free again; the `log_spool` rows stay as a record.
     pub fn log_bytes_of_other_attempts(&self, attempt_id: &AttemptId) -> Result<u64> {
         let a = attempt_id.to_string();
         self.db.call(move |c| {
@@ -859,7 +863,10 @@ impl WorkerStore {
                 "SELECT COALESCE(SUM(l.written_bytes), 0)
                  FROM log_spool l JOIN worker_attempt o ON o.attempt_id = l.attempt_id
                  WHERE o.attempt_id <> ?1 AND o.task_id =
-                    (SELECT task_id FROM worker_attempt WHERE attempt_id = ?1)",
+                    (SELECT task_id FROM worker_attempt WHERE attempt_id = ?1)
+                   AND (o.state <> 'terminal' OR EXISTS
+                    (SELECT 1 FROM blob_ref b
+                     WHERE b.attempt_id = o.attempt_id AND b.kind = 'log'))",
                 params![a],
                 |r| r.get(0),
             )?;

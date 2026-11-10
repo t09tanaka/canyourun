@@ -104,17 +104,26 @@ pub const MAX_WARNING_BYTES: usize = 4096;
 /// The texts to write to the event journal for `warnings`, which another
 /// process handed over: at most `max` of them, each at most `max_bytes` long,
 /// and one more line saying how many were left out, so the journal cannot be
-/// flooded and nothing is dropped without a trace.
-pub fn warning_texts(warnings: &[String], max: usize, max_bytes: usize) -> Vec<String> {
+/// flooded and nothing is dropped without a trace. Each text goes through
+/// `mask` whole and is cut after: cutting first could leave the head of a
+/// secret at the cut, where `mask` no longer recognizes it.
+pub fn warning_texts(
+    warnings: &[String],
+    max: usize,
+    max_bytes: usize,
+    mask: impl Fn(&str) -> String,
+) -> Vec<String> {
     let mut out: Vec<String> = warnings
         .iter()
         .take(max)
         .map(|w| {
+            let mut w = mask(w);
             let mut cut = w.len().min(max_bytes);
             while !w.is_char_boundary(cut) {
                 cut -= 1;
             }
-            w[..cut].to_string()
+            w.truncate(cut);
+            w
         })
         .collect();
     if warnings.len() > max {
@@ -385,24 +394,38 @@ mod tests {
     #[test]
     fn warnings_are_capped_in_number_and_length() {
         let w = |s: &str| s.to_string();
-        assert!(warning_texts(&[], 2, 4).is_empty());
-        assert_eq!(warning_texts(&[w("a"), w("b")], 2, 4), ["a", "b"]);
+        let texts = |ws: &[String], max, bytes| warning_texts(ws, max, bytes, str::to_string);
+        assert!(texts(&[], 2, 4).is_empty());
+        assert_eq!(texts(&[w("a"), w("b")], 2, 4), ["a", "b"]);
         assert_eq!(
-            warning_texts(&[w("a"), w("b"), w("c"), w("d")], 2, 4),
+            texts(&[w("a"), w("b"), w("c"), w("d")], 2, 4),
             ["a", "b", "2 more warnings omitted"]
         );
         // Exactly at the cap is kept whole; one over is cut.
-        assert_eq!(warning_texts(&[w("abcd")], 1, 4), ["abcd"]);
-        assert_eq!(warning_texts(&[w("abcde")], 1, 4), ["abcd"]);
+        assert_eq!(texts(&[w("abcd")], 1, 4), ["abcd"]);
+        assert_eq!(texts(&[w("abcde")], 1, 4), ["abcd"]);
         // Never in the middle of a character (each is 3 bytes here).
         let two = w("\u{3042}\u{3044}");
+        assert_eq!(texts(std::slice::from_ref(&two), 1, 4), ["\u{3042}"]);
+        assert_eq!(texts(std::slice::from_ref(&two), 1, 6), [two.as_str()]);
+    }
+
+    #[test]
+    fn a_warning_is_masked_before_it_is_cut() {
+        // The secret lies across the cut: cut first, its head would stay.
+        let secret = "hunter2!";
+        let mask = |s: &str| s.replace(secret, "***");
+        let text = format!("ab{secret}cd");
         assert_eq!(
-            warning_texts(std::slice::from_ref(&two), 1, 4),
-            ["\u{3042}"]
+            warning_texts(std::slice::from_ref(&text), 1, 6, mask),
+            ["ab***c"]
         );
+        // Only the warnings that are kept are masked, and the count line is
+        // not a warning.
+        let many = vec![text.clone(), text.clone(), "x".to_string()];
         assert_eq!(
-            warning_texts(std::slice::from_ref(&two), 1, 6),
-            [two.as_str()]
+            warning_texts(&many, 2, 64, mask),
+            ["ab***cd", "ab***cd", "1 more warnings omitted"]
         );
     }
 

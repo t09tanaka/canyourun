@@ -438,6 +438,28 @@ impl AttemptSpool {
     }
 }
 
+/// The final positions `(stdout, stderr)` of the attempt's spool when it is
+/// closed, `None` while it is not (or does not exist). The `closed` marker is
+/// written after both streams' last records are durable, so what the index
+/// publishes then is final.
+pub fn closed_status(
+    root: &Path,
+    attempt: &AttemptId,
+) -> Result<Option<(StreamStatus, StreamStatus)>> {
+    let reader = match SpoolReader::open(root, attempt) {
+        Ok(r) => r,
+        Err(SpoolError::NotFound(_)) => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    if !reader.finished() {
+        return Ok(None);
+    }
+    Ok(Some((
+        reader.status(LogStream::Stdout)?,
+        reader.status(LogStream::Stderr)?,
+    )))
+}
+
 /// One answer of [`SpoolReader::read`]; the fields of `ReadLogResponse`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReadChunk {

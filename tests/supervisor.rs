@@ -6,11 +6,12 @@ use remote_task_runner::platform;
 use remote_task_runner::platform::{signal_pid, signal_process_group};
 use remote_task_runner::state::{AttemptState, Exit, Outcome, Receipt, TimeoutKind, TimeoutPhase};
 use remote_task_runner::storage::{LeaseOutcome, NewAcceptance, StorageError, WorkerStore};
+use remote_task_runner::supervisor::outcome::drain_pending_deletes;
 use remote_task_runner::supervisor::process::{code, spawn_detached, supervise};
 use remote_task_runner::supervisor::recover::recover;
 use remote_task_runner::supervisor::run::{run, Report};
 use remote_task_runner::supervisor::spec::{MaskValues, NodeSpec, SuperviseSpec};
-use remote_task_runner::supervisor::spool::SpoolReader;
+use remote_task_runner::supervisor::spool::{AttemptSpool, SpoolReader};
 use remote_task_runner::wire::LeaseKey;
 use remote_task_runner::wire::LogStream;
 use std::collections::BTreeMap;
@@ -446,6 +447,13 @@ fn a_cancelled_attempt_whose_spool_cannot_be_opened_stays_cancelled() {
     let t = settled(&run(&f.spec).unwrap());
     assert_eq!(t.outcome(), Outcome::Cancelled);
     assert_eq!(f.events(f.attempt(), "spool_failed").len(), 1);
+    // Settled without its spool: no result, and a later start leaves it so.
+    assert!(f.store.get_result(f.attempt()).unwrap().is_none());
+    let again = run(&f.spec).unwrap();
+    assert_eq!((again.termination, again.finalized_here), (Some(t), false));
+    assert!(f.store.get_result(f.attempt()).unwrap().is_none());
+    assert_eq!(f.events(f.attempt(), "spool_failed").len(), 1);
+    assert_eq!(std::fs::read(f.spec.spool_dir()).unwrap(), b"");
 }
 
 #[test]
@@ -531,6 +539,8 @@ fn workspace_warnings_become_events_once_and_bounded() {
     assert_eq!(ev[0]["message"], "index not reproduced");
     assert_eq!(ev[1]["message"].as_str().unwrap().len(), 4096);
     assert_eq!(ev[64]["message"], "8 more warnings omitted");
+    assert_eq!(ev[0]["index"], "0");
+    assert_eq!(ev[64]["index"], "64");
     // A second start (the attempt is over) writes nothing more.
     run(&f.spec).unwrap();
     assert_eq!(f.events(f.attempt(), "workspace_warning").len(), 65);
@@ -540,6 +550,31 @@ fn workspace_warnings_become_events_once_and_bounded() {
     assert!(quiet
         .events(quiet.attempt(), "workspace_warning")
         .is_empty());
+}
+
+#[test]
+fn a_secret_across_the_cut_of_a_long_warning_leaves_no_part_of_itself() {
+    let secret = "hunter2-value";
+    let mut f = fx(vec![node("n", "true")]);
+    f.spec.mask = MaskValues(vec![secret.into()]);
+    // The secret starts 5 bytes before the 4096-byte cut.
+    let long = format!("{}{secret} and more", "x".repeat(4091));
+    f.spec.workspace_warnings = vec![
+        long,
+        // Two different warnings that read the same once masked: both stay.
+        format!("token {secret}"),
+        "token ***".to_string(),
+    ];
+    run(&f.spec).unwrap();
+    let ev = f.events(f.attempt(), "workspace_warning");
+    assert_eq!(ev.len(), 3, "{ev:?}");
+    let cut = ev[0]["message"].as_str().unwrap();
+    assert_eq!(cut, format!("{}***", "x".repeat(4091)));
+    assert_eq!(ev[1]["message"], "token ***");
+    assert_eq!(ev[2]["message"], "token ***");
+    assert!(!format!("{ev:?}").contains("hunt"));
+    run(&f.spec).unwrap();
+    assert_eq!(f.events(f.attempt(), "workspace_warning").len(), 3);
 }
 
 #[test]
@@ -927,15 +962,241 @@ fn recovering_a_cancelled_attempt_that_never_launched_settles_it_as_cancelled() 
     assert_eq!(t.outcome(), Outcome::Cancelled);
 }
 
+// --------------------------------------- a supervisor that died while settling
+
+/// The attempt's spool as a supervisor left it that died right after closing
+/// it: `bytes` on stdout, the `closed` marker, nothing in the database.
+fn closed_spool(f: &Fx, bytes: &[u8]) {
+    let s = AttemptSpool::open(&f.spec.spool_dir(), f.attempt(), 1 << 20).unwrap();
+    s.writer(LogStream::Stdout).append(bytes).unwrap();
+    s.finish().unwrap();
+}
+
+fn log_ref(f: &Fx) -> remote_task_runner::storage::NewBlobRef {
+    remote_task_runner::storage::NewBlobRef {
+        ref_id: format!("{}:logs", f.attempt()),
+        attempt_id: f.attempt().to_string(),
+        kind: remote_task_runner::storage::BlobKind::Log,
+        locator: format!("{}/logs", f.attempt()),
+    }
+}
+
+/// The attempt has its one log reference (a pin needs the reference).
+fn has_log_ref(f: &Fx) -> bool {
+    let id = format!("{}:logs", f.attempt());
+    let there = f.store.pin_blob(&id).is_ok();
+    if there {
+        f.store.unpin_blob(&id).unwrap();
+    }
+    there
+}
+
+fn assert_settled_with_output(f: &Fx, bytes: u64) {
+    let result = f.store.get_result(f.attempt()).unwrap().expect("a result");
+    assert_eq!(result["logs"]["stdout"]["bytes"], bytes);
+    assert_eq!(
+        f.store
+            .log_position(f.attempt(), "stdout")
+            .unwrap()
+            .written_bytes,
+        bytes
+    );
+    assert!(has_log_ref(f));
+    assert!(f.events(f.attempt(), "spool_failed").is_empty());
+    assert_eq!(f.state(), AttemptState::Terminal);
+    let (out, last) = f.output_of(f.attempt());
+    assert_eq!(out.len() as u64, bytes);
+    assert!(last.eof);
+}
+
+#[test]
+fn a_crash_right_after_closing_the_spool_is_settled_from_the_closed_spool() {
+    let f = fx(vec![node("n", "true")]);
+    // A launch without a process identity: no made-up pid is ever stored
+    // (the fixture and recovery signal what the store names).
+    claim(&f, "n", None);
+    closed_spool(&f, b"what the command wrote");
+    // `run` takes the recovery way (a launch is recorded) and finds the
+    // spool closed: that is not a spool failure.
+    let r = run(&f.spec).unwrap();
+    assert!(r.finalized_here);
+    assert_eq!(settled(&r).outcome(), Outcome::Interrupted);
+    assert_settled_with_output(&f, 22);
+    // Again, and from the recovery entry itself: nothing changes.
+    let result = f.store.get_result(f.attempt()).unwrap();
+    let again = run(&f.spec).unwrap();
+    assert_eq!(
+        (again.termination, again.finalized_here),
+        (r.termination, false)
+    );
+    let again = recover(&f.spec, &f.store).unwrap();
+    assert_eq!(
+        (again.termination, again.finalized_here),
+        (r.termination, false)
+    );
+    assert_eq!(f.store.get_result(f.attempt()).unwrap(), result);
+}
+
+#[test]
+fn a_crash_after_the_log_reference_is_settled_with_that_one_reference() {
+    let f = fx(vec![node("n", "true")]);
+    closed_spool(&f, b"12345");
+    let pos = remote_task_runner::storage::LogPosition {
+        written_bytes: 5,
+        dropped_bytes: 0,
+        last_seq: 1,
+    };
+    f.store
+        .update_log_position(f.attempt(), "stdout", pos)
+        .unwrap();
+    f.store.add_blob_ref(&log_ref(&f), 50).unwrap();
+    let r = recover(&f.spec, &f.store).unwrap();
+    assert!(r.finalized_here);
+    assert_eq!(settled(&r).outcome(), Outcome::Interrupted);
+    assert_settled_with_output(&f, 5);
+    // One reference: once it is collected the files are queued, once.
+    f.store
+        .ack_collected(f.attempt(), CoordinatorEpoch(1), platform::wall_ms())
+        .unwrap();
+    let gc = f.store.gc(u64::MAX / 4, 0, 0).unwrap();
+    assert_eq!(gc.queued, [format!("{}/logs", f.attempt())]);
+}
+
+#[test]
+fn a_crash_between_the_termination_and_the_result_is_completed_by_the_next_start() {
+    let f = fx(vec![node("n", "touch /nonexistent-dir/never")]);
+    closed_spool(&f, b"done");
+    f.store.add_blob_ref(&log_ref(&f), 50).unwrap();
+    f.store
+        .transition(f.attempt(), AttemptState::Finalizing, 51)
+        .unwrap();
+    let ok =
+        remote_task_runner::state::Termination::new(Outcome::Succeeded, Some(Exit::Code(0)), None)
+            .unwrap();
+    f.store.finalize(f.attempt(), ok, 52).unwrap();
+    assert!(f.store.get_result(f.attempt()).unwrap().is_none());
+    // The termination that was fixed holds, and gets its result.
+    let r = run(&f.spec).unwrap();
+    assert_eq!((r.termination, r.finalized_here), (Some(ok), false));
+    assert_settled_with_output(&f, 4);
+    let result = f.store.get_result(f.attempt()).unwrap().unwrap();
+    assert_eq!(result["termination"]["outcome"], "succeeded");
+    // Nothing was started for it.
+    assert!(f.store.launches(f.attempt()).unwrap().is_empty());
+    let again = run(&f.spec).unwrap();
+    assert_eq!(again.termination, Some(ok));
+    assert_eq!(f.store.get_result(f.attempt()).unwrap(), Some(result));
+}
+
+#[test]
+fn a_crash_before_the_spool_was_closed_is_completed_too() {
+    // Terminal (a competing writer fixed it), the spool still open on disk.
+    let f = fx(vec![node("n", "true")]);
+    {
+        let s = AttemptSpool::open(&f.spec.spool_dir(), f.attempt(), 1 << 20).unwrap();
+        s.writer(LogStream::Stdout).append(b"abc").unwrap();
+        s.sync().unwrap();
+    }
+    f.store
+        .transition(f.attempt(), AttemptState::Finalizing, 5)
+        .unwrap();
+    let cancelled =
+        remote_task_runner::state::Termination::new(Outcome::Cancelled, None, None).unwrap();
+    f.store.finalize(f.attempt(), cancelled, 6).unwrap();
+    let r = recover(&f.spec, &f.store).unwrap();
+    assert_eq!((r.termination, r.finalized_here), (Some(cancelled), false));
+    assert_settled_with_output(&f, 3);
+}
+
+#[test]
+fn an_attempt_settled_without_its_spool_keeps_its_files_accounted_for() {
+    let f = fx(vec![node("a", "true"), node("b", "true")]);
+    let root = f.spec.spool_dir();
+    // Another writer holds the spool: this supervisor cannot resume it.
+    let held = AttemptSpool::open(&root, f.attempt(), 1 << 20).unwrap();
+    held.writer(LogStream::Stdout)
+        .append(b"0123456789")
+        .unwrap();
+    held.sync().unwrap();
+    // What the lost supervisor left beside the spool: the pipe of a node,
+    // and something that only has a pipe's name.
+    let logs = root.join(f.attempt().to_string()).join("logs");
+    let fifo = logs.join("node-0.pipe");
+    assert!(Command::new("mkfifo")
+        .arg(&fifo)
+        .status()
+        .unwrap()
+        .success());
+    std::fs::write(logs.join("node-1.pipe"), b"not a pipe").unwrap();
+    let t = settled(&recover(&f.spec, &f.store).unwrap());
+    assert_eq!(t.outcome(), Outcome::Interrupted);
+    let ev = f.events(f.attempt(), "spool_failed");
+    assert_eq!(ev.len(), 1, "{ev:?}");
+    assert_eq!(ev[0]["stage"], "open");
+    assert!(f.store.get_result(f.attempt()).unwrap().is_none());
+    // The pipe is gone, the other file is not ours to remove.
+    assert!(!fifo.exists());
+    assert_eq!(
+        std::fs::read(logs.join("node-1.pipe")).unwrap(),
+        b"not a pipe"
+    );
+    // The last position the spool published is stored, and counts against
+    // the task's other attempts while the files are there.
+    assert_eq!(
+        f.store
+            .log_position(f.attempt(), "stdout")
+            .unwrap()
+            .written_bytes,
+        10
+    );
+    let second = f.next_attempt();
+    let others = |a: &AttemptId| f.store.log_bytes_of_other_attempts(a).unwrap();
+    assert_eq!(others(&second.attempt_id), 10);
+    // The directory is referenced, so GC collects it: nothing is left that
+    // no one can reach.
+    assert!(has_log_ref(&f));
+    drop(held);
+    f.store
+        .ack_collected(f.attempt(), CoordinatorEpoch(1), platform::wall_ms())
+        .unwrap();
+    let gc = f.store.gc(u64::MAX / 4, 0, 0).unwrap();
+    assert_eq!(gc.queued, [format!("{}/logs", f.attempt())]);
+    // Collected bytes no longer count against the task's limit, also
+    // before the files themselves are deleted.
+    assert_eq!(others(&second.attempt_id), 0);
+    let drained = drain_pending_deletes(&f.store, &root).unwrap();
+    assert_eq!(drained.deleted, 1);
+    assert!(!root.join(f.attempt().to_string()).exists());
+    assert_eq!(others(&second.attempt_id), 0);
+    // A later start of the supervisor does not bring the directory back.
+    let again = run(&f.spec).unwrap();
+    assert_eq!(again.termination, Some(t));
+    assert!(!root.join(f.attempt().to_string()).exists());
+}
+
 // ------------------------------------------- A21 the agent dies, the supervisor does not
 
 fn exe() -> PathBuf {
     assert_cmd::cargo::cargo_bin("remote-task-runner")
 }
 
+/// The spec file as the agent must write it: its user's alone.
+fn write_private(p: &Path, text: &str) {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let _ = std::fs::remove_file(p);
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(p)
+        .unwrap();
+    file.write_all(text.as_bytes()).unwrap();
+}
+
 fn write_spec(f: &Fx, spec: &SuperviseSpec) -> PathBuf {
     let p = f.path("spec.json");
-    std::fs::write(&p, serde_json::to_string(spec).unwrap()).unwrap();
+    write_private(&p, &serde_json::to_string(spec).unwrap());
     p
 }
 
@@ -1103,7 +1364,7 @@ fn only_one_supervisor_may_hold_an_attempt() {
 fn a_bad_spec_is_refused_with_its_own_exit_code() {
     let dir = tempfile::tempdir().unwrap();
     let p = dir.path().join("spec.json");
-    std::fs::write(&p, "{\"nope\": 1}").unwrap();
+    write_private(&p, "{\"nope\": 1}");
     let out = Command::new(exe())
         .arg("supervise")
         .arg("--spec")
