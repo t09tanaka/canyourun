@@ -707,3 +707,37 @@ fn the_clone_is_made_once_and_updated_from_origin() {
     let empty = ws.ensure_clone("github:example/empty", None).unwrap();
     ws.update_clone(&empty).unwrap();
 }
+
+#[test]
+fn a_create_after_a_crash_clears_the_stale_branch_and_registration() {
+    for b in backends(&common_home()) {
+        let f = fixture();
+        let store = f.store();
+        let m = f.capture_commit(&store, "HEAD");
+        let ws = f.workspaces(&b.fw(&f));
+        let repo = f.clone_of(&ws);
+        f.deliver(&store, &repo, &m);
+        let att = AttemptId::generate();
+        // a worktree made, then its directory lost (a crash, a cleaned disk)
+        let dir = f.state.join("workspaces").join(att.as_str());
+        std::fs::create_dir_all(f.state.join("workspaces")).unwrap();
+        let commit = m.execution_commit.clone().unwrap();
+        f.git(
+            repo.dir(),
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                &format!("rtr/{att}"),
+                dir.to_str().unwrap(),
+                &commit,
+            ],
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+        let w = ws.create(&att, &store, &m, Some(&repo)).unwrap();
+        assert!(w.root.join("a.txt").exists(), "{}", b.name);
+        ws.remove(&w).unwrap();
+        assert!(branches(&f, repo.dir()).is_empty());
+    }
+}

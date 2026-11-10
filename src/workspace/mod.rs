@@ -219,6 +219,8 @@ impl Workspaces {
         }
         let clone = repo.dir();
         let branch = plan::branch_name(attempt);
+        // a branch left by a create that died: cleared before anything else
+        self.clear_stale(clone, &branch)?;
         // `fast-worktree` reads the project's configuration from the clone's
         // own checkout: it has to be at the commit the attempt runs. Adds at
         // the commit it is at share the clone; moving it waits for them.
@@ -241,7 +243,6 @@ impl Workspaces {
             .map_err(internal)?;
             lock
         };
-        self.forget_stale_branch(clone, &branch);
         self.fw
             .add(clone, dest, &branch, commit)
             .map_err(|f| plan::fw_error("add", &f))
@@ -257,14 +258,36 @@ impl Workspaces {
             })
             .inspect_err(|_| {
                 // best effort: the original error is the one to report
-                let _ = self.teardown_worktree(clone, dest, &branch);
+                let _ = self.teardown_worktree(clone, dest, &branch, true);
             })
     }
 
-    /// A branch left by a create that died before it could clean up.
-    fn forget_stale_branch(&self, clone: &Path, branch: &str) {
+    /// A branch left by a create that died before it could clean up. Pruning
+    /// the clone's worktree list would also drop the registration of a
+    /// worktree another attempt is removing right now, so it is done only when
+    /// there is a stale branch, and under the exclusive lock (removals hold the
+    /// shared one).
+    fn clear_stale(&self, clone: &Path, branch: &str) -> Result<(), ApiError> {
+        let exists = git::run(
+            &self.env,
+            clone,
+            &[
+                "rev-parse",
+                "--verify",
+                "-q",
+                &format!("refs/heads/{branch}"),
+            ],
+        )
+        .is_ok();
+        if !exists {
+            return Ok(());
+        }
+        let lock = open_lock(&clone.join(".git").join("rtr-workspace.lock"))?;
+        lock.lock()
+            .map_err(|e| io_err("cannot lock the clone", e))?;
         let _ = git::run(&self.env, clone, &["worktree", "prune"]);
         let _ = git::run(&self.env, clone, &["branch", "-D", "-q", branch]);
+        Ok(())
     }
 
     /// Unpack the source into a scratch directory (verified there, working
@@ -341,7 +364,7 @@ impl Workspaces {
                 )),
             },
             WorkspaceKind::Worktree { clone, branch } => {
-                self.teardown_worktree(clone, &ws.root, branch)
+                self.teardown_worktree(clone, &ws.root, branch, false)
             }
         }
     }
@@ -350,16 +373,32 @@ impl Workspaces {
     /// changes and untracked files are reset first (ignored files, the
     /// dependencies, are `fast-worktree`'s to delete), because it refuses a
     /// dirty one.
-    fn teardown_worktree(&self, clone: &Path, dir: &Path, branch: &str) -> Result<(), ApiError> {
+    fn teardown_worktree(
+        &self,
+        clone: &Path,
+        dir: &Path,
+        branch: &str,
+        holding_lock: bool,
+    ) -> Result<(), ApiError> {
         if std::fs::symlink_metadata(dir).is_ok() {
             // the worktree may be half made: these can fail without mattering
             let _ = git::run(&self.env, dir, &["reset", "-q", "--hard"]);
             let _ = git::run(&self.env, dir, &["clean", "-q", "-fd"]);
+            // shared: a prune of the clone's worktree list waits for us
+            let _shared = if holding_lock {
+                None
+            } else {
+                let l = open_lock(&clone.join(".git").join("rtr-workspace.lock"))?;
+                l.lock_shared()
+                    .map_err(|e| io_err("cannot lock the clone", e))?;
+                Some(l)
+            };
             self.fw
                 .remove(clone, dir)
                 .map_err(|f| plan::fw_error("remove", &f))?;
         }
-        self.forget_stale_branch(clone, branch);
+        // (a registration whose directory is gone is the next create's to prune)
+        let _ = git::run(&self.env, clone, &["branch", "-D", "-q", branch]);
         Ok(())
     }
 }
