@@ -718,7 +718,9 @@ dependencies = [
  "serde_json",
  "sha2",
  "task-traffic-controller",
+ "tempfile",
  "thiserror",
+ "toml 0.8.23",
  "ulid",
 ]
 

@@ -8,7 +8,16 @@ python3 - <<'PY'
 import json, os, sys
 root = os.getcwd()
 data = json.load(open("target/llvm-cov.json"))
-want = {"src/ids.rs", "src/state.rs", "src/error.rs", "src/wire.rs"}
+want = {
+    "src/ids.rs",
+    "src/state.rs",
+    "src/error.rs",
+    "src/wire.rs",
+    "src/config/legacy.rs",
+    "src/config/parse.rs",
+    "src/config/paths.rs",
+    "src/config/resolve.rs",
+}
 seen = set()
 bad = []
 for f in data["data"][0]["files"]:
