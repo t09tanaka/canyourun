@@ -60,15 +60,15 @@ CREATE TABLE run (
     created_at_ms    INTEGER NOT NULL,
     closed_at_ms     INTEGER
 );
-CREATE TABLE homework (
-    homework_id   TEXT PRIMARY KEY,
+CREATE TABLE task (
+    task_id   TEXT PRIMARY KEY,
     run_id        TEXT NOT NULL REFERENCES run(run_id),
     spec_json     TEXT NOT NULL,
     created_at_ms INTEGER NOT NULL
 );
 CREATE TABLE attempt (
     attempt_id             TEXT PRIMARY KEY,
-    homework_id            TEXT NOT NULL REFERENCES homework(homework_id),
+    task_id            TEXT NOT NULL REFERENCES task(task_id),
     worker_id              TEXT NOT NULL,
     generation             INTEGER NOT NULL,
     payload_hash           TEXT NOT NULL,
@@ -92,15 +92,15 @@ CREATE TABLE attempt (
     CHECK ((state = 'terminal') = (termination_json IS NOT NULL)),
     CHECK ((state = 'terminal') = (terminal_at_ms IS NOT NULL)),
     CHECK ((retired = 1) = (retired_at_ms IS NOT NULL)),
-    UNIQUE (homework_id, generation)
+    UNIQUE (task_id, generation)
 );
--- At most one attempt per homework that is neither terminal nor confirmed retired.
-CREATE UNIQUE INDEX attempt_one_live ON attempt(homework_id)
+-- At most one attempt per task that is neither terminal nor confirmed retired.
+CREATE UNIQUE INDEX attempt_one_live ON attempt(task_id)
     WHERE state <> 'terminal' AND retired = 0;
 CREATE INDEX attempt_worker ON attempt(worker_id);
 CREATE TABLE placement (
     placement_id  INTEGER PRIMARY KEY AUTOINCREMENT,
-    homework_id   TEXT NOT NULL REFERENCES homework(homework_id),
+    task_id   TEXT NOT NULL REFERENCES task(task_id),
     worker_id     TEXT NOT NULL,
     attempt_id    TEXT REFERENCES attempt(attempt_id),
     demand_json   TEXT NOT NULL,
@@ -172,7 +172,7 @@ CREATE TABLE worker_state (
 CREATE TABLE worker_attempt (
     attempt_id             TEXT PRIMARY KEY,
     run_id                 TEXT NOT NULL,
-    homework_id            TEXT NOT NULL,
+    task_id            TEXT NOT NULL,
     generation             INTEGER NOT NULL,
     payload_hash           TEXT NOT NULL,
     coordinator_epoch      INTEGER NOT NULL,
@@ -191,7 +191,7 @@ CREATE TABLE worker_attempt (
     CHECK ((state = 'terminal') = (terminal_at_ms IS NOT NULL))
 );
 -- A retired attempt still counts until it is terminal (confirmed stopped).
-CREATE UNIQUE INDEX worker_attempt_one_live ON worker_attempt(homework_id)
+CREATE UNIQUE INDEX worker_attempt_one_live ON worker_attempt(task_id)
     WHERE state <> 'terminal';
 -- A cancel or retire that arrived before (or without) the submit. Never deleted.
 CREATE TABLE tombstone (

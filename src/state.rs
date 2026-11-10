@@ -168,7 +168,7 @@ impl Exit {
 pub enum TimeoutKind {
     /// The command's own execution time. Queue wait is not part of it.
     Command,
-    /// The homework-wide deadline across every phase.
+    /// The task-wide deadline across every phase.
     Deadline,
     /// Waiting for resources (admission) took too long.
     ResourceWait,
@@ -193,7 +193,7 @@ pub struct TimeoutInfo {
 
 impl TimeoutInfo {
     /// A command timeout happens while running, a resource-wait timeout while
-    /// waiting; only the homework deadline can fire in any phase.
+    /// waiting; only the task deadline can fire in any phase.
     pub fn is_consistent(self) -> bool {
         match self.kind {
             TimeoutKind::Command => self.phase == TimeoutPhase::Running,

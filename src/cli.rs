@@ -29,9 +29,9 @@ pub enum Command {
     Exec(ExecArgs),
     /// Submit a command without waiting.
     Submit(SubmitArgs),
-    /// List runs and homework.
+    /// List runs and tasks.
     Ls,
-    /// Show one run or homework.
+    /// Show one run or task.
     Show(IdArgs),
     /// Show logs.
     Logs(LogsArgs),

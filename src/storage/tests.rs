@@ -39,7 +39,7 @@ struct Fx {
     _dir: TempDir,
     store: CoordinatorStore,
     run: RunId,
-    hw: HomeworkId,
+    task: TaskId,
     worker: WorkerId,
 }
 
@@ -47,14 +47,14 @@ fn fx() -> Fx {
     let dir = tempfile::tempdir().unwrap();
     let store = CoordinatorStore::open(path_state(&dir), 1).unwrap();
     let run = RunId::generate();
-    let hw = HomeworkId::generate();
+    let task = TaskId::generate();
     store.create_run(&run, None, None, &json!({}), 1).unwrap();
-    store.create_homework(&hw, &run, &json!({}), 1).unwrap();
+    store.create_task(&task, &run, &json!({}), 1).unwrap();
     Fx {
         _dir: dir,
         store,
         run,
-        hw,
+        task,
         worker: WorkerId::parse("mini-a").unwrap(),
     }
 }
@@ -64,7 +64,7 @@ impl Fx {
         self.store.create_attempt(
             NewAttempt {
                 attempt_id: AttemptId::generate(),
-                homework_id: self.hw.clone(),
+                task_id: self.task.clone(),
                 worker_id: self.worker.clone(),
                 payload_hash: hash(h),
                 permit_id: None,
@@ -114,7 +114,7 @@ fn each_open_starts_a_new_epoch_and_a_second_open_is_locked_out() {
 }
 
 #[test]
-fn a_homework_never_has_two_live_attempts() {
+fn a_task_never_has_two_live_attempts() {
     let f = fx();
     let a1 = f.attempt('a').unwrap();
     assert_eq!(a1.generation, Generation(1));
@@ -127,15 +127,15 @@ fn a_homework_never_has_two_live_attempts() {
     // Even the unique index alone refuses it, bypassing the repository check.
     let raw = f.store.db.call(|c| {
         Ok(c.execute(
-            "INSERT INTO attempt (attempt_id, homework_id, worker_id, generation, payload_hash,
+            "INSERT INTO attempt (attempt_id, task_id, worker_id, generation, payload_hash,
                 coordinator_epoch, state, receipts_json, created_at_ms)
-             SELECT 'x', homework_id, 'w', 99, 'h', 1, 'accepted', '{}', 1 FROM attempt LIMIT 1",
+             SELECT 'x', task_id, 'w', 99, 'h', 1, 'accepted', '{}', 1 FROM attempt LIMIT 1",
             [],
         )?)
     });
     assert!(raw.is_err());
 
-    // A terminal attempt frees the homework; the next generation counts up.
+    // A terminal attempt frees the task; the next generation counts up.
     f.to_finalizing(&a1.attempt_id);
     f.store
         .finalize_attempt(&a1.attempt_id, done(Outcome::Failed), 30)
@@ -159,7 +159,7 @@ fn a_new_attempt_waits_for_a_confirmed_retire_with_a_persisted_tombstone() {
         f.store.retire_tombstone(&a1.attempt_id).unwrap(),
         Some((5, None))
     );
-    // The tombstone alone does not free the homework (the old one may still run).
+    // The tombstone alone does not free the task (the old one may still run).
     assert!(f.attempt('a').is_err());
     f.store.confirm_retire(&a1.attempt_id, 7).unwrap();
     assert_eq!(
@@ -348,7 +348,7 @@ fn matrix_permits_hold_until_terminal_or_confirmed_retire() {
         .create_attempt(
             NewAttempt {
                 attempt_id: aid.clone(),
-                homework_id: f.hw.clone(),
+                task_id: f.task.clone(),
                 worker_id: f.worker.clone(),
                 payload_hash: hash('a'),
                 permit_id: Some(p1.clone()),
@@ -389,7 +389,7 @@ fn creating_an_attempt_with_a_bad_permit_leaves_no_attempt() {
     let r = f.store.create_attempt(
         NewAttempt {
             attempt_id: AttemptId::generate(),
-            homework_id: f.hw.clone(),
+            task_id: f.task.clone(),
             worker_id: f.worker.clone(),
             payload_hash: hash('a'),
             permit_id: Some(PermitId::generate()),
@@ -398,7 +398,7 @@ fn creating_an_attempt_with_a_bad_permit_leaves_no_attempt() {
     );
     assert!(r.is_err());
     assert!(f.store.list_nonterminal_attempts().unwrap().is_empty());
-    // The failed commit did not use up the homework.
+    // The failed commit did not use up the task.
     f.attempt('a').unwrap();
 }
 
@@ -407,11 +407,11 @@ fn placements_stay_in_the_unacked_demand_until_acknowledged() {
     let f = fx();
     let p1 = f
         .store
-        .record_placement(&f.hw, &f.worker, None, &json!({"cpu": 2}), 1)
+        .record_placement(&f.task, &f.worker, None, &json!({"cpu": 2}), 1)
         .unwrap();
     let p2 = f
         .store
-        .record_placement(&f.hw, &f.worker, None, &json!({"cpu": 1}), 2)
+        .record_placement(&f.task, &f.worker, None, &json!({"cpu": 1}), 2)
         .unwrap();
     assert!(p2 > p1);
     let open = f.store.unacked_demand().unwrap();
@@ -527,13 +527,13 @@ fn blob(r: &str, a: &AttemptId, kind: BlobKind, loc: &str) -> NewBlobRef {
 fn coordinator_gc_keeps_everything_that_is_not_safely_finished() {
     let f = fx();
     let run = &f.run;
-    let mk = |hw: &HomeworkId| -> AttemptRecord {
-        f.store.create_homework(hw, run, &json!({}), 1).unwrap();
+    let mk = |task: &TaskId| -> AttemptRecord {
+        f.store.create_task(task, run, &json!({}), 1).unwrap();
         f.store
             .create_attempt(
                 NewAttempt {
                     attempt_id: AttemptId::generate(),
-                    homework_id: hw.clone(),
+                    task_id: task.clone(),
                     worker_id: f.worker.clone(),
                     payload_hash: hash('a'),
                     permit_id: None,
@@ -556,11 +556,11 @@ fn coordinator_gc_keeps_everything_that_is_not_safely_finished() {
             .finalize_attempt(&a.attempt_id, done(Outcome::Succeeded), at)
             .unwrap();
     };
-    let old = mk(&HomeworkId::generate()); // terminal, collected, old: collectable
-    let running = mk(&HomeworkId::generate()); // not terminal
-    let uncollected = mk(&HomeworkId::generate()); // terminal, required artifact missing
-    let fresh = mk(&HomeworkId::generate()); // terminal, collected, recent
-    let pinned = mk(&HomeworkId::generate()); // terminal, collected, old, pinned
+    let old = mk(&TaskId::generate()); // terminal, collected, old: collectable
+    let running = mk(&TaskId::generate()); // not terminal
+    let uncollected = mk(&TaskId::generate()); // terminal, required artifact missing
+    let fresh = mk(&TaskId::generate()); // terminal, collected, recent
+    let pinned = mk(&TaskId::generate()); // terminal, collected, old, pinned
     end(&old, 1_000);
     end(&uncollected, 1_000);
     end(&fresh, 1_000 + 6 * DAY);
@@ -645,18 +645,18 @@ fn coordinator_gc_keeps_everything_that_is_not_safely_finished() {
 #[test]
 fn a_restart_keeps_what_was_committed_and_drops_what_was_not() {
     let dir = tempfile::tempdir().unwrap();
-    let (run, hw, aid);
+    let (run, task, aid);
     {
         let s = CoordinatorStore::open(dir.path(), 1).unwrap();
         run = RunId::generate();
-        hw = HomeworkId::generate();
+        task = TaskId::generate();
         aid = AttemptId::generate();
         s.create_run(&run, None, None, &json!({}), 1).unwrap();
-        s.create_homework(&hw, &run, &json!({}), 1).unwrap();
+        s.create_task(&task, &run, &json!({}), 1).unwrap();
         s.create_attempt(
             NewAttempt {
                 attempt_id: aid.clone(),
-                homework_id: hw.clone(),
+                task_id: task.clone(),
                 worker_id: WorkerId::parse("w").unwrap(),
                 payload_hash: hash('a'),
                 permit_id: None,
@@ -703,17 +703,17 @@ fn wx() -> Wx {
     Wx { dir, store, id }
 }
 
-/// The run of a homework in these tests: the same homework always names the
+/// The run of a task in these tests: the same task always names the
 /// same run, so a resend is a true replay.
-fn run_of_hw(hw: &HomeworkId) -> RunId {
-    RunId::parse(&format!("run_{}", &hw.as_str()["hw_".len()..])).unwrap()
+fn run_of_task(task: &TaskId) -> RunId {
+    RunId::parse(&format!("run_{}", &task.as_str()["task_".len()..])).unwrap()
 }
 
-fn acceptance(a: &AttemptId, hw: &HomeworkId, h: char, epoch: u64) -> NewAcceptance {
+fn acceptance(a: &AttemptId, task: &TaskId, h: char, epoch: u64) -> NewAcceptance {
     NewAcceptance {
         attempt_id: a.clone(),
-        run_id: run_of_hw(hw),
-        homework_id: hw.clone(),
+        run_id: run_of_task(task),
+        task_id: task.clone(),
         generation: Generation(1),
         payload_hash: hash(h),
         coordinator_epoch: CoordinatorEpoch(epoch),
@@ -726,7 +726,7 @@ fn resend_of(a: &AcceptedAttempt) -> NewAcceptance {
     NewAcceptance {
         attempt_id: a.attempt_id.clone(),
         run_id: a.run_id.clone(),
-        homework_id: a.homework_id.clone(),
+        task_id: a.task_id.clone(),
         generation: a.generation,
         payload_hash: a.payload_hash.clone(),
         coordinator_epoch: a.coordinator_epoch,
@@ -738,7 +738,7 @@ fn accepted(w: &Wx) -> AcceptedAttempt {
     match w
         .store
         .submit(
-            acceptance(&AttemptId::generate(), &HomeworkId::generate(), 'a', 1),
+            acceptance(&AttemptId::generate(), &TaskId::generate(), 'a', 1),
             10,
         )
         .unwrap()
@@ -763,8 +763,8 @@ fn node(n: &str) -> NodeId {
 #[test]
 fn submit_is_idempotent_for_the_same_payload_and_conflicts_otherwise() {
     let w = wx();
-    let (a, hw) = (AttemptId::generate(), HomeworkId::generate());
-    let first = match w.store.submit(acceptance(&a, &hw, 'a', 1), 10).unwrap() {
+    let (a, task) = (AttemptId::generate(), TaskId::generate());
+    let first = match w.store.submit(acceptance(&a, &task, 'a', 1), 10).unwrap() {
         SubmitOutcome::Accepted(r) => r,
         other => panic!("{other:?}"),
     };
@@ -774,13 +774,13 @@ fn submit_is_idempotent_for_the_same_payload_and_conflicts_otherwise() {
     for i in 0..100 {
         let again = w
             .store
-            .submit(acceptance(&a, &hw, 'a', 1), 1_000 + i)
+            .submit(acceptance(&a, &task, 'a', 1), 1_000 + i)
             .unwrap();
         assert_eq!(again, SubmitOutcome::Existing(first.clone()));
     }
     let e = w
         .store
-        .submit(acceptance(&a, &hw, 'b', 1), 11)
+        .submit(acceptance(&a, &task, 'b', 1), 11)
         .err()
         .unwrap();
     assert!(matches!(e, StorageError::PayloadConflict(_)), "{e:?}");
@@ -797,23 +797,23 @@ fn submit_is_idempotent_for_the_same_payload_and_conflicts_otherwise() {
 }
 
 #[test]
-fn a_second_live_attempt_for_a_homework_is_refused() {
+fn a_second_live_attempt_for_a_task_is_refused() {
     let w = wx();
-    let hw = HomeworkId::generate();
+    let task = TaskId::generate();
     let a1 = AttemptId::generate();
-    w.store.submit(acceptance(&a1, &hw, 'a', 1), 1).unwrap();
+    w.store.submit(acceptance(&a1, &task, 'a', 1), 1).unwrap();
     let e = w
         .store
-        .submit(acceptance(&AttemptId::generate(), &hw, 'a', 1), 2)
+        .submit(acceptance(&AttemptId::generate(), &task, 'a', 1), 2)
         .err()
         .unwrap();
     assert!(matches!(e, StorageError::LiveAttemptExists(_)), "{e:?}");
     // A retired attempt still counts until it is confirmed stopped: a new
-    // submit for the homework is refused, not just delayed by the coordinator.
+    // submit for the task is refused, not just delayed by the coordinator.
     w.store.retire(&a1, CoordinatorEpoch(1), 3).unwrap();
     let e = w
         .store
-        .submit(acceptance(&AttemptId::generate(), &hw, 'a', 1), 4)
+        .submit(acceptance(&AttemptId::generate(), &task, 'a', 1), 4)
         .err()
         .unwrap();
     assert!(matches!(e, StorageError::LiveAttemptExists(ref l) if *l == a1.to_string()));
@@ -831,21 +831,21 @@ fn a_second_live_attempt_for_a_homework_is_refused() {
     );
     w.store.finalize(&a1, done(Outcome::Cancelled), 5).unwrap();
     w.store
-        .submit(acceptance(&AttemptId::generate(), &hw, 'a', 1), 6)
+        .submit(acceptance(&AttemptId::generate(), &task, 'a', 1), 6)
         .unwrap();
 }
 
 #[test]
-fn a_resend_that_differs_in_run_homework_or_generation_conflicts() {
+fn a_resend_that_differs_in_run_task_or_generation_conflicts() {
     let w = wx();
     let first = accepted(&w);
     let mut other_gen = resend_of(&first);
     other_gen.generation = Generation(2);
     let mut other_run = resend_of(&first);
     other_run.run_id = RunId::generate();
-    let mut other_hw = resend_of(&first);
-    other_hw.homework_id = HomeworkId::generate();
-    for bad in [other_gen, other_run, other_hw] {
+    let mut other_task = resend_of(&first);
+    other_task.task_id = TaskId::generate();
+    for bad in [other_gen, other_run, other_task] {
         let e = w.store.submit(bad, 11).err().unwrap();
         assert!(matches!(e, StorageError::PayloadConflict(_)), "{e:?}");
         assert_eq!(e.code(), ErrorCode::Conflict);
@@ -861,7 +861,7 @@ fn a_resend_that_differs_in_run_homework_or_generation_conflicts() {
 #[test]
 fn a_cancel_that_arrives_first_leaves_a_tombstone_and_the_late_submit_is_retired() {
     let w = wx();
-    let (a, hw) = (AttemptId::generate(), HomeworkId::generate());
+    let (a, task) = (AttemptId::generate(), TaskId::generate());
     assert_eq!(
         w.store.cancel(&a, CoordinatorEpoch(1), 5).unwrap(),
         CancelOutcome::Tombstoned
@@ -869,7 +869,7 @@ fn a_cancel_that_arrives_first_leaves_a_tombstone_and_the_late_submit_is_retired
     assert_eq!(w.store.tombstone(&a).unwrap().as_deref(), Some("cancel"));
     let e = w
         .store
-        .submit(acceptance(&a, &hw, 'a', 1), 6)
+        .submit(acceptance(&a, &task, 'a', 1), 6)
         .err()
         .unwrap();
     assert!(matches!(e, StorageError::Retired(_)), "{e:?}");
@@ -879,7 +879,7 @@ fn a_cancel_that_arrives_first_leaves_a_tombstone_and_the_late_submit_is_retired
     let Wx { dir, store, id } = w;
     drop(store);
     let store = WorkerStore::open(dir.path(), &id).unwrap();
-    assert!(store.submit(acceptance(&a, &hw, 'a', 1), 7).is_err());
+    assert!(store.submit(acceptance(&a, &task, 'a', 1), 7).is_err());
     assert!(store
         .db
         .call(|c| Ok(c.execute("DELETE FROM tombstone", [])?))
@@ -923,7 +923,7 @@ fn cancelling_a_known_attempt_is_recorded_once_and_stops_new_spawns() {
             NewAcceptance {
                 attempt_id: a.attempt_id.clone(),
                 run_id: a.run_id.clone(),
-                homework_id: a.homework_id.clone(),
+                task_id: a.task_id.clone(),
                 generation: a.generation,
                 payload_hash: a.payload_hash.clone(),
                 coordinator_epoch: CoordinatorEpoch(1),
@@ -1300,8 +1300,8 @@ fn worker_gc_waits_for_the_ack_and_the_retention_and_skips_pins() {
 #[test]
 fn stale_coordinator_epochs_are_rejected_for_every_control_request() {
     let w = wx();
-    let (a, hw) = (AttemptId::generate(), HomeworkId::generate());
-    w.store.submit(acceptance(&a, &hw, 'a', 5), 1).unwrap();
+    let (a, task) = (AttemptId::generate(), TaskId::generate());
+    w.store.submit(acceptance(&a, &task, 'a', 5), 1).unwrap();
     let old = CoordinatorEpoch(4);
     let e = w.store.cancel(&a, old, 2).err().unwrap();
     assert!(matches!(e, StorageError::StaleEpoch { .. }));
@@ -1309,7 +1309,7 @@ fn stale_coordinator_epochs_are_rejected_for_every_control_request() {
     assert!(w
         .store
         .submit(
-            acceptance(&AttemptId::generate(), &HomeworkId::generate(), 'a', 4),
+            acceptance(&AttemptId::generate(), &TaskId::generate(), 'a', 4),
             2
         )
         .is_err());
@@ -1504,7 +1504,7 @@ fn many_connections_opening_a_fresh_worker_database_at_once_all_succeed() {
 #[test]
 fn concurrent_finalize_from_separate_connections_has_one_winner() {
     let (_dir, _id, stores) = open_many(6);
-    let acc = acceptance(&AttemptId::generate(), &HomeworkId::generate(), 'a', 1);
+    let acc = acceptance(&AttemptId::generate(), &TaskId::generate(), 'a', 1);
     let a = acc.attempt_id.clone();
     stores[0].submit(acc, 1).unwrap();
     to_finalizing_w(&stores[0], &a);
@@ -1538,7 +1538,7 @@ fn concurrent_finalize_from_separate_connections_has_one_winner() {
 #[test]
 fn concurrent_claim_launch_grants_each_node_once() {
     let (_dir, _id, stores) = open_many(6);
-    let acc = acceptance(&AttemptId::generate(), &HomeworkId::generate(), 'a', 1);
+    let acc = acceptance(&AttemptId::generate(), &TaskId::generate(), 'a', 1);
     let a = acc.attempt_id.clone();
     stores[0].submit(acc, 1).unwrap();
     for s in TO_READY {
@@ -1568,7 +1568,7 @@ fn concurrent_claim_launch_grants_each_node_once() {
     );
     // Six different nodes at once: every one is granted, the attempt moves to
     // Starting only once.
-    let acc = acceptance(&AttemptId::generate(), &HomeworkId::generate(), 'a', 1);
+    let acc = acceptance(&AttemptId::generate(), &TaskId::generate(), 'a', 1);
     let b = acc.attempt_id.clone();
     stores[0].submit(acc, 3).unwrap();
     for s in TO_READY {
@@ -1599,7 +1599,7 @@ fn concurrent_claim_launch_grants_each_node_once() {
 fn concurrent_submits_have_one_winner_and_no_busy_errors() {
     let (_dir, _id, stores) = open_many(6);
     // The same attempt six times: one Accepted, five Existing.
-    let acc = acceptance(&AttemptId::generate(), &HomeworkId::generate(), 'a', 1);
+    let acc = acceptance(&AttemptId::generate(), &TaskId::generate(), 'a', 1);
     let results = together(&stores, |_, st| st.submit(acc.clone(), 5));
     no_busy(&results);
     let results: Vec<SubmitOutcome> = results.into_iter().map(|r| r.unwrap()).collect();
@@ -1617,10 +1617,10 @@ fn concurrent_submits_have_one_winner_and_no_busy_errors() {
             .count(),
         5
     );
-    // Six different attempts for one homework: exactly one gets in.
-    let hw = HomeworkId::generate();
+    // Six different attempts for one task: exactly one gets in.
+    let task = TaskId::generate();
     let results = together(&stores, |_, st| {
-        st.submit(acceptance(&AttemptId::generate(), &hw, 'a', 1), 6)
+        st.submit(acceptance(&AttemptId::generate(), &task, 'a', 1), 6)
     });
     no_busy(&results);
     assert_eq!(results.iter().filter(|r| r.is_ok()).count(), 1);
@@ -1644,7 +1644,7 @@ fn a_busy_database_is_a_retryable_error_and_changes_nothing() {
         .unwrap();
     let (locked_tx, locked_rx) = std::sync::mpsc::channel();
     let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
-    let acc = acceptance(&AttemptId::generate(), &HomeworkId::generate(), 'a', 1);
+    let acc = acceptance(&AttemptId::generate(), &TaskId::generate(), 'a', 1);
     std::thread::scope(|s| {
         s.spawn(|| {
             holder
@@ -1679,24 +1679,24 @@ fn a_busy_database_is_a_retryable_error_and_changes_nothing() {
 fn a_failed_request_still_remembers_the_newer_coordinator_epoch() {
     let w = wx();
     // submit: a payload conflict at epoch 5 must not forget epoch 5.
-    let (a, hw) = (AttemptId::generate(), HomeworkId::generate());
-    w.store.submit(acceptance(&a, &hw, 'a', 1), 1).unwrap();
+    let (a, task) = (AttemptId::generate(), TaskId::generate());
+    w.store.submit(acceptance(&a, &task, 'a', 1), 1).unwrap();
     let e = w
         .store
-        .submit(acceptance(&a, &hw, 'b', 5), 2)
+        .submit(acceptance(&a, &task, 'b', 5), 2)
         .err()
         .unwrap();
     assert!(matches!(e, StorageError::PayloadConflict(_)));
     let e = w
         .store
-        .submit(acceptance(&a, &hw, 'a', 4), 3)
+        .submit(acceptance(&a, &task, 'a', 4), 3)
         .err()
         .unwrap();
     assert!(matches!(e, StorageError::StaleEpoch { .. }), "{e:?}");
     // A live-attempt refusal rolls back its own writes and keeps the epoch.
     let e = w
         .store
-        .submit(acceptance(&AttemptId::generate(), &hw, 'a', 7), 4)
+        .submit(acceptance(&AttemptId::generate(), &task, 'a', 7), 4)
         .err()
         .unwrap();
     assert!(matches!(e, StorageError::LiveAttemptExists(_)));
@@ -1805,7 +1805,7 @@ fn a_result_is_the_same_when_its_canonical_form_is_the_same() {
 #[test]
 fn tombstones_keep_their_identity_even_against_sql() {
     let w = wx();
-    let (a, hw) = (AttemptId::generate(), HomeworkId::generate());
+    let (a, task) = (AttemptId::generate(), TaskId::generate());
     w.store.cancel(&a, CoordinatorEpoch(3), 5).unwrap();
     let exec = |sql: &'static str| {
         let a = a.to_string();
@@ -1823,7 +1823,7 @@ fn tombstones_keep_their_identity_even_against_sql() {
     assert!(exec("UPDATE tombstone SET kind = 'cancel' WHERE attempt_id = ?1").is_err());
     w.store.retire(&a, CoordinatorEpoch(3), 6).unwrap();
     assert_eq!(w.store.tombstone(&a).unwrap().as_deref(), Some("retire"));
-    let _ = hw;
+    let _ = task;
 }
 
 #[test]
@@ -1941,7 +1941,7 @@ fn the_last_reference_queues_the_file_and_a_new_reference_to_it_is_refused() {
 fn gc_and_a_new_reference_from_another_connection_never_leave_a_dangling_file() {
     let (_dir, _id, stores) = open_many(2);
     for round in 0..30 {
-        let acc = acceptance(&AttemptId::generate(), &HomeworkId::generate(), 'a', 1);
+        let acc = acceptance(&AttemptId::generate(), &TaskId::generate(), 'a', 1);
         let a = acc.attempt_id.clone();
         stores[0].submit(acc, 1).unwrap();
         to_finalizing_w(&stores[0], &a);
@@ -2093,13 +2093,13 @@ fn gc_runs_in_batches_and_a_failed_batch_keeps_what_the_earlier_ones_did() {
 fn coordinator_gc_reaches_a_deadline_for_every_way_an_attempt_can_end() {
     let f = fx();
     let mk = || -> AttemptRecord {
-        let hw = HomeworkId::generate();
-        f.store.create_homework(&hw, &f.run, &json!({}), 1).unwrap();
+        let task = TaskId::generate();
+        f.store.create_task(&task, &f.run, &json!({}), 1).unwrap();
         f.store
             .create_attempt(
                 NewAttempt {
                     attempt_id: AttemptId::generate(),
-                    homework_id: hw,
+                    task_id: task,
                     worker_id: f.worker.clone(),
                     payload_hash: hash('a'),
                     permit_id: None,
@@ -2287,13 +2287,13 @@ fn a_retired_attempt_blocks_a_new_submit_until_it_is_terminal_even_on_the_databa
         .retire(&a.attempt_id, CoordinatorEpoch(1), 5)
         .unwrap();
     // The index itself says so, not only the check in `submit`.
-    let hw = a.homework_id.to_string();
+    let task = a.task_id.to_string();
     let second = w.store.db.write(move |tx| {
         Ok(tx.execute(
-            "INSERT INTO worker_attempt (attempt_id, run_id, homework_id, generation, payload_hash,
+            "INSERT INTO worker_attempt (attempt_id, run_id, task_id, generation, payload_hash,
                 coordinator_epoch, spec_json, state, receipts_json, accepted_at_ms)
              VALUES ('att_x','run_x',?1,2,'h',1,'{}','accepted','{}',1)",
-            [&hw],
+            [&task],
         )?)
     });
     assert!(second.is_err());

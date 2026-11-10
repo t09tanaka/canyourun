@@ -73,7 +73,7 @@ pub enum ErrorCode {
     LeaseNotRenewable,
 }
 
-/// Why a homework is blocked (accompanies `ErrorCode::Blocked`).
+/// Why a task is blocked (accompanies `ErrorCode::Blocked`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BlockedReason {

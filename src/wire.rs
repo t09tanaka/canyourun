@@ -381,9 +381,9 @@ pub struct InspectResponse {
     pub agent_epoch: AgentEpoch,
     pub snapshot_digest: SnapshotDigest,
     pub policy_digest: PolicyDigest,
-    pub active_homework: u32,
+    pub active_task: u32,
     pub prefetch_pending: u32,
-    pub max_active_homework: u32,
+    pub max_active_task: u32,
     pub prefetch_per_worker: u32,
     pub disk_free_bytes: u64,
     pub draining: bool,
@@ -623,7 +623,7 @@ pub struct CommandSpec {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AttemptPayload {
     pub run_id: RunId,
-    pub homework_id: HomeworkId,
+    pub task_id: TaskId,
     pub generation: Generation,
     pub source_id: SourceId,
     pub plan_digest: PlanDigest,
@@ -636,7 +636,7 @@ pub struct AttemptPayload {
     /// overrides it). Queue wait is not part of it.
     #[serde(default)]
     pub command_timeout_ms: Option<u64>,
-    /// Deadline for the whole homework across preparation, waiting, running and
+    /// Deadline for the whole task across preparation, waiting, running and
     /// collection; the termination records which phase it fired in.
     #[serde(default)]
     pub deadline_ms: Option<u64>,
@@ -743,7 +743,7 @@ pub struct AttemptStatus {
     pub schema_version: SchemaVersion,
     pub attempt_id: AttemptId,
     pub run_id: RunId,
-    pub homework_id: HomeworkId,
+    pub task_id: TaskId,
     pub generation: Generation,
     /// The boot and agent incarnation that produced this status.
     pub worker_boot_id: WorkerBootId,
@@ -1417,7 +1417,7 @@ mod tests {
     fn payload() -> AttemptPayload {
         AttemptPayload {
             run_id: RunId::generate(),
-            homework_id: HomeworkId::generate(),
+            task_id: TaskId::generate(),
             generation: Generation(1),
             source_id: SourceId::generate(),
             plan_digest: dg("plan"),
@@ -1444,7 +1444,7 @@ mod tests {
             schema_version: SV,
             attempt_id: aid(),
             run_id: RunId::generate(),
-            homework_id: HomeworkId::generate(),
+            task_id: TaskId::generate(),
             generation: Generation(2),
             worker_boot_id: boot(),
             agent_epoch: AgentEpoch(2),
@@ -1717,9 +1717,9 @@ mod tests {
                 agent_epoch: AgentEpoch(2),
                 snapshot_digest: dg("s"),
                 policy_digest: dg("p"),
-                active_homework: 1,
+                active_task: 1,
                 prefetch_pending: 0,
-                max_active_homework: 2,
+                max_active_task: 2,
                 prefetch_per_worker: 1,
                 disk_free_bytes: 1 << 30,
                 draining: false,

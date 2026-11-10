@@ -102,10 +102,10 @@ prefixed_id!(
 );
 prefixed_id!(
     /// A placeable logical piece of work.
-    HomeworkId, "hw"
+    TaskId, "task"
 );
 prefixed_id!(
-    /// One execution attempt of a homework.
+    /// One execution attempt of a task.
     AttemptId, "att"
 );
 prefixed_id!(
@@ -362,7 +362,7 @@ mod tests {
         t_clusterid: ClusterId => "cl",
         t_coordinatorid: CoordinatorId => "co",
         t_runid: RunId => "run",
-        t_homeworkid: HomeworkId => "hw",
+        t_taskid: TaskId => "task",
         t_attemptid: AttemptId => "att",
         t_requestid: RequestId => "req",
         t_sourceid: SourceId => "src",
