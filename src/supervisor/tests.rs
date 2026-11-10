@@ -1611,6 +1611,7 @@ fn an_index_scan_over_any_sixteen_bytes_keeps_a_valid_prefix() {
 
 use super::pump::{pump, Pipe};
 use super::run::{settle, SpoolBeat};
+use crate::secrets::mask::Masker;
 use std::os::unix::fs::OpenOptionsExt;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
@@ -1763,10 +1764,19 @@ fn write_bounded(mut out: fs::File, data: &[u8]) {
 /// Run the pump against a writer in this process, as a command's
 /// descriptors would write.
 fn pumped(s: &AttemptSpool, pipe: &Pipe, write: impl FnOnce(fs::File) + Send) -> Option<String> {
+    pumped_masked(s, pipe, &Masker::new([]), write)
+}
+
+fn pumped_masked(
+    s: &AttemptSpool,
+    pipe: &Pipe,
+    mask: &Masker,
+    write: impl FnOnce(fs::File) + Send,
+) -> Option<String> {
     let done = AtomicBool::new(false);
     let error = Mutex::new(None);
     std::thread::scope(|sc| {
-        let feeder = sc.spawn(|| pump(pipe, s.writer(Stdout), &done, &error));
+        let feeder = sc.spawn(|| pump(pipe, s.writer(Stdout), mask.stream(), &done, &error));
         let out = fs::OpenOptions::new()
             .append(true)
             .custom_flags(libc::O_NONBLOCK)
@@ -1833,4 +1843,22 @@ fn a_pipe_is_made_once_reused_after_a_crash_and_never_replaces_another_file() {
     std::os::unix::fs::symlink(&path, &link).unwrap();
     assert!(Pipe::open(&link).is_err());
     assert!(link.symlink_metadata().is_ok() && path.exists());
+}
+
+#[test]
+fn the_pump_masks_secrets_also_across_reads_and_at_the_very_end() {
+    let (dir, a, s) = spool(BIG);
+    let pipe = Pipe::open(&Pipe::path_for(dir.path(), &a, 0)).unwrap();
+    let mask = Masker::new([b"hunter2-value".to_vec()]);
+    let err = pumped_masked(&s, &pipe, &mask, |mut out| {
+        // The secret arrives in two writes, far enough apart for two reads,
+        // and the output ends with a secret and with a held-back prefix of one.
+        out.write_all(b"a hunter2-").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        out.write_all(b"value b hunter2-value hunter2-").unwrap();
+    });
+    assert_eq!(err, None);
+    s.finish().unwrap();
+    let r = SpoolReader::open(dir.path(), &a).unwrap();
+    assert_eq!(read_all(&r, Stdout), b"a *** b *** hunter2-");
 }

@@ -17,7 +17,8 @@
 //! that cannot store the output (it cannot be opened, a write or the final
 //! sync fails) stops the command, is recorded as a `spool_failed` event and
 //! makes the attempt `interrupted`: its output is incomplete, so it is never
-//! reported as a success ([`after_spool_failure`]).
+//! reported as a success ([`after_spool_failure`]). The secret values of the
+//! spec (`mask`) are replaced before any output is stored.
 //!
 //! When the command's processes cannot be confirmed stopped (even after a few
 //! bounded retries), the attempt is left non-terminal and the process exits
@@ -40,6 +41,7 @@ use super::termination::{after_spool_failure, may_continue, pick_reason, termina
 use super::{lease::LeaseClock, lease::LeaseStatus, timeouts};
 use crate::ids::{AttemptId, NodeId, WorkerBootId};
 use crate::platform::{self, Inhibit};
+use crate::secrets::mask::Masker;
 use crate::state::{AttemptState, Exit, Receipt, Termination};
 use crate::storage::{
     Finalized, LaunchClaim, LogPosition, ProcessIdentity, StorageError, WorkerStore,
@@ -202,7 +204,7 @@ pub(crate) fn open_spool(
     let others = store.log_bytes_of_other_attempts(&spec.attempt_id)?;
     let limit = attempt_limit(spec.log_limit_bytes, others);
     Ok(AttemptSpool::open(
-        &spec.spool_root,
+        &spec.spool_dir(),
         &spec.attempt_id,
         limit,
     ))
@@ -352,6 +354,7 @@ struct Control<'a> {
     lease: LeaseClock,
     started_ms: u64,
     spool: &'a AttemptSpool,
+    masker: Masker,
     beat: SpoolBeat,
     /// The first failure of a thread feeding the spool.
     pump_error: Arc<Mutex<Option<String>>>,
@@ -411,7 +414,7 @@ impl Control<'_> {
         let id = command_id(&attempt, index);
         // The pipe the command's output comes through. Without it nothing is
         // registered or started.
-        let pipe = match Pipe::open(&Pipe::path_for(&spec.spool_root, &attempt, index)) {
+        let pipe = match Pipe::open(&Pipe::path_for(&spec.spool_dir(), &attempt, index)) {
             Ok(p) => p,
             Err(e) => {
                 let why = format!("the output pipe of node {}: {e}", node.node_id);
@@ -533,7 +536,8 @@ impl Control<'_> {
         let error = Arc::clone(&self.pump_error);
         let done = AtomicBool::new(false);
         let end = std::thread::scope(|s| {
-            let feeder = s.spawn(|| pump(pipe, out, &done, &error));
+            let mask = self.masker.stream();
+            let feeder = s.spawn(|| pump(pipe, out, mask, &done, &error));
             let end = self.run_admitted(guard, opts, node, id, limits);
             // The command is over (or given up on): what it wrote is read to
             // the end, within a bound.
@@ -835,8 +839,11 @@ pub fn run(spec: &SuperviseSpec) -> Result<Report> {
         platform::wall_ms(),
     )?;
 
+    let masker = spec.mask.masker();
     let warnings: Vec<_> = warning_texts(&spec.workspace_warnings, MAX_WARNINGS, MAX_WARNING_BYTES)
         .into_iter()
+        // A warning may quote what a tool printed.
+        .map(|m| String::from_utf8_lossy(&masker.mask(m.as_bytes())).into_owned())
         .map(|m| (m.clone(), json!({ "message": m })))
         .collect();
     store.append_events_unseen(
@@ -882,6 +889,7 @@ pub fn run(spec: &SuperviseSpec) -> Result<Report> {
         lease: LeaseClock::start(now, spec.lease_ms, spec.poll_ms, applied),
         started_ms: now,
         spool: &spool,
+        masker: masker.clone(),
         beat: SpoolBeat::default(),
         pump_error: Arc::default(),
     };
@@ -911,7 +919,7 @@ pub fn run(spec: &SuperviseSpec) -> Result<Report> {
         );
     }
     let term = termination(end.reason, end.exit);
-    let (termination, finalized_here) = settle(&store, &spec.spool_root, attempt, &spool, term)?;
+    let (termination, finalized_here) = settle(&store, &spec.spool_dir(), attempt, &spool, term)?;
     Ok(Report {
         termination: Some(termination),
         finalized_here,

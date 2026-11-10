@@ -4,6 +4,7 @@
 use super::error::{Result, SupervisorError};
 use super::timeouts::TimeoutPolicy;
 use crate::ids::{AttemptId, NodeId, WorkerId};
+use crate::secrets::mask::Masker;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
@@ -51,6 +52,26 @@ pub struct NodeSpec {
     pub weight: Option<u32>,
 }
 
+/// The secret values to replace in everything the supervisor stores of the
+/// commands' output. They are secrets themselves: `Debug` shows only how
+/// many there are, and the spec file that carries them must be readable by
+/// the worker's user alone and removed by whoever wrote it.
+#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct MaskValues(pub Vec<String>);
+
+impl std::fmt::Debug for MaskValues {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "MaskValues({} values)", self.0.len())
+    }
+}
+
+impl MaskValues {
+    pub fn masker(&self) -> Masker {
+        Masker::new(self.0.iter().map(|v| v.clone().into_bytes()))
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SuperviseSpec {
     /// The worker's state directory (`worker.db` lives here).
@@ -87,8 +108,10 @@ pub struct SuperviseSpec {
     #[serde(default = "d_true")]
     pub inhibit_sleep: bool,
     /// The root of the worker's log spool and artifact store: the output of
-    /// every node is stored under `<spool_root>/<attempt>/logs`.
-    pub spool_root: PathBuf,
+    /// every node is stored under `<spool_root>/<attempt>/logs`. Default
+    /// `<state_dir>/attempts`.
+    #[serde(default)]
+    pub spool_root: Option<PathBuf>,
     /// The cap on the log bytes the task may store on this worker, all its
     /// attempts together. This attempt gets what the others left.
     #[serde(default = "d_log_limit")]
@@ -97,6 +120,10 @@ pub struct SuperviseSpec {
     /// supervisor writes them to the event journal when it starts.
     #[serde(default)]
     pub workspace_warnings: Vec<String>,
+    /// Secret values masked in the commands' output before it is stored, and
+    /// in the workspace warnings. Empty: nothing is masked.
+    #[serde(default)]
+    pub mask: MaskValues,
 }
 
 impl SuperviseSpec {
@@ -118,7 +145,7 @@ impl SuperviseSpec {
         {
             return bad("a timeout of zero is not a timeout");
         }
-        if !self.spool_root.is_absolute() {
+        if self.spool_root.as_ref().is_some_and(|r| !r.is_absolute()) {
             // A relative root would follow whatever directory the supervisor
             // happens to run in.
             return bad("spool_root must be an absolute path");
@@ -141,6 +168,13 @@ impl SuperviseSpec {
             resource_wait_ms: self.resource_wait_timeout_ms,
             deadline_ms: self.deadline_ms,
         }
+    }
+
+    /// The root of the log spool and artifact store.
+    pub fn spool_dir(&self) -> PathBuf {
+        self.spool_root
+            .clone()
+            .unwrap_or_else(|| self.state_dir.join("attempts"))
     }
 
     pub fn traffic_config_path(&self) -> PathBuf {
@@ -209,9 +243,10 @@ mod tests {
             resource_wait_timeout_ms: None,
             deadline_ms: None,
             inhibit_sleep: false,
-            spool_root: "/spool".into(),
+            spool_root: Some("/spool".into()),
             log_limit_bytes: DEFAULT_LOG_LIMIT_BYTES,
             workspace_warnings: vec![],
+            mask: MaskValues::default(),
         }
     }
 
@@ -224,7 +259,7 @@ mod tests {
         assert_eq!(back, s);
         let minimal = serde_json::json!({
             "state_dir": "/s", "worker_id": "w", "attempt_id": s.attempt_id,
-            "traffic_state_dir": "/t", "spool_root": "/spool",
+            "traffic_state_dir": "/t",
             "nodes": [{"node_id": "a", "argv": ["true"], "cwd": "/"}],
         });
         let m: SuperviseSpec = serde_json::from_value(minimal).unwrap();
@@ -233,6 +268,17 @@ mod tests {
         assert!(m.inhibit_sleep);
         assert_eq!(m.log_limit_bytes, 1 << 30);
         assert!(m.workspace_warnings.is_empty());
+        assert_eq!(m.spool_dir(), PathBuf::from("/s/attempts"));
+        assert_eq!(s.spool_dir(), PathBuf::from("/spool"));
+        assert!(m.mask.masker().is_empty());
+        // The values to mask never show in a debug print of the spec.
+        let mut secret = spec();
+        secret.mask = MaskValues(vec!["hunter2-value".into()]);
+        assert!(!format!("{secret:?}").contains("hunter2"));
+        assert_eq!(secret.mask.masker().mask(b"a hunter2-value b"), b"a *** b");
+        let back: SuperviseSpec =
+            serde_json::from_str(&serde_json::to_string(&secret).unwrap()).unwrap();
+        assert_eq!(back, secret);
         assert_eq!(m.traffic_config_path(), PathBuf::from("/t/config.toml"));
     }
 
@@ -242,7 +288,7 @@ mod tests {
         s.nodes.clear();
         assert!(s.validate().is_err());
         let mut s = spec();
-        s.spool_root = "spool".into();
+        s.spool_root = Some("spool".into());
         assert!(s.validate().is_err());
         let mut s = spec();
         s.lease_ms = 0;

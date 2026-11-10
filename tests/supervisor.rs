@@ -9,7 +9,7 @@ use remote_task_runner::storage::{LeaseOutcome, NewAcceptance, StorageError, Wor
 use remote_task_runner::supervisor::process::{code, spawn_detached, supervise};
 use remote_task_runner::supervisor::recover::recover;
 use remote_task_runner::supervisor::run::{run, Report};
-use remote_task_runner::supervisor::spec::{NodeSpec, SuperviseSpec};
+use remote_task_runner::supervisor::spec::{MaskValues, NodeSpec, SuperviseSpec};
 use remote_task_runner::supervisor::spool::SpoolReader;
 use remote_task_runner::wire::LeaseKey;
 use remote_task_runner::wire::LogStream;
@@ -89,9 +89,10 @@ fn fx(nodes: Vec<NodeSpec>) -> Fx {
         resource_wait_timeout_ms: None,
         deadline_ms: None,
         inhibit_sleep: false,
-        spool_root: dir.path().join("spool"),
+        spool_root: Some(dir.path().join("spool")),
         log_limit_bytes: 1 << 30,
         workspace_warnings: vec![],
+        mask: Default::default(),
     };
     Fx {
         strays: Default::default(),
@@ -149,7 +150,7 @@ impl Fx {
         &self,
         attempt: &AttemptId,
     ) -> (Vec<u8>, remote_task_runner::supervisor::spool::ReadChunk) {
-        let r = SpoolReader::open(&self.spec.spool_root, attempt).unwrap();
+        let r = SpoolReader::open(&self.spec.spool_dir(), attempt).unwrap();
         let (mut out, mut off) = (Vec::new(), 0);
         loop {
             let c = r.read(LogStream::Stdout, off, 1 << 20).unwrap();
@@ -298,7 +299,7 @@ fn nodes_run_in_order_with_an_isolated_environment_and_their_output_in_the_spool
     assert_eq!(result["logs"]["stdout"]["bytes"], bytes.len() as u64);
     // The pipes the output came through are gone.
     let left: Vec<_> =
-        std::fs::read_dir(spec.spool_root.join(f.attempt().to_string()).join("logs"))
+        std::fs::read_dir(spec.spool_dir().join(f.attempt().to_string()).join("logs"))
             .unwrap()
             .map(|e| e.unwrap().file_name().into_string().unwrap())
             .filter(|n| n.ends_with(".pipe"))
@@ -417,7 +418,7 @@ fn a_spool_that_cannot_be_opened_interrupts_the_attempt_and_nothing_is_started()
     let mut spec = f.spec.clone();
     spec.nodes = vec![node("n", &format!("touch '{}'", marker.display()))];
     // The spool root is a file: no directory can be made below it.
-    std::fs::write(&spec.spool_root, b"in the way").unwrap();
+    std::fs::write(spec.spool_dir(), b"in the way").unwrap();
     let spec_path = write_spec(&f, &spec);
     let mut sup = spawn_detached(&exe(), &spec_path).unwrap();
     f.track(sup.id());
@@ -434,13 +435,13 @@ fn a_spool_that_cannot_be_opened_interrupts_the_attempt_and_nothing_is_started()
     assert_eq!(ev[0]["stage"], "open");
     assert!(!ev[0]["error"].as_str().unwrap().is_empty());
     assert!(f.store.get_result(f.attempt()).unwrap().is_none());
-    assert_eq!(std::fs::read(&spec.spool_root).unwrap(), b"in the way");
+    assert_eq!(std::fs::read(spec.spool_dir()).unwrap(), b"in the way");
 }
 
 #[test]
 fn a_cancelled_attempt_whose_spool_cannot_be_opened_stays_cancelled() {
     let f = fx(vec![node("n", "true")]);
-    std::fs::write(&f.spec.spool_root, b"").unwrap();
+    std::fs::write(f.spec.spool_dir(), b"").unwrap();
     f.store.cancel(f.attempt(), CoordinatorEpoch(1), 5).unwrap();
     let t = settled(&run(&f.spec).unwrap());
     assert_eq!(t.outcome(), Outcome::Cancelled);
@@ -454,7 +455,7 @@ fn an_output_pipe_that_cannot_be_made_interrupts_the_attempt() {
     let mut spec = f.spec.clone();
     spec.nodes = vec![node("n", &format!("touch '{}'", marker.display()))];
     // Something that is not a pipe sits where the node's pipe belongs.
-    let logs = spec.spool_root.join(f.attempt().to_string()).join("logs");
+    let logs = spec.spool_dir().join(f.attempt().to_string()).join("logs");
     std::fs::create_dir_all(&logs).unwrap();
     std::fs::write(logs.join("node-0.pipe"), b"not a pipe").unwrap();
     let t = settled(&run(&spec).unwrap());
@@ -468,6 +469,52 @@ fn an_output_pipe_that_cannot_be_made_interrupts_the_attempt() {
         std::fs::read(logs.join("node-0.pipe")).unwrap(),
         b"not a pipe"
     );
+}
+
+#[test]
+fn a_secret_the_command_prints_never_reaches_the_spool_or_the_journal() {
+    let secret = "hunter2-value";
+    // Printed whole, on stderr, and in two writes with a pause between.
+    let mut f = fx(vec![node(
+        "n",
+        "echo \"token=$TOKEN\"; echo \"err $TOKEN\" >&2; printf hunter2-; sleep 0.3; echo value; echo done",
+    )]);
+    f.spec.nodes[0].env.insert("TOKEN".into(), secret.into());
+    f.spec.mask = MaskValues(vec![secret.into()]);
+    f.spec.workspace_warnings = vec![format!("git said: {secret} is not a ref")];
+    let t = settled(&run(&f.spec).unwrap());
+    assert_eq!(t.outcome(), Outcome::Succeeded);
+    let text = f.output();
+    assert!(text.contains("token=***"), "{text}");
+    assert!(text.contains("err ***"), "{text}");
+    assert!(text.ends_with("***\ndone\n"), "{text}");
+    // Not in any file of the spool, whatever its format.
+    fn files(dir: &Path, out: &mut Vec<PathBuf>) {
+        for e in std::fs::read_dir(dir).unwrap() {
+            let p = e.unwrap().path();
+            if p.is_dir() {
+                files(&p, out);
+            } else {
+                out.push(p);
+            }
+        }
+    }
+    let mut all = Vec::new();
+    files(&f.spec.spool_dir(), &mut all);
+    assert!(!all.is_empty());
+    for p in all {
+        let bytes = std::fs::read(&p).unwrap();
+        let found = bytes.windows(secret.len()).any(|w| w == secret.as_bytes());
+        assert!(!found, "{} holds the secret", p.display());
+    }
+    // Nor in the journal or the stored result.
+    let ev = f.store.events_after(0, 1000).unwrap();
+    assert!(ev.iter().any(|e| e.kind == "workspace_warning"));
+    for e in ev {
+        assert!(!e.payload.to_string().contains(secret), "{:?}", e.kind);
+    }
+    let result = f.store.get_result(f.attempt()).unwrap().unwrap();
+    assert!(!result.to_string().contains(secret));
 }
 
 #[test]

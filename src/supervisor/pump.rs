@@ -9,11 +9,16 @@
 //! failed or reached its limit), so the command is never blocked on its
 //! output by anything but the local disk.
 //!
+//! Secret values are replaced before the bytes reach the spool
+//! ([`StreamMasker`]): a value cut by a read is still found, and what the
+//! masker holds back is stored when the command is over.
+//!
 //! Both of the command's streams arrive through the one descriptor, so they
 //! are stored as one stream, in the order they were written.
 
 use super::spool::StreamWriter;
 use crate::ids::AttemptId;
+use crate::secrets::mask::StreamMasker;
 use std::ffi::CString;
 use std::fs::{File, OpenOptions};
 use std::io::{self, ErrorKind, Read};
@@ -87,9 +92,11 @@ impl Drop for Pipe {
 /// Read `pipe` into `out` until `done` is set and the pipe is empty (or
 /// [`LAST_DRAIN`] has passed since). The first failure to store goes to
 /// `error`, where the supervisor's heartbeat finds it; reading goes on.
+/// Everything passes through `mask` on its way to `out`.
 pub(crate) fn pump(
     pipe: &Pipe,
     out: &StreamWriter,
+    mut mask: StreamMasker,
     done: &AtomicBool,
     error: &Mutex<Option<String>>,
 ) {
@@ -101,6 +108,14 @@ pub(crate) fn pump(
             .unwrap_or_else(|e| e.into_inner())
             .get_or_insert(why);
     };
+    let mut store = |bytes: Vec<u8>| {
+        if !failed {
+            if let Err(e) = out.append(&bytes) {
+                failed = true;
+                fail(e.to_string());
+            }
+        }
+    };
     let mut deadline: Option<Instant> = None;
     loop {
         // Looked at before the read: after `done`, one more read is always
@@ -111,34 +126,32 @@ pub(crate) fn pump(
         }
         match (&pipe.file).read(&mut buf) {
             Ok(n) if n > 0 => {
-                if !failed {
-                    if let Err(e) = out.append(&buf[..n]) {
-                        failed = true;
-                        fail(e.to_string());
-                    }
-                }
+                store(mask.push(&buf[..n]));
                 if deadline.is_some_and(|d| Instant::now() >= d) {
-                    return;
+                    break;
                 }
             }
             // No writer (yet, or any more), or nothing to read right now.
             Ok(_) => {
                 if finishing {
-                    return;
+                    break;
                 }
                 std::thread::sleep(IDLE);
             }
             Err(e) if e.kind() == ErrorKind::WouldBlock => {
                 if finishing {
-                    return;
+                    break;
                 }
                 std::thread::sleep(IDLE);
             }
             Err(e) if e.kind() == ErrorKind::Interrupted => {}
             Err(e) => {
                 fail(format!("reading the command's output: {e}"));
-                return;
+                break;
             }
         }
     }
+    // The end of this command's output: what was held back for a secret
+    // that might have continued.
+    store(mask.finish());
 }

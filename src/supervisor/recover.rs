@@ -130,7 +130,7 @@ pub fn recover(spec: &SuperviseSpec, store: &WorkerStore) -> Result<Report> {
     // with the attempt; a spool that cannot be resumed is a spool failure.
     let term = termination(reason, None);
     let (t, here) = match open_spool(spec, store)? {
-        Ok(spool) => settle(store, &spec.spool_root, attempt, &spool, term)?,
+        Ok(spool) => settle(store, &spec.spool_dir(), attempt, &spool, term)?,
         Err(e) => settle_without_spool(store, attempt, "open", &e.to_string(), term)?,
     };
     Ok(Report {
