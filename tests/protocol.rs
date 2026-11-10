@@ -707,7 +707,7 @@ async fn finish_flood(
     let (mut busy, mut internal) = (0, 0);
     for call in calls {
         match call.await.unwrap() {
-            Err(CallError::Remote(e)) if e.code == ErrorCode::SourceBusy => busy += 1,
+            Err(CallError::Remote(e)) if e.code == ErrorCode::Overloaded => busy += 1,
             Err(CallError::Remote(e)) if e.code == ErrorCode::Internal => internal += 1,
             other => panic!("{other:?}"),
         }

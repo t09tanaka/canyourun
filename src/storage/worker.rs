@@ -420,6 +420,23 @@ impl WorkerStore {
         })
     }
 
+    /// The attempts this worker knows, newest first, at most `limit`;
+    /// terminal ones only when `include_terminal`.
+    pub fn list_attempts(
+        &self,
+        include_terminal: bool,
+        limit: u32,
+    ) -> Result<Vec<AcceptedAttempt>> {
+        self.db.call(move |c| {
+            let mut s = c.prepare(&format!(
+                "SELECT {COLS} FROM worker_attempt WHERE (?1 OR state <> 'terminal')
+                 ORDER BY accepted_at_ms DESC, attempt_id DESC LIMIT ?2"
+            ))?;
+            let rows = s.query_map(params![include_terminal, limit], |r| Ok(from_row(r)))?;
+            rows.map(|r| r?).collect()
+        })
+    }
+
     // ------------------------------------------------------ cancel, retire
 
     /// Persist a cancel request before doing anything about it. For an
@@ -993,6 +1010,13 @@ impl WorkerStore {
     pub fn events_after(&self, after_seq: u64, limit: u32) -> Result<Vec<Event>> {
         self.db
             .call(move |c| common::events_after(c, after_seq, limit))
+    }
+
+    /// Every event of one attempt, oldest first, at most `limit`.
+    pub fn events_of_attempt(&self, attempt_id: &AttemptId, limit: u32) -> Result<Vec<Event>> {
+        let a = attempt_id.to_string();
+        self.db
+            .call(move |c| common::events_of_attempt(c, &a, limit))
     }
 
     /// The events of one attempt with one `kind`, oldest first.

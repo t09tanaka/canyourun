@@ -58,6 +58,20 @@ pub(crate) fn events_after(conn: &Connection, after_seq: u64, limit: u32) -> Res
     rows.map(|r| event_of(r?)).collect()
 }
 
+/// Every event of one attempt, oldest first (its `attempt_seq` order), at
+/// most `limit`.
+pub(crate) fn events_of_attempt(
+    conn: &Connection,
+    attempt_id: &str,
+    limit: u32,
+) -> Result<Vec<Event>> {
+    let mut s = conn.prepare(&format!(
+        "SELECT {EVENT_COLS} FROM event WHERE attempt_id = ?1 ORDER BY seq LIMIT ?2"
+    ))?;
+    let rows = s.query_map(params![attempt_id, limit], event_row)?;
+    rows.map(|r| event_of(r?)).collect()
+}
+
 const EVENT_COLS: &str = "seq, run_id, attempt_id, attempt_seq, kind, payload_json, at_ms";
 
 type EventRow = (
