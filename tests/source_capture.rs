@@ -141,9 +141,12 @@ fn dirty(dir: &Path) {
     .unwrap();
 }
 
-/// path -> (kind, executable, content or link value), without `.git`.
-fn listing(root: &Path) -> BTreeMap<String, (char, bool, Vec<u8>)> {
-    fn walk(root: &Path, rel: &Path, out: &mut BTreeMap<String, (char, bool, Vec<u8>)>) {
+/// path -> (kind, executable, content or link value)
+type Listing = BTreeMap<String, (char, bool, Vec<u8>)>;
+
+/// What is in a directory, without `.git`.
+fn listing(root: &Path) -> Listing {
+    fn walk(root: &Path, rel: &Path, out: &mut Listing) {
         for e in std::fs::read_dir(root.join(rel)).unwrap() {
             let e = e.unwrap();
             let p = rel.join(e.file_name());
@@ -190,7 +193,7 @@ fn original_state(
     )
 }
 
-fn expected_listing(dir: &Path) -> BTreeMap<String, (char, bool, Vec<u8>)> {
+fn expected_listing(dir: &Path) -> Listing {
     let mut l = listing(dir);
     // ignored files are not part of a capture
     l.remove("ignored.log");
