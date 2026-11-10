@@ -589,7 +589,11 @@ async fn non_utf8_log_bytes_round_trip_and_a_reread_is_harmless() {
     let node = NodeId::parse("build").unwrap();
     let mut cursor = LogCursor::new(0);
     let mut got = Vec::new();
-    loop {
+    // Bounded: a cursor that makes no progress must fail this test, not loop.
+    let rounds = spool.len() / 300 + 2;
+    let mut finished = false;
+    for _ in 0..rounds {
+        let before = cursor.next_offset();
         let r = read_log(
             &conn.client,
             &attempt,
@@ -603,9 +607,12 @@ async fn non_utf8_log_bytes_round_trip_and_a_reread_is_harmless() {
         .unwrap();
         got.extend_from_slice(&r.fresh);
         if r.eof {
+            finished = true;
             break;
         }
+        assert!(cursor.next_offset() > before, "the cursor made no progress");
     }
+    assert!(finished, "the log did not reach eof in {rounds} rounds");
     assert_eq!(got, spool);
     assert!(std::str::from_utf8(&got).is_err());
     // After a reconnect the reader may ask again from an older offset; the

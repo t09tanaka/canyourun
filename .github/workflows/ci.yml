@@ -78,10 +78,14 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: install cargo-schemata
-        run: command -v cargo-schemata || cargo install cargo-schemata --locked --version 0.1.0
+        run: |
+          # A cached binary of another version is replaced, not reused.
+          if ! cargo schemata --version 2>/dev/null | grep -q '0\.3\.0'; then
+            cargo install cargo-schemata --locked --version 0.3.0 --force
+          fi
       - name: every target file has mutants, zero survivors
         run: |
           if [ -z "$PURE" ]; then echo "no pure modules yet"; exit 0; fi
           scripts/mutation-targets-check.sh $PURE
           args=""; for f in $PURE; do args="$args --file $f"; done
-          cargo schemata $args
+          cargo schemata $args --jobs "$(nproc)"
