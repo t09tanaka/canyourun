@@ -214,7 +214,13 @@ pub fn run(cli: Cli) -> i32 {
 /// is read (to find the socket); the rest of the crate takes a map.
 fn run_worker_stdio() -> i32 {
     use crate::protocol::transport::{bridge, default_agent_socket, BridgeError};
-    let env = std::env::vars().collect();
+    // Only HOME is read, with `var_os`: `std::env::vars()` panics on any
+    // non-UTF-8 variable, and a bridge started under an odd environment must
+    // still work. A HOME that is not UTF-8 cannot be a worker socket path here.
+    let mut env = std::collections::BTreeMap::new();
+    if let Some(home) = std::env::var_os("HOME").and_then(|h| h.into_string().ok()) {
+        env.insert("HOME".to_string(), home);
+    }
     let Some(socket) = default_agent_socket(&env) else {
         eprintln!("error: cannot locate the worker agent socket: HOME is not set");
         return ErrorCode::InvalidInput.exit_code();
@@ -230,6 +236,10 @@ fn run_worker_stdio() -> i32 {
         }
     };
     let result = runtime.block_on(bridge(&socket, tokio::io::stdin(), tokio::io::stdout()));
+    // `tokio::io::stdin` reads on a blocking thread. When the agent closes
+    // first, that read may be parked on a stdin the peer keeps open, and a plain
+    // drop of the runtime would wait for it forever.
+    runtime.shutdown_background();
     match result {
         Ok(()) => exit::SUCCESS,
         Err(e @ BridgeError::AgentNotRunning { .. }) => {

@@ -166,18 +166,58 @@ mod tests {
         })
     }
 
+    /// A spread of frames: every body, extreme stream ids, text that needs
+    /// JSON escaping and non-ASCII.
+    fn sample_frames() -> Vec<Frame> {
+        let mut out = vec![Frame::ping(0), Frame::pong(u32::MAX)];
+        for (i, text) in [
+            "",
+            "x",
+            "quote \" and \\ and \n",
+            "日本語 \u{1F600}",
+            "\u{0}\u{1f}",
+        ]
+        .iter()
+        .enumerate()
+        {
+            let m = Message::Error(ErrorResponse {
+                schema_version: SchemaVersion::CURRENT,
+                request_id: None,
+                error: ApiError::new(ErrorCode::Internal, *text),
+            });
+            out.push(Frame::message([0, 1, u32::MAX][i % 3], m));
+        }
+        out
+    }
+
     #[test]
-    fn round_trips_every_body() {
-        for frame in [
-            Frame::message(7, error_message()),
-            Frame::ping(1),
-            Frame::pong(2),
-        ] {
+    fn what_is_encoded_decodes_to_the_same_frame_with_a_truthful_prefix() {
+        for frame in sample_frames() {
             let bytes = encode(&frame, MAX_FRAME_LEN).unwrap();
             let header: [u8; 4] = bytes[..4].try_into().unwrap();
             let len = decode_header(header, MAX_FRAME_LEN).unwrap();
-            assert_eq!(len, bytes.len() - HEADER_LEN);
+            assert_eq!(len, bytes.len() - HEADER_LEN, "prefix is the payload size");
             assert_eq!(decode_payload(&bytes[4..]).unwrap(), frame);
+            // Any strict prefix of the payload is not a frame: a cut stream is
+            // never mistaken for a shorter valid one.
+            for cut in 0..len {
+                assert!(
+                    decode_payload(&bytes[4..4 + cut]).is_err(),
+                    "{frame:?} cut {cut}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn the_size_limit_binds_encode_and_decode_at_the_same_byte() {
+        for frame in sample_frames() {
+            let len = serde_json::to_vec(&frame).unwrap().len();
+            assert!(encode(&frame, len).is_ok());
+            assert!(encode(&frame, len - 1).is_err());
+            let header = (len as u32).to_be_bytes();
+            assert_eq!(decode_header(header, len).unwrap(), len);
+            assert!(decode_header(header, len - 1).is_err());
         }
     }
 
@@ -209,27 +249,22 @@ mod tests {
     }
 
     #[test]
-    fn limit_is_inclusive_on_both_sides() {
+    fn an_oversize_error_names_both_sizes() {
         let frame = Frame::ping(1);
         let len = serde_json::to_vec(&frame).unwrap().len();
-        assert!(encode(&frame, len).is_ok());
-        assert!(matches!(
-            encode(&frame, len - 1),
-            Err(FrameError::TooLarge { len: l, max }) if l == len && max == len - 1
-        ));
-        assert!(decode_header([0, 0, 0, 5], 5).is_ok());
-        assert!(matches!(
-            decode_header([0, 0, 0, 6], 5),
-            Err(FrameError::TooLarge { len: 6, max: 5 })
-        ));
+        let e = encode(&frame, len - 1).unwrap_err();
+        assert!(matches!(e, FrameError::TooLarge { .. }));
+        let text = e.to_string();
+        assert!(text.contains(&len.to_string()), "{text}");
+        assert!(text.contains(&(len - 1).to_string()), "{text}");
     }
 
     #[test]
     fn rejects_empty_and_garbage_prefixes() {
-        assert!(matches!(
-            decode_header([0, 0, 0, 0], MAX_FRAME_LEN),
-            Err(FrameError::Empty)
-        ));
+        // The message is what the operator reads when a stream is out of step.
+        let e = decode_header([0, 0, 0, 0], MAX_FRAME_LEN).unwrap_err();
+        assert!(matches!(e, FrameError::Empty));
+        assert!(e.to_string().contains("empty"));
         // "Welc" from a login banner on stdout is a huge length, not a frame.
         assert!(matches!(
             decode_header(*b"Welc", MAX_FRAME_LEN),
@@ -255,7 +290,6 @@ mod tests {
             decode_payload(br#"{"stream":1,"kind":"nope","body":{"t":"ping"}}"#),
             Err(FrameError::Malformed(_))
         ));
-        assert!(FrameError::Empty.to_string().contains("empty"));
     }
 
     #[test]

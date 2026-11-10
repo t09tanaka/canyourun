@@ -154,3 +154,57 @@ async fn a_child_process_is_a_transport() {
     assert!(spawn_child(&[]).is_err());
     assert!(spawn_child(&["/definitely/not/here".to_string()]).is_err());
 }
+
+#[test]
+fn a_non_utf8_environment_does_not_crash_the_bridge() {
+    use std::os::unix::ffi::OsStringExt;
+    let home = short_tempdir();
+    let junk = std::ffi::OsString::from_vec(vec![b'x', 0xff, 0xfe]);
+    // Some other variable is not UTF-8: the bridge must still find its agent
+    // directory (and, with none running, fail with the explicit error, not a panic).
+    let out = assert_cmd::Command::new(BIN)
+        .args(["worker", "--stdio"])
+        .env("HOME", home.path())
+        .env("RTR_TEST_JUNK", &junk)
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(73), "{:?}", out.status);
+    assert!(out.stdout.is_empty());
+    // A HOME that is itself not UTF-8 is "no usable HOME": an input error.
+    let out = assert_cmd::Command::new(BIN)
+        .args(["worker", "--stdio"])
+        .env("HOME", &junk)
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2), "{:?}", out.status);
+    assert!(out.stdout.is_empty());
+}
+
+/// The agent hangs up while the caller's stdin stays open and silent (ssh keeps
+/// it open for as long as the session lives). The bridge must exit on its own:
+/// a blocking read on stdin must not keep the process alive.
+#[tokio::test]
+async fn the_bridge_exits_when_the_agent_closes_even_if_stdin_stays_open() {
+    let home = short_tempdir();
+    let sock = home.path().join(".remote-task-runner").join("agent.sock");
+    let listener = listen_unix(&sock).unwrap();
+    tokio::spawn(async move {
+        let (stream, _) = listener.accept().await.unwrap();
+        drop(stream);
+    });
+    let mut child = tokio::process::Command::new(BIN)
+        .args(["worker", "--stdio"])
+        .env("HOME", home.path())
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let _stdin_kept_open = child.stdin.take().unwrap();
+    let status = tokio::time::timeout(std::time::Duration::from_secs(10), child.wait())
+        .await
+        .expect("the bridge did not exit after the agent closed")
+        .unwrap();
+    assert!(status.success(), "{status:?}");
+}

@@ -59,24 +59,68 @@ pub async fn connect_unix(path: &Path) -> io::Result<Io> {
     Ok(Io::from_stream(UnixStream::connect(path).await?))
 }
 
-/// Listen on a Unix socket that only the owner can reach. A stale socket file
-/// from a dead agent is replaced; a live one is an error.
+/// Listen on a Unix socket that only the owner can reach.
+///
+/// The parent directory is the access control: it is created with mode 0700
+/// when missing, and an existing one whose mode lets group or others in is an
+/// error (it is never loosened or tightened behind the caller's back; that
+/// could be a shared directory such as `/tmp`). The socket file is then chmod
+/// 0600 right after `bind`; the process-wide umask is not touched, so between
+/// the two calls only the 0700 parent keeps others out, which is why that
+/// precondition is enforced rather than assumed.
+///
+/// A stale socket file from a dead agent is replaced; a live one is an error.
+/// Only a socket is ever removed: any other file at `path` is left alone and
+/// reported.
 pub fn listen_unix(path: &Path) -> io::Result<UnixListener> {
-    use std::os::unix::fs::PermissionsExt;
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
-        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+    use std::os::unix::fs::{DirBuilderExt, FileTypeExt, PermissionsExt};
+    if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+        match std::fs::metadata(dir) {
+            Ok(meta) => {
+                if !meta.is_dir() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "the socket's parent is not a directory",
+                    ));
+                }
+                if meta.permissions().mode() & 0o077 != 0 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        format!(
+                            "the socket's directory {} is reachable by group or others; \
+                             make it mode 0700",
+                            dir.display()
+                        ),
+                    ));
+                }
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                std::fs::DirBuilder::new()
+                    .recursive(true)
+                    .mode(0o700)
+                    .create(dir)?;
+            }
+            Err(e) => return Err(e),
+        }
     }
-    if path.exists() {
-        match std::os::unix::net::UnixStream::connect(path) {
-            Ok(_) => {
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_socket() => {
+            if std::os::unix::net::UnixStream::connect(path).is_ok() {
                 return Err(io::Error::new(
                     io::ErrorKind::AddrInUse,
                     "another agent is listening on this socket",
-                ))
+                ));
             }
-            Err(_) => std::fs::remove_file(path)?,
+            std::fs::remove_file(path)?;
         }
+        Ok(_) => {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "the socket path is taken by something that is not a socket",
+            ))
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
     }
     let listener = UnixListener::bind(path)?;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
@@ -246,7 +290,8 @@ mod tests {
     #[tokio::test]
     async fn the_bridge_relays_both_ways_and_stops_when_the_agent_closes() {
         let dir = short_tempdir();
-        let sock = dir.path().join("a.sock");
+        // The parent is made by `listen_unix` (0700); the tempdir itself may be wider.
+        let sock = dir.path().join("agent").join("a.sock");
         let listener = listen_unix(&sock).unwrap();
         let agent = tokio::spawn(async move {
             let (mut s, _) = listener.accept().await.unwrap();
@@ -296,6 +341,42 @@ mod tests {
             .mode()
             & 0o777;
         assert_eq!(dir_mode, 0o700);
+    }
+
+    #[tokio::test]
+    async fn a_loose_parent_or_a_foreign_file_is_an_error_and_nothing_is_touched() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = short_tempdir();
+        // A loose existing parent is refused, and its mode is left as it was.
+        let loose = dir.path().join("loose");
+        std::fs::create_dir(&loose).unwrap();
+        std::fs::set_permissions(&loose, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let err = listen_unix(&loose.join("a.sock")).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+        let mode = std::fs::metadata(&loose).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o755);
+        // A regular file at the socket path is never deleted.
+        let tight = dir.path().join("tight");
+        std::fs::create_dir(&tight).unwrap();
+        std::fs::set_permissions(&tight, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let file = tight.join("a.sock");
+        std::fs::write(&file, b"precious").unwrap();
+        let err = listen_unix(&file).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read(&file).unwrap(), b"precious");
+        // A parent that is a file is refused too.
+        let err = listen_unix(&file.join("b.sock")).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        // A missing parent chain is created, every level 0700.
+        let deep = dir.path().join("x").join("y").join("a.sock");
+        let _l = listen_unix(&deep).unwrap();
+        for d in [
+            deep.parent().unwrap(),
+            deep.parent().unwrap().parent().unwrap(),
+        ] {
+            let mode = std::fs::metadata(d).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o700, "{d:?}");
+        }
     }
 
     #[tokio::test]

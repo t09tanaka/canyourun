@@ -8,6 +8,10 @@ use remote_task_runner::protocol::chunk::{ChunkReceiver, LogCursor};
 use remote_task_runner::protocol::frame::{encode, Body, Frame, MAX_FRAME_LEN};
 use remote_task_runner::protocol::io::{read_frame, write_frame};
 use remote_task_runner::protocol::mux::{run_writer, Outbox, Shared};
+use remote_task_runner::protocol::mux::{
+    INBOUND_BULK_MAX_BYTES, INBOUND_BULK_MAX_REQUESTS, INBOUND_CONTROL_MAX_REQUESTS,
+    OUTBOX_CONTROL_MAX_FRAMES,
+};
 use remote_task_runner::protocol::sched::Outgoing;
 use remote_task_runner::protocol::transfer::{get_blob, put_blob, read_log, TransferError};
 use remote_task_runner::protocol::transport::duplex_pair;
@@ -209,7 +213,9 @@ async fn a_disconnect_leaves_outstanding_requests_unconfirmed() {
     };
     // The worker received the request and then died without answering.
     let inbound = incoming.next().await.unwrap();
-    drop(inbound);
+    // Dying means no answer of any kind (a dropped responder would answer
+    // INTERNAL), so the responder is leaked rather than dropped.
+    std::mem::forget(inbound);
     drop(incoming);
     let err = caller.await.unwrap().unwrap_err();
     assert!(matches!(
@@ -527,18 +533,26 @@ async fn a_blob_download_resumes_from_a_verified_prefix_and_checks_the_digest() 
             _ => None,
         }),
     );
-    let whole = get_blob(&conn.client, &digest, vec![], 700, T)
+    let whole = get_blob(&conn.client, &digest, vec![], 700, 1 << 20, Some(5000), T)
         .await
         .unwrap();
     assert_eq!(whole, *data);
-    let resumed = get_blob(&conn.client, &digest, data[..1234].to_vec(), 700, T)
-        .await
-        .unwrap();
+    let resumed = get_blob(
+        &conn.client,
+        &digest,
+        data[..1234].to_vec(),
+        700,
+        1 << 20,
+        None,
+        T,
+    )
+    .await
+    .unwrap();
     assert_eq!(resumed, *data);
     // A prefix that is not the start of this blob fails the digest check.
     let mut bad = data[..1234].to_vec();
     bad[0] ^= 1;
-    let err = get_blob(&conn.client, &digest, bad, 700, T)
+    let err = get_blob(&conn.client, &digest, bad, 700, 1 << 20, None, T)
         .await
         .unwrap_err();
     assert!(matches!(err, TransferError::Chunk(_)), "{err:?}");
@@ -622,4 +636,343 @@ async fn non_utf8_log_bytes_round_trip_and_a_reread_is_harmless() {
     .await
     .unwrap();
     assert_eq!(r2.fresh, spool[300..600]);
+}
+
+// --- overload ---------------------------------------------------------------
+
+fn blob_get_request() -> Request {
+    Request::BlobGet(BlobGetRequest {
+        schema_version: SchemaVersion::CURRENT,
+        request_id: RequestId::generate(),
+        digest: Digest::of_bytes(b"x"),
+        offset: 0,
+        max_bytes: 1,
+    })
+}
+
+fn blob_put_request(bytes: usize) -> Request {
+    Request::BlobPut(BlobPutRequest {
+        schema_version: SchemaVersion::CURRENT,
+        request_id: RequestId::generate(),
+        coordinator_epoch: CoordinatorEpoch(1),
+        source_id: SourceId::generate(),
+        digest: Digest::of_bytes(b"x"),
+        total_size: bytes as u64,
+        offset: 0,
+        data: Bytes(pseudo_random(bytes)),
+    })
+}
+
+/// Call `requests` at once on a worker that never takes anything off its queues
+/// and sort the outcomes: refused at once with the busy code, or left waiting.
+async fn flood(
+    client: &remote_task_runner::protocol::Client,
+    requests: Vec<Request>,
+) -> (usize, usize) {
+    let calls: Vec<_> = requests
+        .into_iter()
+        .map(|r| {
+            let c = client.clone();
+            tokio::spawn(async move { c.call(r, Duration::from_millis(400)).await })
+        })
+        .collect();
+    let (mut busy, mut waiting) = (0, 0);
+    for call in calls {
+        match call.await.unwrap() {
+            Err(CallError::Remote(e)) => {
+                assert_eq!(e.code, ErrorCode::SourceBusy, "{e:?}");
+                busy += 1;
+            }
+            Err(CallError::Unconfirmed(Unconfirmed::TimedOut)) => waiting += 1,
+            other => panic!("{other:?}"),
+        }
+    }
+    (busy, waiting)
+}
+
+#[tokio::test]
+async fn a_bulk_flood_is_refused_beyond_the_limit_while_heartbeats_and_the_queue_keep_working() {
+    let cluster = ClusterId::generate();
+    let (conn, srv) = pair(&cluster).await;
+    let mut incoming = srv.incoming;
+    let extra = 20;
+    let requests = (0..INBOUND_BULK_MAX_REQUESTS + extra)
+        .map(|_| blob_get_request())
+        .collect();
+    let client = conn.client.clone();
+    let flooding = tokio::spawn(async move { flood(&client, requests).await });
+    // The reader is never stopped by the flood: pings still come back.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    conn.client.ping(T).await.unwrap();
+    let (busy, waiting) = flooding.await.unwrap();
+    assert_eq!(busy, extra);
+    assert_eq!(waiting, INBOUND_BULK_MAX_REQUESTS);
+    // What was accepted is still there to be served, and serving frees room.
+    for _ in 0..INBOUND_BULK_MAX_REQUESTS {
+        incoming.next().await.unwrap();
+    }
+    let again = {
+        let c = conn.client.clone();
+        tokio::spawn(async move { c.call(blob_get_request(), T).await })
+    };
+    let inbound = incoming.next().await.unwrap();
+    let Request::BlobGet(g) = &inbound.request else {
+        panic!("not a blob_get")
+    };
+    let answer = Response::BlobGet(BlobGetResponse {
+        schema_version: SchemaVersion::CURRENT,
+        digest: g.digest.clone(),
+        offset: 0,
+        total_size: 0,
+        data: Bytes(vec![]),
+        eof: true,
+    });
+    inbound.responder.respond(answer).await.unwrap();
+    assert!(again.await.unwrap().is_ok());
+}
+
+#[tokio::test]
+async fn bulk_bytes_are_bounded_too() {
+    let cluster = ClusterId::generate();
+    let (conn, srv) = pair(&cluster).await;
+    let _incoming = srv.incoming;
+    // Few requests, each big: the byte budget, not the count, is what bites.
+    let chunk = 700_000;
+    let count = 14;
+    assert!(count < INBOUND_BULK_MAX_REQUESTS);
+    let requests: Vec<_> = (0..count).map(|_| blob_put_request(chunk)).collect();
+    let (busy, waiting) = flood(&conn.client, requests).await;
+    assert!(busy >= 1, "no request was refused");
+    assert!(waiting >= 1, "everything was refused");
+    assert_eq!(busy + waiting, count);
+    // Accepted requests fit the budget: raw bytes are less than wire bytes.
+    assert!(
+        waiting * chunk <= INBOUND_BULK_MAX_BYTES,
+        "{waiting} accepted"
+    );
+}
+
+#[tokio::test]
+async fn a_control_backlog_beyond_the_limit_closes_the_connection() {
+    let cluster = ClusterId::generate();
+    let (conn, srv) = pair(&cluster).await;
+    let _incoming = srv.incoming;
+    let calls: Vec<_> = (0..INBOUND_CONTROL_MAX_REQUESTS + 50)
+        .map(|_| {
+            let c = conn.client.clone();
+            tokio::spawn(async move { c.call(ack_request(), T).await })
+        })
+        .collect();
+    for call in calls {
+        let err = call.await.unwrap().unwrap_err();
+        assert!(
+            matches!(err, CallError::Unconfirmed(Unconfirmed::Disconnected)),
+            "{err:?}"
+        );
+    }
+    assert!(conn.client.is_closed());
+}
+
+#[tokio::test]
+async fn a_peer_that_never_reads_cannot_grow_the_control_queue_without_bound() {
+    // A writer whose peer never reads: it blocks on the first frame, so
+    // everything after piles up in the control queue.
+    let (writer_end, _peer) = tokio::io::duplex(16);
+    let shared = Shared::new(MAX_FRAME_LEN);
+    let outbox = Outbox::new();
+    tokio::spawn(run_writer(
+        writer_end,
+        Arc::clone(&outbox),
+        Arc::clone(&shared),
+    ));
+    let mut refused = None;
+    for i in 0..OUTBOX_CONTROL_MAX_FRAMES + 10 {
+        if outbox
+            .send_control(&Frame::ping(i as u32), MAX_FRAME_LEN)
+            .is_err()
+        {
+            refused = Some(i);
+            break;
+        }
+    }
+    let at = refused.expect("the queue accepted frames without limit");
+    assert!(at <= OUTBOX_CONTROL_MAX_FRAMES + 1, "{at}");
+    // The connection is cut even though the writer is stuck mid-write.
+    tokio::time::timeout(T, async {
+        while !shared.is_closed() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the connection was not closed");
+    // And nothing more is accepted.
+    assert!(outbox.send_control(&Frame::ping(0), MAX_FRAME_LEN).is_err());
+}
+
+#[tokio::test]
+async fn a_request_dropped_without_an_answer_is_answered_internal() {
+    let cluster = ClusterId::generate();
+    let (conn, srv) = pair(&cluster).await;
+    let mut incoming = srv.incoming;
+    let caller = {
+        let c = conn.client.clone();
+        tokio::spawn(async move { c.call(ack_request(), T).await })
+    };
+    let inbound = incoming.next().await.unwrap();
+    drop(inbound);
+    match caller.await.unwrap() {
+        Err(CallError::Remote(e)) => assert_eq!(e.code, ErrorCode::Internal),
+        other => panic!("{other:?}"),
+    }
+    // The connection is fine.
+    assert!(conn.client.ping(T).await.is_ok());
+}
+
+#[tokio::test]
+async fn an_answer_that_cannot_be_encoded_becomes_an_error_answer() {
+    let cluster = ClusterId::generate();
+    let (conn, srv) = pair(&cluster).await;
+    let mut incoming = srv.incoming;
+    let caller = {
+        let c = conn.client.clone();
+        tokio::spawn(async move { c.call(blob_get_request(), T).await })
+    };
+    let inbound = incoming.next().await.unwrap();
+    let huge = Response::BlobGet(BlobGetResponse {
+        schema_version: SchemaVersion::CURRENT,
+        digest: Digest::of_bytes(b"x"),
+        offset: 0,
+        total_size: 4 << 20,
+        data: Bytes(vec![0; 3 << 20]),
+        eof: true,
+    });
+    assert!(inbound.responder.respond(huge).await.is_err());
+    match caller.await.unwrap() {
+        Err(CallError::Remote(e)) => {
+            assert_eq!(e.code, ErrorCode::Internal);
+            assert!(e.message.contains("encoded"), "{e:?}");
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+// --- transfer limits --------------------------------------------------------
+
+/// A worker that answers every `blob_get` with a made-up total size.
+fn lying_size_worker(totals: Vec<u64>) -> Handler {
+    let calls = Arc::new(Mutex::new(0usize));
+    Arc::new(move |req| match req {
+        Request::BlobGet(r) => {
+            let mut n = calls.lock().unwrap();
+            let total = totals[(*n).min(totals.len() - 1)];
+            *n += 1;
+            Some(Ok(Response::BlobGet(BlobGetResponse {
+                schema_version: SchemaVersion::CURRENT,
+                digest: r.digest,
+                offset: r.offset,
+                total_size: total,
+                data: Bytes(vec![0; 10]),
+                eof: false,
+            })))
+        }
+        _ => None,
+    })
+}
+
+#[tokio::test]
+async fn a_blob_larger_than_allowed_is_refused_before_anything_is_kept() {
+    let cluster = ClusterId::generate();
+    let digest = Digest::of_bytes(b"whatever");
+    for announced in [(1u64 << 20) + 1, u64::MAX] {
+        let (conn, srv) = pair(&cluster).await;
+        serve(srv.incoming, lying_size_worker(vec![announced]));
+        let err = get_blob(&conn.client, &digest, vec![], 100, 1 << 20, None, T)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, TransferError::TooLarge { total, max } if total == announced && max == 1 << 20),
+            "{err:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_blob_whose_size_differs_from_the_expected_one_or_changes_is_refused() {
+    let cluster = ClusterId::generate();
+    let digest = Digest::of_bytes(b"whatever");
+    let (conn, srv) = pair(&cluster).await;
+    serve(srv.incoming, lying_size_worker(vec![5000]));
+    let err = get_blob(&conn.client, &digest, vec![], 100, 1 << 20, Some(4000), T)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(
+            err,
+            TransferError::SizeMismatch {
+                expected: 4000,
+                actual: 5000
+            }
+        ),
+        "{err:?}"
+    );
+    // A size that moves between rounds cannot be trusted either.
+    let (conn, srv) = pair(&cluster).await;
+    serve(srv.incoming, lying_size_worker(vec![5000, 6000]));
+    let err = get_blob(&conn.client, &digest, vec![], 100, 1 << 20, None, T)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, TransferError::Unexpected(_)), "{err:?}");
+}
+
+/// A worker whose `received` follows a script, then the honest receiver.
+fn scripted_put_worker(script: Vec<u64>, state: Arc<Mutex<Option<ChunkReceiver>>>) -> Handler {
+    let honest = blob_worker(state);
+    let step = Arc::new(Mutex::new(0usize));
+    Arc::new(move |req| {
+        let Request::BlobPut(r) = &req else {
+            return None;
+        };
+        let mut n = step.lock().unwrap();
+        let i = *n;
+        *n += 1;
+        match script.get(i) {
+            Some(&received) => Some(Ok(Response::BlobPut(BlobPutResponse {
+                schema_version: SchemaVersion::CURRENT,
+                digest: r.digest.clone(),
+                received,
+                complete: false,
+            }))),
+            None => honest(req),
+        }
+    })
+}
+
+#[tokio::test]
+async fn an_upload_that_keeps_going_backwards_stalls_but_one_restart_is_tolerated() {
+    let cluster = ClusterId::generate();
+    let data = pseudo_random(1000);
+    let source = SourceId::generate();
+    // Forward, back, forward, back, ...: every forward step resets the plain
+    // stall counter, so only counting the regressions ends this.
+    let script: Vec<u64> = (1..50).flat_map(|i| [i * 10, 0]).collect();
+    let (conn, srv) = pair(&cluster).await;
+    serve(
+        srv.incoming,
+        scripted_put_worker(script, Arc::new(Mutex::new(None))),
+    );
+    let err = put_blob(&conn.client, CoordinatorEpoch(1), &source, &data, 0, 10, T)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, TransferError::Stalled), "{err:?}");
+
+    // A single loss of progress (the worker restarted) is followed.
+    let (conn, srv) = pair(&cluster).await;
+    serve(
+        srv.incoming,
+        scripted_put_worker(vec![100, 0], Arc::new(Mutex::new(None))),
+    );
+    let done = put_blob(&conn.client, CoordinatorEpoch(1), &source, &data, 0, 100, T)
+        .await
+        .unwrap();
+    assert!(done.complete);
 }

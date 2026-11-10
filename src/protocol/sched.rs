@@ -19,6 +19,8 @@ pub struct Scheduler {
     blob: VecDeque<Outgoing>,
     /// The log queue goes before the blob queue on the next bulk pick.
     log_next: bool,
+    /// Sum of `bytes.len()` over the control queue.
+    control_bytes: usize,
 }
 
 impl Scheduler {
@@ -35,11 +37,25 @@ impl Scheduler {
     }
 
     pub fn push(&mut self, item: Outgoing) {
+        if item.kind == StreamKind::Control {
+            self.control_bytes += item.bytes.len();
+        }
         self.queue(item.kind).push_back(item);
+    }
+
+    /// Control frames waiting, and their total size. The caller bounds these: a
+    /// peer that never reads must not grow them without limit.
+    pub fn control_len(&self) -> usize {
+        self.control.len()
+    }
+
+    pub fn control_bytes(&self) -> usize {
+        self.control_bytes
     }
 
     pub fn pop(&mut self) -> Option<Outgoing> {
         if let Some(item) = self.control.pop_front() {
+            self.control_bytes -= item.bytes.len();
             return Some(item);
         }
         let order = if self.log_next {
@@ -97,6 +113,31 @@ mod tests {
         // A control frame that arrives between bulk frames goes next again.
         s.push(item(StreamKind::Control, 202));
         assert_eq!(s.pop().unwrap().bytes, vec![202]);
+    }
+
+    #[test]
+    fn control_size_is_tracked_through_push_and_pop() {
+        let mut s = Scheduler::new();
+        assert_eq!((s.control_len(), s.control_bytes()), (0, 0));
+        s.push(Outgoing {
+            kind: StreamKind::Control,
+            bytes: vec![0; 5],
+        });
+        s.push(Outgoing {
+            kind: StreamKind::Control,
+            bytes: vec![0; 7],
+        });
+        // Bulk frames are not counted: they have their own backpressure.
+        s.push(Outgoing {
+            kind: StreamKind::Blob,
+            bytes: vec![0; 100],
+        });
+        assert_eq!((s.control_len(), s.control_bytes()), (2, 12));
+        s.pop();
+        assert_eq!((s.control_len(), s.control_bytes()), (1, 7));
+        s.pop();
+        s.pop();
+        assert_eq!((s.control_len(), s.control_bytes()), (0, 0));
     }
 
     #[test]

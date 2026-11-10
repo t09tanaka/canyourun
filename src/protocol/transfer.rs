@@ -5,7 +5,7 @@
 //! helper again on a new connection with what is already held.
 
 use super::chunk::{
-    chunk_at, clamp_chunk, ChunkError, ChunkReceiver, EventCursor, LogCursor, LogError,
+    chunk_at, clamp_chunk, ChunkError, ChunkReceiver, EventCursor, EventError, LogCursor, LogError,
     MAX_CHUNK_BYTES,
 };
 use super::mux::{CallError, Client};
@@ -19,6 +19,12 @@ use thiserror::Error;
 
 /// Answers that do not advance the transfer before it is given up.
 const MAX_STALLS: u32 = 3;
+/// Times the worker may report a `received` below what it already reported over
+/// one upload before the transfer is given up. An honest worker loses progress
+/// at most when it restarts and drops a partial blob (once, maybe twice);
+/// a worker that keeps going back and forth would otherwise keep the upload
+/// running forever, each forward step resetting the stall counter.
+const MAX_REGRESSIONS: u32 = 2;
 
 #[derive(Debug, Error)]
 pub enum TransferError {
@@ -28,11 +34,19 @@ pub enum TransferError {
     Chunk(#[from] ChunkError),
     #[error(transparent)]
     Log(#[from] LogError),
+    #[error(transparent)]
+    Event(#[from] EventError),
     /// The peer keeps answering without making progress.
     #[error("transfer is not advancing")]
     Stalled,
     #[error("unexpected answer: {0}")]
     Unexpected(&'static str),
+    /// The peer announced a blob larger than the caller allows.
+    #[error("blob of {total} bytes is larger than the allowed {max}")]
+    TooLarge { total: u64, max: u64 },
+    /// The peer announced a size other than the one the caller knows.
+    #[error("blob size is {actual}, expected {expected}")]
+    SizeMismatch { expected: u64, actual: u64 },
 }
 
 /// Send `data` as blob `source_id`, starting at offset `start` (what a previous
@@ -53,6 +67,8 @@ pub async fn put_blob(
     let chunk_bytes = chunk_bytes.clamp(1, MAX_CHUNK_BYTES);
     let mut offset = start.min(total_size);
     let mut stalls = 0;
+    let mut regressions = 0;
+    let mut highest = offset;
     loop {
         let chunk = chunk_at(data, offset, chunk_bytes);
         let request = Request::BlobPut(BlobPutRequest {
@@ -73,6 +89,13 @@ pub async fn put_blob(
         if resp.complete {
             return Ok(resp);
         }
+        if resp.received < highest {
+            regressions += 1;
+            if regressions > MAX_REGRESSIONS {
+                return Err(TransferError::Stalled);
+            }
+        }
+        highest = highest.max(resp.received.min(total_size));
         if resp.received > offset {
             stalls = 0;
         } else {
@@ -88,11 +111,18 @@ pub async fn put_blob(
 /// Fetch blob `digest`. `prefix` is what an earlier, interrupted fetch already
 /// verified into place (empty for a fresh one). The result is checked against
 /// the digest before it is returned.
+///
+/// The announced `total_size` is the peer's word, and the result is held in
+/// memory: a size above `max_total` is refused before any byte is kept, and so
+/// is one that differs from `expected_size` when the caller knows it (the
+/// manifest says how big the blob is). The size must not change mid-transfer.
 pub async fn get_blob(
     client: &Client,
     digest: &Digest,
     prefix: Vec<u8>,
     max_bytes: u32,
+    max_total: u64,
+    expected_size: Option<u64>,
     timeout: Duration,
 ) -> Result<Vec<u8>, TransferError> {
     let mut buf = prefix;
@@ -117,8 +147,14 @@ pub async fn get_blob(
                 "blob_get answered for another digest",
             ));
         }
+        check_total(resp.total_size, max_total, expected_size)?;
         let rcv = match receiver.as_mut() {
-            Some(r) => r,
+            Some(r) => {
+                if r.total_size() != resp.total_size {
+                    return Err(TransferError::Unexpected("blob size changed mid-transfer"));
+                }
+                r
+            }
             None => {
                 let mut r = ChunkReceiver::new(digest.clone(), resp.total_size);
                 if !buf.is_empty() {
@@ -140,6 +176,19 @@ pub async fn get_blob(
         } else {
             stalls = 0;
         }
+    }
+}
+
+fn check_total(total: u64, max: u64, expected: Option<u64>) -> Result<(), TransferError> {
+    if total > max {
+        return Err(TransferError::TooLarge { total, max });
+    }
+    match expected {
+        Some(expected) if expected != total => Err(TransferError::SizeMismatch {
+            expected,
+            actual: total,
+        }),
+        _ => Ok(()),
     }
 }
 
@@ -213,7 +262,7 @@ pub async fn watch_events(
         ));
     };
     Ok(cursor
-        .fresh(&resp.events, resp.next_seq)
+        .fresh(&resp.events, resp.next_seq)?
         .into_iter()
         .cloned()
         .collect())

@@ -84,21 +84,38 @@ pub fn quote(arg: &str) -> String {
     format!("'{}'", arg.replace('\'', r"'\''"))
 }
 
+/// Seconds `ssh` waits for the TCP connection and the handshake. Without a
+/// bound, a host that went away leaves the connect attempt hanging for the
+/// system's TCP timeout (minutes).
+pub const SSH_CONNECT_TIMEOUT_SECS: u32 = 15;
+/// Seconds between keepalive probes on an established session, and how many
+/// unanswered probes end it. A link that dies silently (a sleeping laptop, a
+/// dropped NAT entry) is then noticed after about `interval * count` seconds
+/// and the connection reports a disconnect, instead of looking alive forever.
+pub const SSH_SERVER_ALIVE_INTERVAL_SECS: u32 = 15;
+pub const SSH_SERVER_ALIVE_COUNT_MAX: u32 = 3;
+
 /// The full `ssh` argv. `-T` because a pty would rewrite the binary stream;
 /// `BatchMode` so a missing key fails instead of prompting on a pipe;
-/// `ClearAllForwardings` so config-level forwards do not ride along.
+/// `ClearAllForwardings` so config-level forwards do not ride along;
+/// `ConnectTimeout` and `ServerAlive*` bound a dead host and a dead link (see
+/// the constants).
 pub fn ssh_argv(target: &SshTarget, command: &RemoteCommand) -> Vec<String> {
-    vec![
-        "ssh".to_string(),
-        "-T".to_string(),
-        "-o".to_string(),
+    let mut argv = vec!["ssh".to_string(), "-T".to_string()];
+    for option in [
         "BatchMode=yes".to_string(),
-        "-o".to_string(),
         "ClearAllForwardings=yes".to_string(),
-        "--".to_string(),
-        target.as_str().to_string(),
-        command.shell_string(),
-    ]
+        format!("ConnectTimeout={SSH_CONNECT_TIMEOUT_SECS}"),
+        format!("ServerAliveInterval={SSH_SERVER_ALIVE_INTERVAL_SECS}"),
+        format!("ServerAliveCountMax={SSH_SERVER_ALIVE_COUNT_MAX}"),
+    ] {
+        argv.push("-o".to_string());
+        argv.push(option);
+    }
+    argv.push("--".to_string());
+    argv.push(target.as_str().to_string());
+    argv.push(command.shell_string());
+    argv
 }
 
 #[cfg(test)]
@@ -199,6 +216,12 @@ mod tests {
                 "BatchMode=yes",
                 "-o",
                 "ClearAllForwardings=yes",
+                "-o",
+                "ConnectTimeout=15",
+                "-o",
+                "ServerAliveInterval=15",
+                "-o",
+                "ServerAliveCountMax=3",
                 "--",
                 "user@host",
                 "'/usr/local/bin/remote-task-runner' 'worker' '--stdio'",
@@ -206,7 +229,7 @@ mod tests {
         );
         // Everything before `--` is fixed, whatever the destination.
         let other = ssh_argv(&SshTarget::parse("other").unwrap(), &c);
-        assert_eq!(argv[..7], other[..7]);
+        assert_eq!(argv[..13], other[..13]);
         assert_eq!(argv.iter().filter(|a| a.contains("user@host")).count(), 1);
     }
 }

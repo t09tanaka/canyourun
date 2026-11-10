@@ -4,9 +4,10 @@
 //! and when a transfer is complete, so the same rules serve a spool file, a blob
 //! store or a test buffer.
 
-use crate::ids::Digest;
+use crate::ids::{AttemptId, Digest};
 use crate::wire::AttemptEvent;
 use sha2::{Digest as _, Sha256};
+use std::collections::HashMap;
 use thiserror::Error;
 
 /// Largest payload of one chunk (256 KiB). One frame is the unit a heartbeat can
@@ -78,6 +79,11 @@ impl ChunkReceiver {
             received: 0,
             hasher: Sha256::new(),
         }
+    }
+
+    /// The announced size of the whole blob.
+    pub fn total_size(&self) -> u64 {
+        self.total
     }
 
     pub fn received(&self) -> u64 {
@@ -193,37 +199,97 @@ impl LogCursor {
     }
 }
 
-/// Where a reader of the event stream stands (`watch_events`, by `seq`).
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum EventError {
+    /// An event skips a `seq` of its attempt: events were lost.
+    #[error("event stream has a gap: expected seq {expected}, got {got}")]
+    Gap { expected: u64, got: u64 },
+    /// Within one answer an attempt's `seq` went down.
+    #[error("event seq went backwards inside one answer: {after} after {before}")]
+    Descending { before: u64, after: u64 },
+}
+
+/// Where a reader of the event stream stands (`watch_events`).
+///
+/// `seq` is a per-attempt sequence that starts at 1 and has no holes; the
+/// identity of an event is `(attempt_id, seq)`. A repeated or older event is
+/// dropped, a missing one is an error (like a gap in a log), and so is a `seq`
+/// that goes down inside one answer. Use one cursor per attempt when watching
+/// one attempt; a cursor over all attempts starts at 0 so every attempt's
+/// first event (seq 1) is expected.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct EventCursor {
-    after_seq: u64,
+    /// Where unseen attempts start: their first event is `origin + 1`.
+    origin: u64,
+    /// Raised by `next_seq` (filtered events), never past what was seen.
+    floor: u64,
+    last: HashMap<AttemptId, u64>,
 }
 
 impl EventCursor {
     pub fn new(after_seq: u64) -> Self {
-        EventCursor { after_seq }
+        EventCursor {
+            origin: after_seq,
+            floor: after_seq,
+            last: HashMap::new(),
+        }
     }
 
-    /// The `after_seq` to ask for next.
+    /// The `after_seq` to ask for next: the lowest position any known attempt
+    /// stands at, so no attempt's events are skipped (repeats are dropped).
     pub fn after_seq(&self) -> u64 {
-        self.after_seq
+        self.last
+            .values()
+            .copied()
+            .min()
+            .map_or(self.floor, |m| m.max(self.floor))
     }
 
-    /// Events not seen before, in order. A repeated or older event is dropped.
+    /// Events not seen before, in order. Nothing is applied when the answer is
+    /// inconsistent. `next_seq` is where the worker says the next ask can start;
+    /// it is believed only up to the lowest position of the attempts seen, so a wrong or hostile
+    /// value cannot make the reader skip events it has not been given. (An
+    /// empty answer therefore does not move the cursor.)
     pub fn fresh<'a>(
         &mut self,
         events: &'a [AttemptEvent],
         next_seq: u64,
-    ) -> Vec<&'a AttemptEvent> {
+    ) -> Result<Vec<&'a AttemptEvent>, EventError> {
+        let mut last = self.last.clone();
+        let mut in_answer: HashMap<&AttemptId, u64> = HashMap::new();
         let mut out = Vec::new();
         for e in events {
-            if e.seq > self.after_seq {
-                self.after_seq = e.seq;
-                out.push(e);
+            if let Some(&before) = in_answer.get(&e.attempt_id) {
+                if e.seq < before {
+                    return Err(EventError::Descending {
+                        before,
+                        after: e.seq,
+                    });
+                }
             }
+            in_answer.insert(&e.attempt_id, e.seq);
+            let seen = last.get(&e.attempt_id).copied().unwrap_or(self.origin);
+            if e.seq <= seen {
+                continue;
+            }
+            // `seen + 1` overflows only when `seen` is u64::MAX, which `e.seq <=
+            // seen` already excluded.
+            let expected = seen + 1;
+            if e.seq != expected {
+                return Err(EventError::Gap {
+                    expected,
+                    got: e.seq,
+                });
+            }
+            last.insert(e.attempt_id.clone(), e.seq);
+            out.push(e);
         }
-        self.after_seq = self.after_seq.max(next_seq);
-        out
+        // Believed up to the lowest attempt position: with several attempts, a
+        // larger value would skip the ones that are behind.
+        let lowest = last.values().copied().min().unwrap_or(self.floor);
+        self.floor = self.floor.max(next_seq.min(lowest));
+        self.last = last;
+        Ok(out)
     }
 }
 
@@ -259,6 +325,7 @@ mod tests {
     fn in_order_chunks_complete_only_at_the_end() {
         let data = blob(10);
         let mut r = receiver(&data);
+        assert_eq!(r.total_size(), 10);
         let a = r.accept(0, &data[..4]).unwrap();
         assert_eq!((a.received, a.fresh, a.complete), (4, &data[..4], false));
         let a = r.accept(4, &data[4..9]).unwrap();
@@ -424,10 +491,10 @@ mod tests {
         .contains("expected"));
     }
 
-    fn event(seq: u64) -> AttemptEvent {
+    fn event_of(attempt: &AttemptId, seq: u64) -> AttemptEvent {
         AttemptEvent {
             seq,
-            attempt_id: AttemptId::generate(),
+            attempt_id: attempt.clone(),
             kind: EventKind::StateChanged,
             state: None,
             receipt: None,
@@ -436,23 +503,127 @@ mod tests {
         }
     }
 
+    fn seqs(v: Vec<&AttemptEvent>) -> Vec<u64> {
+        v.iter().map(|e| e.seq).collect()
+    }
+
     #[test]
-    fn event_cursor_drops_repeats_and_follows_next_seq() {
+    fn event_cursor_drops_repeats_and_follows_the_stream() {
+        let a = AttemptId::generate();
         let mut c = EventCursor::new(0);
-        let first = [event(1), event(2), event(3)];
-        assert_eq!(c.fresh(&first, 3).len(), 3);
+        let first = [event_of(&a, 1), event_of(&a, 2), event_of(&a, 3)];
+        assert_eq!(seqs(c.fresh(&first, 3).unwrap()), vec![1, 2, 3]);
         assert_eq!(c.after_seq(), 3);
         // The same page again, and an older one: nothing new.
-        assert!(c.fresh(&first, 3).is_empty());
-        let mixed = [event(2), event(4), event(4), event(5)];
-        let got: Vec<u64> = c.fresh(&mixed, 5).iter().map(|e| e.seq).collect();
-        assert_eq!(got, vec![4, 5]);
-        // An empty page may still advance the cursor (filtered events).
-        assert!(c.fresh(&[], 9).is_empty());
-        assert_eq!(c.after_seq(), 9);
-        // next_seq never moves it back.
-        assert!(c.fresh(&[], 2).is_empty());
-        assert_eq!(c.after_seq(), 9);
+        assert!(c.fresh(&first, 3).unwrap().is_empty());
+        let mixed = [
+            event_of(&a, 2),
+            event_of(&a, 4),
+            event_of(&a, 4),
+            event_of(&a, 5),
+        ];
+        assert_eq!(seqs(c.fresh(&mixed, 5).unwrap()), vec![4, 5]);
+        assert_eq!(c.after_seq(), 5);
         assert_eq!(EventCursor::default().after_seq(), 0);
+    }
+
+    #[test]
+    fn a_missing_seq_is_an_error_and_nothing_is_applied() {
+        let a = AttemptId::generate();
+        let mut c = EventCursor::new(0);
+        c.fresh(&[event_of(&a, 1)], 1).unwrap();
+        let before = c.clone();
+        assert_eq!(
+            c.fresh(&[event_of(&a, 2), event_of(&a, 4)], 4),
+            Err(EventError::Gap {
+                expected: 3,
+                got: 4
+            })
+        );
+        // The good first event of the bad answer was not kept either.
+        assert_eq!(c, before);
+        // A first event that is not 1 is a gap too (events 1 and 2 are missing).
+        let mut fresh = EventCursor::new(0);
+        assert!(matches!(
+            fresh.fresh(&[event_of(&a, 3)], 3),
+            Err(EventError::Gap {
+                expected: 1,
+                got: 3
+            })
+        ));
+        assert!(EventError::Gap {
+            expected: 1,
+            got: 2
+        }
+        .to_string()
+        .contains("expected"));
+    }
+
+    #[test]
+    fn a_descending_answer_is_an_error() {
+        let a = AttemptId::generate();
+        let mut c = EventCursor::new(0);
+        let err = c
+            .fresh(&[event_of(&a, 1), event_of(&a, 2), event_of(&a, 1)], 2)
+            .unwrap_err();
+        assert_eq!(
+            err,
+            EventError::Descending {
+                before: 2,
+                after: 1
+            }
+        );
+        assert!(err.to_string().contains("backwards"));
+        assert_eq!(c.after_seq(), 0);
+    }
+
+    #[test]
+    fn seq_is_per_attempt_and_the_key_is_attempt_and_seq() {
+        let (a, b) = (AttemptId::generate(), AttemptId::generate());
+        let mut c = EventCursor::new(0);
+        let page = [event_of(&a, 1), event_of(&b, 1), event_of(&a, 2)];
+        assert_eq!(seqs(c.fresh(&page, 2).unwrap()), vec![1, 1, 2]);
+        // The lowest position is what is asked for, so b is not skipped.
+        assert_eq!(c.after_seq(), 1);
+        // Same seq, other attempt: new. Same pair again: a repeat.
+        assert_eq!(
+            seqs(c.fresh(&[event_of(&a, 2), event_of(&b, 2)], 2).unwrap()),
+            vec![2]
+        );
+    }
+
+    #[test]
+    fn next_seq_never_runs_past_what_was_seen_and_never_goes_back() {
+        let a = AttemptId::generate();
+        let mut c = EventCursor::new(0);
+        // With nothing seen, next_seq cannot move the cursor.
+        assert!(c.fresh(&[], u64::MAX).unwrap().is_empty());
+        assert_eq!(c.after_seq(), 0);
+        // Beyond the last event it is capped at that event.
+        c.fresh(&[event_of(&a, 1), event_of(&a, 2)], u64::MAX)
+            .unwrap();
+        assert_eq!(c.after_seq(), 2);
+        // Below it, it does not pull the cursor back.
+        assert!(c.fresh(&[], 1).unwrap().is_empty());
+        assert_eq!(c.after_seq(), 2);
+    }
+
+    #[test]
+    fn the_largest_seq_is_handled_without_overflow() {
+        let a = AttemptId::generate();
+        let mut c = EventCursor::new(u64::MAX - 1);
+        assert_eq!(
+            seqs(c.fresh(&[event_of(&a, u64::MAX)], u64::MAX).unwrap()),
+            vec![u64::MAX]
+        );
+        assert_eq!(c.after_seq(), u64::MAX);
+        // Nothing can come after it; repeats are dropped, no overflow.
+        assert!(c
+            .fresh(&[event_of(&a, u64::MAX)], u64::MAX)
+            .unwrap()
+            .is_empty());
+        let mut at_max = EventCursor::new(u64::MAX);
+        assert!(at_max.fresh(&[], u64::MAX).unwrap().is_empty());
+        assert_eq!(at_max.after_seq(), u64::MAX);
     }
 }
