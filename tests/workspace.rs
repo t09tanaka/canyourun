@@ -75,8 +75,14 @@ struct GitFw {
     env: BTreeMap<String, String>,
 }
 
+/// `git worktree add` and `remove` race with each other in one repository
+/// (Git lists `.git/worktrees` while another call deletes an entry); the real
+/// tool unregisters only its own entry, so the stand-in is serialized.
+static GIT_WORKTREE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 impl FastWorktree for GitFw {
     fn add(&self, repo: &Path, dest: &Path, branch: &str, start: &str) -> Result<(), FwFailure> {
+        let _g = GIT_WORKTREE.lock().unwrap_or_else(|e| e.into_inner());
         let out = Command::new("git")
             .args(["worktree", "add", "-q", "-b", branch])
             .arg(dest)
@@ -97,6 +103,7 @@ impl FastWorktree for GitFw {
     }
 
     fn remove(&self, repo: &Path, path: &Path) -> Result<(), FwFailure> {
+        let _g = GIT_WORKTREE.lock().unwrap_or_else(|e| e.into_inner());
         let st = Command::new("git")
             .args(["status", "--porcelain", "--untracked-files=all"])
             .current_dir(path)
