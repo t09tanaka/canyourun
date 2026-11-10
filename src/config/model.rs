@@ -24,6 +24,8 @@ pub struct UserConfig {
 #[serde(deny_unknown_fields)]
 pub struct Coordinator {
     pub local_worker: Option<bool>,
+    /// Priority of the parent's local worker (bigger is preferred).
+    pub local_worker_priority: Option<i64>,
     pub heartbeat_seconds: Option<u64>,
     pub stale_seconds: Option<u64>,
     pub lease_seconds: Option<u64>,
@@ -39,6 +41,7 @@ pub struct Scheduler {
     pub strategy: Option<Strategy>,
     pub forecast_ttl_ms: Option<u64>,
     pub prefetch_per_worker: Option<u32>,
+    pub priority_step_seconds: Option<u64>,
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Deserialize)]
@@ -57,6 +60,8 @@ pub struct Worker {
     #[serde(default)]
     pub labels: Vec<String>,
     pub ephemeral: Option<bool>,
+    /// Placement preference, bigger is preferred. Range-checked in resolve.
+    pub priority: Option<i64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]

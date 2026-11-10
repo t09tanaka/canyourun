@@ -26,6 +26,11 @@ pub const DEFAULT_PREFETCH_PER_WORKER: u32 = 1;
 pub const DEFAULT_MAX_ACTIVE_HOMEWORK: u32 = 2;
 pub const DEFAULT_LOG_SPOOL_LIMIT_BYTES: u64 = 1 << 30;
 pub const DEFAULT_RETENTION_DAYS: u32 = 7;
+pub const DEFAULT_PRIORITY: i64 = 0;
+pub const MIN_PRIORITY: i64 = -100;
+pub const MAX_PRIORITY: i64 = 100;
+pub const DEFAULT_PRIORITY_STEP_SECONDS: u64 = 60;
+pub const MAX_PRIORITY_STEP_SECONDS: u64 = 3600;
 pub const DEFAULT_WORKFLOWS_DIR: &str = ".github/workflows";
 pub const DEFAULT_STATUS_CONTEXT: &str = "local-ci";
 
@@ -95,6 +100,8 @@ pub struct WorkerSpec {
     pub service_mode: Option<ServiceMode>,
     pub labels: Vec<String>,
     pub ephemeral: bool,
+    /// `-100..=100`, bigger is preferred. Validated by `resolve`.
+    pub priority: Value<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -108,6 +115,7 @@ pub struct OutputSpec {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResolvedConfig {
     pub local_worker: Value<bool>,
+    pub local_worker_priority: Value<i64>,
     pub heartbeat_seconds: Value<u64>,
     pub stale_seconds: Value<u64>,
     pub lease_seconds: Value<u64>,
@@ -118,6 +126,7 @@ pub struct ResolvedConfig {
     pub strategy: Value<Strategy>,
     pub forecast_ttl_ms: Value<u64>,
     pub prefetch_per_worker: Value<u32>,
+    pub priority_step_seconds: Value<u64>,
     pub workers: Vec<WorkerSpec>,
     pub source_mode: Value<SourceMode>,
     pub include: Value<Vec<String>>,
@@ -176,6 +185,11 @@ impl ResolvedConfig {
                 v.to_string()
             }),
             e(
+                "coordinator.local_worker_priority",
+                &self.local_worker_priority,
+                |v| v.to_string(),
+            ),
+            e(
                 "coordinator.heartbeat_seconds",
                 &self.heartbeat_seconds,
                 |v| v.to_string(),
@@ -213,6 +227,11 @@ impl ResolvedConfig {
             e(
                 "scheduler.prefetch_per_worker",
                 &self.prefetch_per_worker,
+                |v| v.to_string(),
+            ),
+            e(
+                "scheduler.priority_step_seconds",
+                &self.priority_step_seconds,
                 |v| v.to_string(),
             ),
             e("source.mode", &self.source_mode, |v| {
@@ -439,6 +458,19 @@ fn check_timing(r: &ResolvedConfig, problems: &mut Vec<String>) {
         u64::from(r.retention_days.value),
         &r.retention_days.origin,
     );
+    check_priority(
+        problems,
+        "local_worker_priority",
+        r.local_worker_priority.value,
+        &r.local_worker_priority.origin,
+    );
+    let step = &r.priority_step_seconds;
+    if step.value > MAX_PRIORITY_STEP_SECONDS {
+        problems.push(format!(
+            "{} must be at most {MAX_PRIORITY_STEP_SECONDS}",
+            describe("priority_step_seconds", step)
+        ));
+    }
     if let Some(t) = r.timeout_seconds.value {
         check_nonzero(problems, "timeout_seconds", t, &r.timeout_seconds.origin);
     }
@@ -465,7 +497,19 @@ fn check_timing(r: &ResolvedConfig, problems: &mut Vec<String>) {
     }
 }
 
-fn check_workers(user: &UserConfig, problems: &mut Vec<String>) -> Vec<WorkerSpec> {
+fn check_priority(problems: &mut Vec<String>, name: &str, v: i64, origin: &Origin) {
+    if !(MIN_PRIORITY..=MAX_PRIORITY).contains(&v) {
+        problems.push(format!(
+            "{name} = {v} ({origin}) must be between {MIN_PRIORITY} and {MAX_PRIORITY}"
+        ));
+    }
+}
+
+fn check_workers(
+    user: &UserConfig,
+    layers: &Layers,
+    problems: &mut Vec<String>,
+) -> Vec<WorkerSpec> {
     let mut seen = BTreeSet::new();
     let mut out = Vec::new();
     for w in &user.workers {
@@ -495,6 +539,13 @@ fn check_workers(user: &UserConfig, problems: &mut Vec<String>) -> Vec<WorkerSpe
                 w.id
             ));
         }
+        let priority = pick(layers, None, None, None, w.priority, DEFAULT_PRIORITY);
+        check_priority(
+            problems,
+            &format!("worker {:?}: priority", w.id),
+            priority.value,
+            &priority.origin,
+        );
         out.push(WorkerSpec {
             id: w.id.clone(),
             ssh: w.ssh.clone(),
@@ -505,6 +556,7 @@ fn check_workers(user: &UserConfig, problems: &mut Vec<String>) -> Vec<WorkerSpe
             },
             labels: w.labels.clone(),
             ephemeral,
+            priority,
         });
     }
     out
@@ -667,6 +719,14 @@ pub fn resolve(inp: &Inputs<'_>) -> Result<ResolvedConfig, ConfigError> {
     let some = |v: Option<String>| v.map(Some);
     let r = ResolvedConfig {
         local_worker: pick(&layers, None, None, None, coord.local_worker, true),
+        local_worker_priority: pick(
+            &layers,
+            None,
+            None,
+            None,
+            coord.local_worker_priority,
+            DEFAULT_PRIORITY,
+        ),
         heartbeat_seconds: pick(
             &layers,
             o.heartbeat_seconds,
@@ -747,7 +807,15 @@ pub fn resolve(inp: &Inputs<'_>) -> Result<ResolvedConfig, ConfigError> {
             sched.prefetch_per_worker,
             DEFAULT_PREFETCH_PER_WORKER,
         ),
-        workers: check_workers(user, &mut problems),
+        priority_step_seconds: pick(
+            &layers,
+            None,
+            None,
+            None,
+            sched.priority_step_seconds,
+            DEFAULT_PRIORITY_STEP_SECONDS,
+        ),
+        workers: check_workers(user, &layers, &mut problems),
         source_mode: pick(
             &layers,
             o.source_mode,
