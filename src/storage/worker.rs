@@ -851,8 +851,9 @@ impl WorkerStore {
     /// Store the result of a terminal attempt, once. It is kept as canonical
     /// JSON (the wire form: sorted keys, integers only), and a second call is
     /// the same result when the canonical forms are equal, whatever the key
-    /// order or spacing it was built with.
-    pub fn record_result(&self, attempt_id: &AttemptId, result: &Value) -> Result<()> {
+    /// order or spacing it was built with. Returns whether this call stored it
+    /// (`false` for the replay of an equal result).
+    pub fn record_result(&self, attempt_id: &AttemptId, result: &Value) -> Result<bool> {
         let text = canonical_json(result)
             .map_err(|e| StorageError::Invalid(format!("result is not canonical JSON: {e}")))?;
         let a = attempt_id.to_string();
@@ -876,14 +877,14 @@ impl WorkerStore {
                         "UPDATE worker_attempt SET result_json = ?1 WHERE attempt_id = ?2",
                         params![text, a],
                     )?;
-                    Ok(())
+                    Ok(true)
                 }
                 Some(e) => {
                     let stored: Value = from_json("result", &e)?;
                     let stored = canonical_json(&stored)
                         .map_err(|e| StorageError::Corrupt(format!("result: {e}")))?;
                     if stored == text {
-                        Ok(())
+                        Ok(false)
                     } else {
                         Err(StorageError::Immutable(format!("result of {a}")))
                     }
@@ -966,6 +967,37 @@ impl WorkerStore {
     pub fn events_after(&self, after_seq: u64, limit: u32) -> Result<Vec<Event>> {
         self.db
             .call(move |c| common::events_after(c, after_seq, limit))
+    }
+
+    /// The events of one attempt with one `kind`, oldest first.
+    pub fn events_of(&self, attempt_id: &AttemptId, kind: &str) -> Result<Vec<Event>> {
+        let (a, k) = (attempt_id.to_string(), kind.to_string());
+        self.db.call(move |c| common::events_of(c, &a, &k))
+    }
+
+    /// For each `(key, payload)` of `wanted`, append an event of `kind` to the
+    /// attempt unless it already has one of that kind whose `payload[key_field]`
+    /// is `key`; the check and the appends are one transaction, so concurrent
+    /// callers cannot both append. Returns how many were appended.
+    pub fn append_events_unseen(
+        &self,
+        run_id: Option<&RunId>,
+        attempt_id: &AttemptId,
+        kind: &str,
+        key_field: &str,
+        wanted: &[(String, Value)],
+        at_ms: u64,
+    ) -> Result<u32> {
+        let r = run_id.map(ToString::to_string);
+        let (a, k, f) = (
+            attempt_id.to_string(),
+            kind.to_string(),
+            key_field.to_string(),
+        );
+        let wanted = wanted.to_vec();
+        self.db.write(move |tx| {
+            common::append_events_unseen(tx, r.as_deref(), &a, &k, &f, &wanted, at_ms)
+        })
     }
 
     // ------------------------------------------------------- references, GC

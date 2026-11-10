@@ -161,7 +161,9 @@ pub fn check_entries<'a>(
     Ok(())
 }
 
-fn fold_path(p: &[u8]) -> Vec<u8> {
+/// [`fold_component`] of every component of `p`: the key a path is compared
+/// by on a file system that folds names.
+pub fn fold_path(p: &[u8]) -> Vec<u8> {
     let mut out: Vec<u8> = vec![];
     for (i, c) in p.split(|b| *b == b'/').enumerate() {
         if i > 0 {

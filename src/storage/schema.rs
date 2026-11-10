@@ -12,11 +12,17 @@ CREATE TABLE event (
     seq          INTEGER PRIMARY KEY AUTOINCREMENT,
     run_id       TEXT,
     attempt_id   TEXT,
+    -- 1, 2, 3, ... per attempt with no holes (NULL for an event of no
+    -- attempt): the sequence a watcher of one attempt follows. Numbered by
+    -- the INSERT itself, in the writer's transaction.
+    attempt_seq  INTEGER CHECK ((attempt_id IS NULL) = (attempt_seq IS NULL)),
     kind         TEXT NOT NULL,
     payload_json TEXT NOT NULL,
     at_ms        INTEGER NOT NULL
 );
 CREATE INDEX event_attempt ON event(attempt_id, seq);
+CREATE UNIQUE INDEX event_attempt_seq ON event(attempt_id, attempt_seq)
+    WHERE attempt_id IS NOT NULL;
 CREATE TRIGGER event_no_update BEFORE UPDATE ON event
 BEGIN SELECT RAISE(ABORT, 'event journal is append-only'); END;
 CREATE TRIGGER event_no_delete BEFORE DELETE ON event

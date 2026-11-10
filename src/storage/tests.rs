@@ -326,6 +326,99 @@ fn the_event_journal_is_append_only_with_increasing_sequence() {
 }
 
 #[test]
+fn events_are_numbered_per_attempt_without_holes() {
+    let f = fx();
+    let (a, b) = (AttemptId::generate(), AttemptId::generate());
+    let add = |att: Option<&AttemptId>, k: &str| {
+        f.store
+            .append_event(Some(&f.run), att, k, &json!({"k": k}), 1)
+            .unwrap()
+    };
+    add(Some(&a), "x");
+    add(None, "none");
+    add(Some(&b), "x");
+    add(Some(&a), "y");
+    add(Some(&a), "x");
+    add(Some(&b), "y");
+    let all = f.store.events_after(0, 1000).unwrap();
+    let of = |att: &AttemptId| -> Vec<u64> {
+        all.iter()
+            .filter(|e| e.attempt_id.as_deref() == Some(att.as_str()))
+            .map(|e| e.attempt_seq.unwrap())
+            .collect()
+    };
+    assert_eq!(of(&a), [1, 2, 3]);
+    assert_eq!(of(&b), [1, 2]);
+    let none: Vec<_> = all.iter().filter(|e| e.attempt_id.is_none()).collect();
+    assert!(none.iter().all(|e| e.attempt_seq.is_none()));
+    // By attempt and kind, oldest first.
+    let xs = f.store.events_of(&a, "x").unwrap();
+    assert_eq!(
+        xs.iter()
+            .map(|e| e.attempt_seq.unwrap())
+            .collect::<Vec<_>>(),
+        [1, 3]
+    );
+    assert!(f.store.events_of(&a, "nope").unwrap().is_empty());
+    // The pair is unique, and an event has an attempt_seq exactly when it has an attempt.
+    let dup = f.store.db.call(|c| {
+        Ok(c.execute(
+            "INSERT INTO event (run_id, attempt_id, attempt_seq, kind, payload_json, at_ms)
+             SELECT run_id, attempt_id, attempt_seq, kind, payload_json, at_ms FROM event
+             WHERE attempt_seq = 1 AND attempt_id IS NOT NULL LIMIT 1",
+            [],
+        )?)
+    });
+    assert!(dup.is_err());
+    let lone = f.store.db.call(|c| {
+        Ok(c.execute(
+            "INSERT INTO event (attempt_id, attempt_seq, kind, payload_json, at_ms)
+             VALUES (NULL, 5, 'k', '1', 1)",
+            [],
+        )?)
+    });
+    assert!(lone.is_err());
+}
+
+#[test]
+fn unseen_events_are_appended_once_per_key() {
+    let f = fx();
+    let a = AttemptId::generate();
+    let want = |keys: &[&str]| -> Vec<(String, serde_json::Value)> {
+        keys.iter()
+            .map(|k| (k.to_string(), json!({"stream": k})))
+            .collect()
+    };
+    let go = |keys: &[&str]| {
+        f.store
+            .append_events_unseen(Some(&f.run), &a, "t", "stream", &want(keys), 5)
+            .unwrap()
+    };
+    assert_eq!(go(&["o", "e"]), 2);
+    assert_eq!(go(&["o", "e"]), 0);
+    assert_eq!(go(&["e", "z"]), 1);
+    let ev = f.store.events_of(&a, "t").unwrap();
+    assert_eq!(ev.len(), 3);
+    assert_eq!(
+        ev.iter()
+            .map(|e| e.attempt_seq.unwrap())
+            .collect::<Vec<_>>(),
+        [1, 2, 3]
+    );
+    assert!(ev
+        .iter()
+        .all(|e| e.run_id.as_deref() == Some(f.run.as_str())));
+    // Other kinds and other attempts do not count as seen.
+    let b = AttemptId::generate();
+    assert_eq!(
+        f.store
+            .append_events_unseen(None, &b, "t", "stream", &want(&["o"]), 6)
+            .unwrap(),
+        1
+    );
+}
+
+#[test]
 fn matrix_permits_hold_until_terminal_or_confirmed_retire() {
     let f = fx();
     f.store.create_matrix_group("g", &f.run, 2, 1).unwrap();

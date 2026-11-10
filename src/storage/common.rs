@@ -16,6 +16,9 @@ pub struct Event {
     pub seq: u64,
     pub run_id: Option<String>,
     pub attempt_id: Option<String>,
+    /// Position among the events of `attempt_id`: 1, 2, 3, ... with no holes
+    /// (`None` when the event belongs to no attempt).
+    pub attempt_seq: Option<u64>,
     pub kind: String,
     pub payload: Value,
     pub at_ms: u64,
@@ -30,7 +33,12 @@ pub(crate) fn append_event(
     at_ms: u64,
 ) -> Result<u64> {
     conn.execute(
-        "INSERT INTO event (run_id, attempt_id, kind, payload_json, at_ms) VALUES (?1,?2,?3,?4,?5)",
+        "INSERT INTO event (run_id, attempt_id, attempt_seq, kind, payload_json, at_ms)
+         VALUES (?1, ?2,
+            CASE WHEN ?2 IS NULL THEN NULL
+                 ELSE (SELECT COALESCE(MAX(attempt_seq), 0) + 1 FROM event WHERE attempt_id = ?2)
+            END,
+            ?3, ?4, ?5)",
         params![
             run_id,
             attempt_id,
@@ -43,34 +51,85 @@ pub(crate) fn append_event(
 }
 
 pub(crate) fn events_after(conn: &Connection, after_seq: u64, limit: u32) -> Result<Vec<Event>> {
-    let mut s = conn.prepare(
-        "SELECT seq, run_id, attempt_id, kind, payload_json, at_ms FROM event
-         WHERE seq > ?1 ORDER BY seq LIMIT ?2",
-    )?;
-    let rows = s.query_map(params![to_i64(after_seq)?, limit], |r| {
-        Ok((
-            r.get::<_, i64>(0)?,
-            r.get(1)?,
-            r.get(2)?,
-            r.get(3)?,
-            r.get::<_, String>(4)?,
-            r.get::<_, i64>(5)?,
-        ))
-    })?;
-    let mut out = Vec::new();
-    for row in rows {
-        let (seq, run_id, attempt_id, kind, payload, at) = row?;
-        out.push(Event {
-            seq: to_u64(seq)?,
-            run_id,
-            attempt_id,
-            kind,
-            payload: serde_json::from_str(&payload)
-                .map_err(|e| StorageError::Corrupt(format!("event payload: {e}")))?,
-            at_ms: to_u64(at)?,
-        });
+    let mut s = conn.prepare(&format!(
+        "SELECT {EVENT_COLS} FROM event WHERE seq > ?1 ORDER BY seq LIMIT ?2"
+    ))?;
+    let rows = s.query_map(params![to_i64(after_seq)?, limit], event_row)?;
+    rows.map(|r| event_of(r?)).collect()
+}
+
+const EVENT_COLS: &str = "seq, run_id, attempt_id, attempt_seq, kind, payload_json, at_ms";
+
+type EventRow = (
+    i64,
+    Option<String>,
+    Option<String>,
+    Option<i64>,
+    String,
+    String,
+    i64,
+);
+
+fn event_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<EventRow> {
+    Ok((
+        r.get(0)?,
+        r.get(1)?,
+        r.get(2)?,
+        r.get(3)?,
+        r.get(4)?,
+        r.get(5)?,
+        r.get(6)?,
+    ))
+}
+
+fn event_of(row: EventRow) -> Result<Event> {
+    let (seq, run_id, attempt_id, attempt_seq, kind, payload, at) = row;
+    Ok(Event {
+        seq: to_u64(seq)?,
+        run_id,
+        attempt_id,
+        attempt_seq: attempt_seq.map(to_u64).transpose()?,
+        kind,
+        payload: serde_json::from_str(&payload)
+            .map_err(|e| StorageError::Corrupt(format!("event payload: {e}")))?,
+        at_ms: to_u64(at)?,
+    })
+}
+
+/// The events of one attempt with one `kind`, oldest first.
+pub(crate) fn events_of(conn: &Connection, attempt_id: &str, kind: &str) -> Result<Vec<Event>> {
+    let mut s = conn.prepare(&format!(
+        "SELECT {EVENT_COLS} FROM event WHERE attempt_id = ?1 AND kind = ?2 ORDER BY attempt_seq"
+    ))?;
+    let rows = s.query_map(params![attempt_id, kind], event_row)?;
+    rows.map(|r| event_of(r?)).collect()
+}
+
+/// Append, for each `(key, payload)`, an event of `kind` to the attempt unless
+/// it already has one of that kind whose payload has `payload[key_field] ==
+/// key`. Read and write happen on `conn`, so inside one transaction the check
+/// and the insert cannot be separated. Returns how many were appended.
+pub(crate) fn append_events_unseen(
+    conn: &Connection,
+    run_id: Option<&str>,
+    attempt_id: &str,
+    kind: &str,
+    key_field: &str,
+    wanted: &[(String, Value)],
+    at_ms: u64,
+) -> Result<u32> {
+    let seen: Vec<Event> = events_of(conn, attempt_id, kind)?;
+    let mut n = 0;
+    for (key, payload) in wanted {
+        let have = seen
+            .iter()
+            .any(|e| e.payload[key_field].as_str() == Some(key.as_str()));
+        if !have {
+            append_event(conn, run_id, Some(attempt_id), kind, payload, at_ms)?;
+            n += 1;
+        }
     }
-    Ok(out)
+    Ok(n)
 }
 
 pub(crate) fn state_str(s: AttemptState) -> &'static str {

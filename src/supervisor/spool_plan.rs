@@ -8,10 +8,13 @@
 //! trust; bytes of the log file past it are not yet published.
 
 use crate::ids::{AttemptId, Digest};
+use crate::source::safety::fold_path;
 use crate::state::Termination;
 use crate::wire::ArtifactRecord;
 use serde_json::{json, Value};
-use std::path::PathBuf;
+use std::collections::BTreeSet;
+use std::ffi::OsString;
+use std::path::{Component, Path, PathBuf};
 
 pub const RECORD_LEN: usize = 16;
 /// The largest answer to one read, whatever the caller asked for.
@@ -20,11 +23,12 @@ pub const MAX_READ_BYTES: u64 = 8 << 20;
 /// flood after the limit does not grow the index without bound.
 pub const DROP_RECORD_STEP: u64 = 1 << 20;
 /// Stored bytes that may wait without an index record. The log bytes are
-/// written at once; only the record that publishes them to a reader is held
-/// back until this much has accumulated (or the writer syncs or finishes), so
-/// the index stays at most `RECORD_LEN` per `MIN_RECORD_BYTES` of log however
-/// small the producer's writes are.
-pub const MIN_RECORD_BYTES: u64 = 4096;
+/// written at once; the record that publishes them to a reader is written only
+/// after the log is fsynced, and that happens when this much has accumulated
+/// (or the writer syncs or finishes), so the index stays at most `RECORD_LEN`
+/// per `MIN_RECORD_BYTES` of log and the log is fsynced once per that many
+/// bytes, however small the producer's writes are.
+pub const MIN_RECORD_BYTES: u64 = 1 << 20;
 const MAX_NAME_BYTES: usize = 1024;
 const MAX_COMPONENT_BYTES: usize = 255;
 const MAX_DEPTH: usize = 16;
@@ -163,6 +167,68 @@ pub fn read_window(end: u64, offset: u64, max_bytes: u64) -> (u64, u64) {
     (start, max_bytes.min(MAX_READ_BYTES).min(end - start))
 }
 
+/// The components of an artifact source below `workspace`: `source` is either
+/// absolute and below it, or relative to it, and holds only plain components
+/// (no `..`, no `.`, no root or prefix). `None` for anything else, and for the
+/// workspace itself.
+pub fn source_under(workspace: &Path, source: &Path) -> Option<Vec<OsString>> {
+    let rel = if source.is_absolute() {
+        source.strip_prefix(workspace).ok()?
+    } else {
+        source
+    };
+    let comps: Vec<OsString> = rel
+        .components()
+        .map(|c| match c {
+            Component::Normal(n) => Some(n.to_os_string()),
+            _ => None,
+        })
+        .collect::<Option<_>>()?;
+    (!comps.is_empty()).then_some(comps)
+}
+
+/// A name the store gives its temporary files. Artifact names may not start
+/// like this, so such a file is always ours to sweep.
+pub fn is_tmp_name(name: &str) -> bool {
+    name.starts_with(".tmp")
+}
+
+/// Why a set of artifact names is refused.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ArtifactSetError {
+    /// The same name twice, or two names that a file system folding case and
+    /// Unicode form (macOS) would store as one file.
+    Duplicate(String),
+    /// A name that lies below another artifact (which is a file there).
+    Nested(String),
+}
+
+/// The names of one attempt's artifacts must be distinct and none may lie
+/// below another, compared on their folded form
+/// ([`crate::source::safety::fold_path`]: NFC and lowercase).
+pub fn check_artifact_names(names: &[&str]) -> Result<(), ArtifactSetError> {
+    let keys: Vec<(Vec<u8>, &str)> = names
+        .iter()
+        .map(|n| (fold_path(n.as_bytes()), *n))
+        .collect();
+    let mut seen = BTreeSet::new();
+    for (k, n) in &keys {
+        if !seen.insert(k.as_slice()) {
+            return Err(ArtifactSetError::Duplicate((*n).to_string()));
+        }
+    }
+    for (k, n) in &keys {
+        let below_another = k
+            .iter()
+            .enumerate()
+            .any(|(i, b)| *b == b'/' && seen.contains(&k[..i]));
+        if below_another {
+            return Err(ArtifactSetError::Nested((*n).to_string()));
+        }
+    }
+    Ok(())
+}
+
 /// A path the spool or the result store may use under its root: relative,
 /// plain components only. `name` is an artifact name or a path inside it.
 pub fn relative_path(name: &str) -> Option<PathBuf> {
@@ -178,7 +244,7 @@ pub fn relative_path(name: &str) -> Option<PathBuf> {
             && p.len() <= MAX_COMPONENT_BYTES
             && *p != "."
             && *p != ".."
-            && !p.starts_with(".tmp")
+            && !is_tmp_name(p)
             && !p.chars().any(|c| c.is_control() || c == '\\')
     });
     ok.then(|| parts.iter().collect())
@@ -215,6 +281,19 @@ pub struct StreamSummary {
     pub last_seq: u64,
 }
 
+/// The artifacts as the result stores them: by name, so the same set is the
+/// same value whatever order it came in.
+pub fn artifacts_json(artifacts: &[ArtifactRecord]) -> Value {
+    let mut sorted: Vec<&ArtifactRecord> = artifacts.iter().collect();
+    sorted.sort_by(|a, b| a.name.cmp(&b.name));
+    json!(sorted)
+}
+
+/// Whether a stored result lists exactly these artifacts.
+pub fn result_has_artifacts(result: &Value, artifacts: &[ArtifactRecord]) -> bool {
+    result["artifacts"] == artifacts_json(artifacts)
+}
+
 /// The stored result: termination, artifacts (by name, so the same result is
 /// the same bytes) and, per stream, what the spool kept and dropped.
 pub fn result_json(
@@ -223,8 +302,6 @@ pub fn result_json(
     stdout: StreamSummary,
     stderr: StreamSummary,
 ) -> Value {
-    let mut sorted: Vec<&ArtifactRecord> = artifacts.iter().collect();
-    sorted.sort_by(|a, b| a.name.cmp(&b.name));
     let stream = |s: StreamSummary| {
         json!({
             "bytes": s.bytes,
@@ -235,7 +312,7 @@ pub fn result_json(
     };
     json!({
         "termination": termination,
-        "artifacts": sorted,
+        "artifacts": artifacts_json(artifacts),
         "logs": { "stdout": stream(stdout), "stderr": stream(stderr) },
     })
 }
@@ -254,6 +331,7 @@ mod tests {
     use super::*;
     use crate::ids::SourceId;
     use crate::state::Outcome;
+    use serde_json::json;
 
     fn rec(end: u64, dropped: u64) -> [u8; RECORD_LEN] {
         Mark { end, dropped }.encode()
@@ -469,6 +547,122 @@ mod tests {
         assert_eq!(v["logs"]["stderr"]["dropped_bytes"], 9);
         assert_eq!(v["logs"]["stdout"]["last_seq"], 2);
         assert_eq!(v["logs"]["stdout"]["bytes"], 5);
+    }
+
+    #[test]
+    fn temporary_names_are_ours() {
+        assert!(is_tmp_name(".tmp"));
+        assert!(is_tmp_name(".tmpAb12"));
+        assert!(!is_tmp_name("tmp"));
+        assert!(!is_tmp_name("x.tmp"));
+        assert!(!is_tmp_name(".t"));
+        assert!(!is_tmp_name(""));
+    }
+
+    fn names(n: &[&str]) -> Result<(), ArtifactSetError> {
+        check_artifact_names(n)
+    }
+
+    #[test]
+    fn distinct_artifact_names_pass() {
+        assert_eq!(names(&[]), Ok(()));
+        assert_eq!(names(&["a"]), Ok(()));
+        assert_eq!(names(&["a", "b", "c/d", "c/e", "a2", "a-x"]), Ok(()));
+        // A prefix that is not a whole component is not "below".
+        assert_eq!(names(&["a", "ab/c", "a.b"]), Ok(()));
+    }
+
+    #[test]
+    fn a_repeated_name_is_a_duplicate_also_when_a_file_system_would_fold_it() {
+        let dup = |n: &str| Err(ArtifactSetError::Duplicate(n.to_string()));
+        assert_eq!(names(&["a", "a"]), dup("a"));
+        assert_eq!(names(&["x", "d/f", "d/f"]), dup("d/f"));
+        // The later name is the one reported.
+        assert_eq!(names(&["Readme", "README"]), dup("README"));
+        assert_eq!(names(&["d/Ab", "D/aB"]), dup("D/aB"));
+        // NFC and NFD spell one name.
+        assert_eq!(names(&["caf\u{e9}", "cafe\u{301}"]), dup("cafe\u{301}"));
+    }
+
+    #[test]
+    fn a_name_below_another_is_nested() {
+        let nested = |n: &str| Err(ArtifactSetError::Nested(n.to_string()));
+        assert_eq!(names(&["a", "a/b"]), nested("a/b"));
+        assert_eq!(names(&["a/b", "a"]), nested("a/b"));
+        assert_eq!(names(&["a", "a-x", "a/b/c"]), nested("a/b/c"));
+        assert_eq!(names(&["d/e", "D/E/f"]), nested("D/E/f"));
+        // A duplicate is reported before a nesting.
+        assert_eq!(
+            names(&["a", "a/b", "A"]),
+            Err(ArtifactSetError::Duplicate("A".into()))
+        );
+    }
+
+    fn rec_of(name: &str, size: u64) -> ArtifactRecord {
+        ArtifactRecord {
+            name: name.into(),
+            path: name.into(),
+            size,
+            digest: Digest::of_bytes(b"x"),
+            source_id: crate::ids::SourceId::generate(),
+            plan_digest: Digest::of_bytes(b"p"),
+            attempt_id: AttemptId::generate(),
+            profile_fingerprint: Digest::of_bytes(b"f"),
+        }
+    }
+
+    #[test]
+    fn a_result_matches_artifacts_by_content_not_by_order() {
+        let (a, b) = (rec_of("a", 1), rec_of("b", 2));
+        let t = Termination::new(Outcome::Cancelled, None, None).unwrap();
+        let s = StreamSummary {
+            bytes: 0,
+            dropped_bytes: 0,
+            last_seq: 0,
+        };
+        let result = result_json(&t, &[b.clone(), a.clone()], s, s);
+        assert!(result_has_artifacts(&result, &[a.clone(), b.clone()]));
+        assert!(result_has_artifacts(&result, &[b.clone(), a.clone()]));
+        assert!(!result_has_artifacts(&result, std::slice::from_ref(&a)));
+        assert!(!result_has_artifacts(&result, &[]));
+        assert!(!result_has_artifacts(&result, &[a.clone(), rec_of("b", 3)]));
+        assert!(!result_has_artifacts(&result, &[a, b, rec_of("c", 1)]));
+        // A result with no artifacts matches the empty set, and nothing else.
+        let none = result_json(&t, &[], s, s);
+        assert!(result_has_artifacts(&none, &[]));
+        assert!(!result_has_artifacts(&none, &[rec_of("a", 1)]));
+        // Not a result at all: matches nothing, not even the empty set.
+        assert!(!result_has_artifacts(&json!({}), &[]));
+    }
+
+    #[test]
+    fn a_source_is_below_the_workspace_with_plain_components() {
+        let ws = Path::new("/w/ws");
+        let os =
+            |v: &[&str]| -> Option<Vec<OsString>> { Some(v.iter().map(OsString::from).collect()) };
+        assert_eq!(source_under(ws, Path::new("/w/ws/a")), os(&["a"]));
+        assert_eq!(
+            source_under(ws, Path::new("/w/ws/a/b.txt")),
+            os(&["a", "b.txt"])
+        );
+        assert_eq!(source_under(ws, Path::new("a/b")), os(&["a", "b"]));
+        assert_eq!(source_under(ws, Path::new("a//b/")), os(&["a", "b"]));
+        for bad in [
+            "/w/ws",
+            "/w/ws/",
+            "/w/other/a",
+            "/w/wsx/a",
+            "/etc/passwd",
+            "/w/ws/../x",
+            "/w/ws/a/../../x",
+            "..",
+            "../a",
+            "a/../b",
+            "./a",
+            "",
+        ] {
+            assert_eq!(source_under(ws, Path::new(bad)), None, "{bad:?}");
+        }
     }
 
     #[test]

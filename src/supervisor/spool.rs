@@ -10,41 +10,52 @@
 //! limit (both streams share it). The spec's limit is per task, so the
 //! limit given to [`AttemptSpool::open`] is the task's limit less what its
 //! other attempts stored ([`super::spool_plan::attempt_limit`]); the caller
-//! knows the attempts and sums their `LogPosition`s in the worker database.
-//! Past it, bytes are dropped, not
-//! stored: the offset space does not move, `end` stays where the limit cut it
-//! and `dropped_bytes` counts what was lost, so a reader at `end` that sees
-//! `log_truncated` knows nothing more will come there. The sequence of a
-//! stream is its number of index records; with the offset it is what the
-//! protocol's cursors dedupe on. A record is written when
-//! [`MIN_RECORD_BYTES`](super::spool_plan::MIN_RECORD_BYTES) of stored bytes
-//! wait for one, when drops are worth recording, and on `sync` and `finish`, so
-//! the index stays small whatever the size of the producer's writes. The log
-//! bytes themselves are written at once; a reader sees them when their record
-//! is written, so a small tail becomes visible at the next `sync` (the
-//! supervisor's heartbeat) at the latest.
+//! (S9a) knows the attempts and sums their `LogPosition`s in the worker
+//! database. Those positions are only as fresh as the supervisor made them:
+//! it must call [`super::outcome::sync_log_position`] on every heartbeat (it
+//! syncs the spool, then stores the positions, which only move forward) and
+//! `finish_attempt` stores the final ones. The remaining budget of a retry is
+//! computed from them, so a position that was never stored counts as nothing.
+//! Past the limit, bytes are dropped, not stored: the offset space does not
+//! move, `end` stays where the limit cut it and `dropped_bytes` counts what
+//! was lost, so a reader at `end` that sees `log_truncated` knows nothing more
+//! will come there. Once a stream has dropped anything it keeps dropping, also
+//! after a resume with a larger limit: its offsets would otherwise continue
+//! past a hole in the producer's output. The sequence of a stream is its number
+//! of index records; with the offset it is what the protocol's cursors dedupe
+//! on.
 //!
-//! Durability (the fsync policy). An append is `write(2)` of the bytes, then of
-//! one index record, both through the kernel: a crash of the supervisor
-//! process (the case that matters, as it is a separate process) loses nothing
-//! that was appended, and the agent sees the bytes at once. `fsync` of the log
-//! and then the index happens every [`SYNC_BYTES`] of stored data, on
-//! [`StreamWriter::sync`] (the supervisor calls it on its heartbeat) and always
-//! at [`AttemptSpool::finish`]. Only an OS crash or power loss can lose the
-//! bytes after the last sync; recovery then keeps the valid prefix of the
-//! index and never reuses an offset for different bytes on this machine. A
-//! reader that had already seen offsets past the last sync gets a smaller
-//! `end` after such a crash, which the protocol reports as ordinary
-//! resumption, not as a gap.
+//! Visibility and durability. The log bytes are written at once (`write(2)`,
+//! so a crash of the supervisor process, the case that matters as it is a
+//! separate process, loses nothing that was appended) but are not shown to a
+//! reader until they are durable: a reader trusts only the index, and an index
+//! record is written only right after the log was `fsync`ed, never before. A
+//! record is written (so, an `fsync` happens) when
+//! [`MIN_RECORD_BYTES`](super::spool_plan::MIN_RECORD_BYTES) of stored bytes
+//! wait for one, when drops are worth recording, on [`StreamWriter::sync`] (the
+//! supervisor calls it on its heartbeat, which bounds how long a small tail
+//! stays invisible) and at [`AttemptSpool::finish`]. So whatever a reader saw
+//! survives an OS crash or power loss as far as its bytes go: `end` never
+//! shrinks below what was published. The index itself is fsynced right after
+//! its record; a record the crash took leaves the reader a smaller `seq` and
+//! the next record is written for the log's real length, which the protocol
+//! reports as ordinary resumption, not as a gap. Only bytes that were never
+//! published can be lost, and nothing reuses an offset a reader has seen.
+//!
+//! Who can write here. The spool root belongs to the supervisor's user and is
+//! not reachable from the commands it runs (their workspace is elsewhere, and
+//! artifacts are copied in from it by the supervisor after they exit); the
+//! spool trusts that and does not defend against a writer inside the root.
 //!
 //! Resuming after a crash ([`AttemptSpool::open`]) cuts the index to its valid
-//! prefix, adds a record for log bytes written after the last record, and
-//! continues from the log's real length: the offset never goes back and no
+//! prefix, makes the log's bytes beyond it durable and adds a record for them,
+//! and continues from the log's real length: the offset never goes back and no
 //! byte is stored twice. Bytes the producer wrote while no supervisor was
 //! alive are not in the spool, and their count is not known.
 
 use super::spool_plan::{
-    admit, read_window, record_needed, IndexScan, Mark, Recovery, MAX_READ_BYTES, RECORD_LEN,
+    admit, read_window, record_needed, Admission, IndexScan, Mark, Recovery, MAX_READ_BYTES,
+    RECORD_LEN,
 };
 use crate::ids::AttemptId;
 use crate::storage::LogPosition;
@@ -55,9 +66,6 @@ use std::os::unix::fs::{DirBuilderExt, FileExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-
-/// Stored bytes appended between two fsyncs.
-pub const SYNC_BYTES: u64 = 1 << 20;
 
 #[derive(Debug, thiserror::Error)]
 pub enum SpoolError {
@@ -142,7 +150,7 @@ struct Budget {
 }
 
 impl Budget {
-    fn reserve(&self, len: u64) -> super::spool_plan::Admission {
+    fn reserve(&self, len: u64) -> Admission {
         // A compare-exchange loop: `fetch_update` is deprecated on new
         // toolchains and its replacement is newer than the MSRV.
         let mut prev = self.used.load(Ordering::SeqCst);
@@ -171,8 +179,10 @@ struct Inner {
     data_end: u64,
     /// Dropped bytes counted so far (the record may lag by a batch).
     dropped: u64,
+    /// This stream dropped bytes before a crash: whatever comes now is
+    /// dropped too, so its offsets never continue past a hole.
+    closed_for_store: bool,
     seq: u64,
-    unsynced: u64,
     failed: bool,
     finished: bool,
 }
@@ -199,17 +209,21 @@ impl StreamWriter {
         if bytes.is_empty() {
             return Ok(status_of(&g));
         }
-        let adm = self.budget.reserve(bytes.len() as u64);
+        let len = bytes.len() as u64;
+        let adm = if g.closed_for_store {
+            Admission {
+                store: 0,
+                drop: len,
+            }
+        } else {
+            self.budget.reserve(len)
+        };
         let r = (|| -> io::Result<()> {
             let store = adm.store as usize;
             g.data.write_all(&bytes[..store])?;
             g.dropped += adm.drop;
             g.data_end += adm.store;
             if record_needed(g.data_end - g.mark.end, g.mark.dropped, g.dropped) {
-                write_record(&mut g)?;
-            }
-            g.unsynced += adm.store;
-            if g.unsynced >= SYNC_BYTES {
                 sync_inner(&mut g)?;
             }
             Ok(())
@@ -223,21 +237,23 @@ impl StreamWriter {
         }
     }
 
-    /// Publish everything appended so far to readers (the pending index
-    /// record) and make it durable (log first, then index). The supervisor
-    /// calls this on its heartbeat, which bounds how long a small tail stays
-    /// invisible to the agent.
-    pub fn sync(&self) -> Result<()> {
+    /// Make everything appended so far durable (the log is fsynced), then
+    /// publish it to readers (the pending index record, fsynced in turn). The
+    /// supervisor calls this on its heartbeat, which bounds how long a small
+    /// tail stays invisible to the agent. Returns the stream's status, which is
+    /// what the supervisor stores as the stream's `LogPosition`.
+    pub fn sync(&self) -> Result<StreamStatus> {
         let mut g = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         if g.failed {
             return Err(SpoolError::Failed);
         }
-        write_record_if_pending(&mut g)
-            .and_then(|()| sync_inner(&mut g))
-            .map_err(|e| {
+        match sync_inner(&mut g) {
+            Ok(()) => Ok(status_of(&g)),
+            Err(e) => {
                 g.failed = true;
-                e.into()
-            })
+                Err(e.into())
+            }
+        }
     }
 
     /// Test hook: behave as after a failed disk write.
@@ -255,11 +271,7 @@ impl StreamWriter {
         if g.failed {
             return Err(SpoolError::Failed);
         }
-        let r = (|| -> io::Result<()> {
-            write_record_if_pending(&mut g)?;
-            sync_inner(&mut g)
-        })();
-        if let Err(e) = r {
+        if let Err(e) = sync_inner(&mut g) {
             g.failed = true;
             return Err(e.into());
         }
@@ -268,7 +280,8 @@ impl StreamWriter {
     }
 }
 
-/// Publish the log's current end and the drop count as one index record.
+/// Publish the log's current end and the drop count as one index record. The
+/// caller has made the log durable up to `data_end`.
 fn write_record(g: &mut Inner) -> io::Result<()> {
     let m = Mark {
         end: g.data_end,
@@ -280,13 +293,6 @@ fn write_record(g: &mut Inner) -> io::Result<()> {
     Ok(())
 }
 
-fn write_record_if_pending(g: &mut Inner) -> io::Result<()> {
-    if g.data_end != g.mark.end || g.dropped != g.mark.dropped {
-        write_record(g)?;
-    }
-    Ok(())
-}
-
 fn status_of(g: &Inner) -> StreamStatus {
     StreamStatus {
         end: g.data_end,
@@ -295,11 +301,15 @@ fn status_of(g: &Inner) -> StreamStatus {
     }
 }
 
+/// Make the log durable, then (and only then) publish what is pending as one
+/// index record and make that durable too. A record therefore never claims
+/// bytes that an OS crash could take.
 fn sync_inner(g: &mut Inner) -> io::Result<()> {
     g.data.sync_data()?;
-    g.idx.sync_data()?;
-    g.unsynced = 0;
-    Ok(())
+    if g.data_end != g.mark.end || g.dropped != g.mark.dropped {
+        write_record(g)?;
+    }
+    g.idx.sync_data()
 }
 
 /// Open one stream for writing, recovering what a crash left.
@@ -325,23 +335,26 @@ fn open_stream(dir: &Path, stream: LogStream, budget: &Arc<Budget>) -> io::Resul
         repaired = true;
     }
     if let Some(m) = append {
+        // The bytes beyond the last record were only in the page cache:
+        // durable first, then published.
+        data.sync_data()?;
         (&idx).write_all(&m.encode())?;
         repaired = true;
     }
-    let mut inner = Inner {
+    if repaired {
+        idx.sync_data()?;
+    }
+    let inner = Inner {
         data,
         idx,
         mark,
         data_end: mark.end,
         dropped: mark.dropped,
+        closed_for_store: mark.dropped > 0,
         seq,
-        unsynced: 0,
         failed: false,
         finished: false,
     };
-    if repaired {
-        sync_inner(&mut inner)?;
-    }
     budget.used.fetch_add(mark.end, Ordering::SeqCst);
     Ok(StreamWriter {
         inner: Mutex::new(inner),
@@ -399,6 +412,11 @@ impl AttemptSpool {
             LogStream::Stdout => &self.stdout,
             LogStream::Stderr => &self.stderr,
         }
+    }
+
+    /// [`StreamWriter::sync`] of both streams: `(stdout, stderr)` after it.
+    pub fn sync(&self) -> Result<(StreamStatus, StreamStatus)> {
+        Ok((self.stdout.sync()?, self.stderr.sync()?))
     }
 
     /// The output is complete: write the exact drop counts, fsync, and mark
