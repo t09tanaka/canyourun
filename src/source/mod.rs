@@ -21,7 +21,9 @@ pub mod store;
 
 use crate::error::{ApiError, ErrorCode};
 use crate::ids::RunId;
-use local_ci::source::{capture_directory, capture_source, CaptureOptions, Hook, SourceKind};
+use local_ci::source::{
+    capture_directory, capture_source, CaptureOptions, Hook, SecretSpec, SourceKind,
+};
 use local_ci::ExecContext;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -65,12 +67,35 @@ pub struct CaptureParams {
     /// A test seam, called between the steps of a capture (see
     /// [`local_ci::source::Stage`]).
     pub hook: Option<Hook>,
+    /// Ignored files to send as secrets (chapter 22.3); built by
+    /// [`crate::secrets::capture`], which adds what `.worktreeinclude` matches.
+    pub secret_files: Vec<SecretSpec>,
+    /// The cluster key the secret files' HMACs are made with.
+    pub secret_key: Vec<u8>,
+}
+
+impl std::fmt::Debug for CaptureParams {
+    /// The key is not shown.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CaptureParams")
+            .field("base", &self.base)
+            .field("include", &self.include)
+            .field("exclude", &self.exclude)
+            .field("max_attempts", &self.max_attempts)
+            .field("secret_files", &self.secret_files)
+            .field("secret_key", &"<redacted>")
+            .finish_non_exhaustive()
+    }
 }
 
 /// A source that is fixed and published.
 #[derive(Debug, Clone)]
 pub struct Captured {
     pub manifest: SourceManifest,
+    /// Where local-ci put the secret files of this capture (0600, in the
+    /// source store, keyed by source). `None` when there are none, and for a
+    /// run whose capture was made before: its bundle is already with the run.
+    pub secrets: Option<PathBuf>,
     /// Things worth saying that did not stop the capture.
     pub warnings: Vec<String>,
 }
@@ -90,9 +115,8 @@ pub fn capture(
         base: params.base.clone(),
         include: params.include.clone(),
         exclude: params.exclude.clone(),
-        // the secret bundle is captured by the secret path (chapter 22.3)
-        secret_files: vec![],
-        secret_key: vec![],
+        secret_files: params.secret_files.clone(),
+        secret_key: params.secret_key.clone(),
         max_attempts: classify::attempt_budget(params.max_attempts),
         hook: params.hook.clone(),
     };
@@ -126,6 +150,7 @@ pub fn capture(
     })?;
     Ok(Captured {
         manifest,
+        secrets: snap.secrets,
         warnings: snap.warnings,
     })
 }
@@ -220,6 +245,7 @@ pub fn capture_for_run(
             })?;
         return Ok(Captured {
             manifest: from_ci(&m)?,
+            secrets: None,
             warnings: vec![],
         });
     }

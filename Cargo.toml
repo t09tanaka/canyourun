@@ -19,6 +19,7 @@ path = "src/main.rs"
 [dependencies]
 anyhow = "1"
 base64 = "0.22"
+getrandom = "0.3"
 clap = { version = "4", features = ["derive"] }
 libc = "0.2"
 local-ci = "0.9"
