@@ -175,15 +175,7 @@ fn listing(root: &Path) -> Listing {
 }
 
 /// What a capture must not change in the original.
-fn original_state(
-    dir: &Path,
-) -> (
-    Vec<u8>,
-    String,
-    String,
-    String,
-    BTreeMap<String, (char, bool, Vec<u8>)>,
-) {
+fn original_state(dir: &Path) -> (Vec<u8>, String, String, String, Listing) {
     (
         std::fs::read(dir.join(".git/index")).unwrap(),
         git_out(dir, &["for-each-ref"]),
