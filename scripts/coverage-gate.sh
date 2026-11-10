@@ -13,6 +13,7 @@ want = {
     "src/state.rs",
     "src/error.rs",
     "src/wire.rs",
+    "src/storage/policy.rs",
     "src/config/legacy.rs",
     "src/config/parse.rs",
     "src/config/paths.rs",
