@@ -771,6 +771,7 @@ dependencies = [
  "assert_cmd",
  "base64",
  "clap",
+ "libc",
  "local-ci",
  "rusqlite",
  "serde",

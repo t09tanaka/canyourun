@@ -691,6 +691,8 @@ fn only_attempt_workspaces_can_be_removed() {
             cwd: root.clone(),
             root,
             kind: WorkspaceKind::Directory,
+            index_reproduced: true,
+            warnings: vec![],
         };
         let e = ws.remove(&w).unwrap_err();
         assert_eq!(e.code, ErrorCode::InvalidInput);
@@ -747,4 +749,710 @@ fn a_create_after_a_crash_clears_the_stale_branch_and_registration() {
         ws.remove(&w).unwrap();
         assert!(branches(&f, repo.dir()).is_empty());
     }
+}
+
+// ---- review fixes -----------------------------------------------------
+
+/// The capture store's own Git repository that holds `tree` (local-ci writes
+/// the index tree there).
+fn repo_with(f: &Fixture, tree: &str) -> PathBuf {
+    let git = f.root.join("capture-state/sources/git");
+    std::fs::read_dir(git)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .find(|d| {
+            Command::new("git")
+                .args(["cat-file", "-e", tree])
+                .current_dir(d)
+                .env_clear()
+                .envs(f.env())
+                .output()
+                .unwrap()
+                .status
+                .success()
+        })
+        .expect("the index tree is in the capture store")
+}
+
+/// The objects `tree` needs, copied from the repository `src` into `dst` (what
+/// a bundle that carried the original's index tree would do).
+fn copy_objects(f: &Fixture, src: &Path, dst: &Path, tree: &str) {
+    use std::io::Write;
+    let ids: String = f
+        .git(src, &["rev-list", "--objects", tree])
+        .lines()
+        .map(|l| format!("{}\n", l.split(' ').next().unwrap()))
+        .collect();
+    let mut pack = Command::new("git");
+    pack.args(["pack-objects", "--stdout", "-q"])
+        .current_dir(src)
+        .env_clear()
+        .envs(f.env())
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped());
+    let mut child = pack.spawn().unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(ids.as_bytes())
+        .unwrap();
+    let packed = child.wait_with_output().unwrap().stdout;
+    let mut unpack = Command::new("git");
+    unpack
+        .args(["unpack-objects", "-q"])
+        .current_dir(dst)
+        .env_clear()
+        .envs(f.env())
+        .stdin(std::process::Stdio::piped());
+    let mut child = unpack.spawn().unwrap();
+    child.stdin.take().unwrap().write_all(&packed).unwrap();
+    assert!(child.wait().unwrap().success());
+}
+
+/// A worktree capture of a repository with a staged change, an unstaged one
+/// and an untracked file.
+fn dirty_capture(f: &Fixture, store: &SourceStore) -> CiManifest {
+    std::fs::write(f.dir.join("a.txt"), "staged\n").unwrap();
+    f.git(&f.dir, &["add", "a.txt"]);
+    std::fs::write(f.dir.join("pkg/lib.txt"), "unstaged\n").unwrap();
+    std::fs::write(f.dir.join("new.txt"), "untracked\n").unwrap();
+    let c = capture(
+        &f.env(),
+        store,
+        &SourceRequest::Worktree { dir: f.dir.clone() },
+        &CaptureParams::default(),
+    )
+    .unwrap();
+    store.manifest(&c.manifest.ci_source_id).unwrap().unwrap()
+}
+
+#[test]
+fn head_and_index_are_the_originals() {
+    for b in backends(&common_home()) {
+        let f = fixture();
+        let store = f.store();
+        let m = dirty_capture(&f, &store);
+        let ws = f.workspaces(&b.fw(&f));
+        let repo = f.clone_of(&ws);
+        f.deliver(&store, &repo, &m);
+        let tree = m.index_tree.clone().unwrap();
+        // the bundle does not carry the index tree yet: it is copied in
+        let src = repo_with(&f, &tree);
+        copy_objects(&f, &src, repo.dir(), &tree);
+        let w = ws
+            .create(&AttemptId::generate(), &store, &m, Some(&repo))
+            .unwrap();
+        assert!(w.index_reproduced, "{}: {:?}", b.name, w.warnings);
+        assert!(w.warnings.is_empty());
+        let head = f.git(&f.dir, &["rev-parse", "HEAD"]);
+        assert_eq!(f.git(&w.root, &["rev-parse", "HEAD"]), head, "{}", b.name);
+        for args in [
+            vec!["diff"],
+            vec!["diff", "--cached"],
+            vec!["status", "--porcelain"],
+        ] {
+            assert_eq!(
+                f.git(&w.root, &args),
+                f.git(&f.dir, &args),
+                "{}: git {args:?}",
+                b.name
+            );
+        }
+        assert!(f
+            .git(&w.root, &["diff", "--cached", "--name-only"])
+            .contains("a.txt"));
+        ws.remove(&w).unwrap();
+        assert!(branches(&f, repo.dir()).is_empty());
+    }
+}
+
+#[test]
+fn without_the_index_tree_the_index_is_the_heads_and_it_is_said() {
+    let b = &backends(&common_home())[0];
+    let f = fixture();
+    let store = f.store();
+    let m = dirty_capture(&f, &store);
+    let ws = f.workspaces(&b.fw(&f));
+    let repo = f.clone_of(&ws);
+    f.deliver(&store, &repo, &m);
+    let head = f.git(&f.dir, &["rev-parse", "HEAD"]);
+    let w = ws
+        .create(&AttemptId::generate(), &store, &m, Some(&repo))
+        .unwrap();
+    assert!(!w.index_reproduced);
+    assert_eq!(w.warnings.len(), 1, "{:?}", w.warnings);
+    assert!(w.warnings[0].contains("index tree"), "{:?}", w.warnings);
+    assert_eq!(f.git(&w.root, &["rev-parse", "HEAD"]), head);
+    // the index is HEAD's tree: nothing staged, all changes unstaged
+    assert_eq!(f.git(&w.root, &["diff", "--cached"]), "");
+    assert!(f.git(&w.root, &["diff", "--name-only"]).contains("a.txt"));
+    assert_eq!(
+        std::fs::read_to_string(w.root.join("a.txt")).unwrap(),
+        "staged\n"
+    );
+    ws.remove(&w).unwrap();
+}
+
+/// A `fast-worktree` that does a little and fails, leaving `dest` behind.
+struct Half {
+    gitfile: Option<String>,
+}
+
+impl FastWorktree for Half {
+    fn add(&self, _: &Path, dest: &Path, _: &str, _: &str) -> Result<(), FwFailure> {
+        std::fs::create_dir_all(dest).unwrap();
+        if let Some(g) = &self.gitfile {
+            std::fs::write(dest.join(".git"), g).unwrap();
+        }
+        std::fs::write(dest.join("junk"), "x").unwrap();
+        Err(FwFailure::Failed {
+            code: Some(1),
+            stderr: "half".into(),
+        })
+    }
+    fn remove(&self, _: &Path, _: &Path) -> Result<(), FwFailure> {
+        panic!("a directory that is not a worktree of the clone is not handed to the tool")
+    }
+}
+
+#[test]
+fn a_failed_add_inside_another_repository_does_not_touch_it() {
+    let f = fixture();
+    let store = f.store();
+    let m = f.capture_commit(&store, "HEAD");
+    // the worker's state lives inside someone's repository, which is dirty
+    let outer = f.root.join("outer");
+    std::fs::create_dir_all(&outer).unwrap();
+    f.git(&outer, &["init", "-q", "-b", "main"]);
+    std::fs::write(outer.join("t.txt"), "committed\n").unwrap();
+    f.git(&outer, &["add", "."]);
+    f.git(&outer, &["commit", "-qm", "outer"]);
+    std::fs::write(outer.join("t.txt"), "my uncommitted work\n").unwrap();
+    std::fs::write(outer.join("untracked.txt"), "mine\n").unwrap();
+    let want = (
+        f.git(&outer, &["status", "--porcelain"]),
+        f.git(&outer, &["rev-parse", "HEAD"]),
+    );
+    for gitfile in [
+        None,
+        Some("gitdir: /nonexistent/.git/worktrees/x\n".to_string()),
+        Some(format!("gitdir: {}\n", outer.join(".git").display())),
+    ] {
+        let fw: Arc<dyn FastWorktree> = Arc::new(Half { gitfile });
+        let ws = Workspaces::new(outer.join("state"), f.env(), fw);
+        let repo = ws
+            .ensure_clone("github:example/repo", Some(f.dir.to_str().unwrap()))
+            .unwrap();
+        f.deliver(&f.store(), &repo, &m);
+        let att = AttemptId::generate();
+        let e = ws.create(&att, &store, &m, Some(&repo)).unwrap_err();
+        assert_eq!(e.code, ErrorCode::Blocked, "{e:?}");
+        assert!(!outer.join("state/workspaces").join(att.as_str()).exists());
+        assert_eq!(
+            std::fs::read_to_string(outer.join("t.txt")).unwrap(),
+            "my uncommitted work\n"
+        );
+        assert!(outer.join("untracked.txt").exists());
+        let status = f.git(&outer, &["status", "--porcelain"]);
+        let status: Vec<_> = status.lines().filter(|l| !l.contains("state/")).collect();
+        assert_eq!(status.join("\n"), want.0, "{status:?}");
+        assert_eq!(f.git(&outer, &["rev-parse", "HEAD"]), want.1);
+    }
+}
+
+#[test]
+fn a_symlink_at_the_workspaces_place_is_not_followed() {
+    let b = &backends(&common_home())[0];
+    let f = fixture();
+    let store = f.store();
+    let m = f.capture_commit(&store, "HEAD");
+    let ws = f.workspaces(&b.fw(&f));
+    let repo = f.clone_of(&ws);
+    f.deliver(&store, &repo, &m);
+    // a repository of someone else, dirty, that the link points at
+    let victim = f.root.join("victim");
+    std::fs::create_dir_all(&victim).unwrap();
+    f.git(&victim, &["init", "-q", "-b", "main"]);
+    std::fs::write(victim.join("v.txt"), "v\n").unwrap();
+    f.git(&victim, &["add", "."]);
+    f.git(&victim, &["commit", "-qm", "v"]);
+    std::fs::write(victim.join("v.txt"), "precious\n").unwrap();
+    let att = AttemptId::generate();
+    let place = f.state.join("workspaces").join(att.as_str());
+    std::fs::create_dir_all(f.state.join("workspaces")).unwrap();
+    std::os::unix::fs::symlink(&victim, &place).unwrap();
+    // a create finds something there that is not its leftover
+    let e = ws.create(&att, &store, &m, Some(&repo)).unwrap_err();
+    assert_eq!(e.code, ErrorCode::Conflict);
+    assert_eq!(
+        std::fs::read_to_string(victim.join("v.txt")).unwrap(),
+        "precious\n"
+    );
+    // a removal removes the link, not what it points at
+    let w = Workspace {
+        root: place.clone(),
+        cwd: place.clone(),
+        kind: WorkspaceKind::Worktree {
+            clone: repo.dir().to_path_buf(),
+            branch: format!("rtr/{att}"),
+        },
+        index_reproduced: true,
+        warnings: vec![],
+    };
+    ws.remove(&w).unwrap();
+    assert!(std::fs::symlink_metadata(&place).is_err());
+    assert_eq!(
+        std::fs::read_to_string(victim.join("v.txt")).unwrap(),
+        "precious\n"
+    );
+    assert_eq!(f.git(&victim, &["status", "--porcelain"]), " M v.txt");
+}
+
+#[test]
+fn a_create_over_a_dead_creates_directory_starts_over() {
+    for b in backends(&common_home()) {
+        let f = fixture();
+        let store = f.store();
+        let m = f.capture_commit(&store, "HEAD");
+        let ws = f.workspaces(&b.fw(&f));
+        let repo = f.clone_of(&ws);
+        f.deliver(&store, &repo, &m);
+        let att = AttemptId::generate();
+        let dir = f.state.join("workspaces").join(att.as_str());
+        std::fs::create_dir_all(f.state.join("workspaces")).unwrap();
+        f.git(
+            repo.dir(),
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                &format!("rtr/{att}"),
+                dir.to_str().unwrap(),
+                m.execution_commit.as_deref().unwrap(),
+            ],
+        );
+        // it died with the directory half used
+        std::fs::write(dir.join("a.txt"), "half\n").unwrap();
+        std::fs::write(dir.join("left-over"), "x\n").unwrap();
+        let w = ws.create(&att, &store, &m, Some(&repo)).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(w.root.join("a.txt")).unwrap(),
+            "a\n",
+            "{}",
+            b.name
+        );
+        assert!(!w.root.join("left-over").exists());
+        ws.remove(&w).unwrap();
+        assert!(branches(&f, repo.dir()).is_empty());
+        assert_eq!(worktrees(&f, repo.dir()).len(), 1);
+        // a directory with no branch and no registration is not ours
+        let att2 = AttemptId::generate();
+        let other = f.state.join("workspaces").join(att2.as_str());
+        std::fs::create_dir_all(&other).unwrap();
+        let e = ws.create(&att2, &store, &m, Some(&repo)).unwrap_err();
+        assert_eq!(e.code, ErrorCode::Conflict);
+        assert!(other.exists());
+    }
+}
+
+#[test]
+fn remove_after_the_directory_is_gone_clears_the_branch() {
+    for b in backends(&common_home()) {
+        let f = fixture();
+        let store = f.store();
+        let m = f.capture_commit(&store, "HEAD");
+        let ws = f.workspaces(&b.fw(&f));
+        let repo = f.clone_of(&ws);
+        f.deliver(&store, &repo, &m);
+        let w = ws
+            .create(&AttemptId::generate(), &store, &m, Some(&repo))
+            .unwrap();
+        std::fs::remove_dir_all(&w.root).unwrap();
+        ws.remove(&w).unwrap();
+        assert!(branches(&f, repo.dir()).is_empty(), "{}", b.name);
+        assert_eq!(worktrees(&f, repo.dir()).len(), 1);
+    }
+}
+
+#[test]
+fn a_forged_record_is_refused() {
+    let b = &backends(&common_home())[0];
+    let f = fixture();
+    let store = f.store();
+    let m = f.capture_commit(&store, "HEAD");
+    let ws = f.workspaces(&b.fw(&f));
+    let repo = f.clone_of(&ws);
+    f.deliver(&store, &repo, &m);
+    let w = ws
+        .create(&AttemptId::generate(), &store, &m, Some(&repo))
+        .unwrap();
+    let before = tree_hash(&f.dir);
+    let good = w.kind.clone();
+    let WorkspaceKind::Worktree { clone, branch } = good else {
+        panic!()
+    };
+    for kind in [
+        // a repository of the user's, not a clone made here
+        WorkspaceKind::Worktree {
+            clone: f.dir.clone(),
+            branch: branch.clone(),
+        },
+        // a branch that is not the attempt's
+        WorkspaceKind::Worktree {
+            clone: clone.clone(),
+            branch: "main".into(),
+        },
+        WorkspaceKind::Worktree {
+            clone: f.state.join("clones"),
+            branch: branch.clone(),
+        },
+    ] {
+        let forged = Workspace { kind, ..w.clone() };
+        let e = ws.remove(&forged).unwrap_err();
+        assert_eq!(e.code, ErrorCode::InvalidInput, "{forged:?}");
+    }
+    assert_eq!(tree_hash(&f.dir), before);
+    assert!(w.root.exists());
+    ws.remove(&w).unwrap();
+}
+
+#[test]
+fn the_sweeper_clears_what_no_record_names() {
+    let b = &backends(&common_home())[0];
+    let f = fixture();
+    let store = f.store();
+    let m = f.capture_commit(&store, "HEAD");
+    let ws = f.workspaces(&b.fw(&f));
+    let repo = f.clone_of(&ws);
+    f.deliver(&store, &repo, &m);
+    // nothing there yet: nothing to do
+    assert_eq!(ws.sweep_orphans(&|_| false).unwrap().removed.len(), 0);
+    let kept = ws
+        .create(&AttemptId::generate(), &store, &m, Some(&repo))
+        .unwrap();
+    let lost = ws
+        .create(&AttemptId::generate(), &store, &m, Some(&repo))
+        .unwrap();
+    let plain = f
+        .state
+        .join("workspaces")
+        .join(AttemptId::generate().as_str());
+    std::fs::create_dir_all(plain.join("sub")).unwrap();
+    let scratch = f.state.join("workspaces/.staging.abc");
+    std::fs::create_dir_all(&scratch).unwrap();
+    let half_clone = f.state.join("clones/.clone.xyz");
+    std::fs::create_dir_all(&half_clone).unwrap();
+    let foreign = f.state.join("workspaces/notes.txt");
+    std::fs::write(&foreign, "mine").unwrap();
+    // a leftover that holds a directory it cannot read
+    std::fs::create_dir_all(plain.join("locked")).unwrap();
+    std::fs::set_permissions(
+        plain.join("locked"),
+        std::os::unix::fs::PermissionsExt::from_mode(0o000),
+    )
+    .unwrap();
+    let kept_root = kept.root.clone();
+    let report = ws
+        .sweep_orphans(&|a| kept_root.ends_with(a.as_str()))
+        .unwrap();
+    assert!(report.failed.is_empty(), "{:?}", report.failed);
+    assert_eq!(report.removed.len(), 4, "{:?}", report.removed);
+    assert!(kept.root.exists());
+    assert!(foreign.exists());
+    for gone in [&lost.root, &plain, &scratch, &half_clone] {
+        assert!(!gone.exists(), "{gone:?}");
+    }
+    // the dead attempt's branch went with its worktree
+    assert_eq!(branches(&f, repo.dir()).len(), 1);
+    assert_eq!(worktrees(&f, repo.dir()).len(), 2);
+    ws.remove(&kept).unwrap();
+}
+
+#[test]
+fn a_directory_workspace_with_an_unreadable_directory_is_removed() {
+    let b = &backends(&common_home())[0];
+    let f = fixture();
+    let plain = f.root.join("plain");
+    std::fs::create_dir_all(&plain).unwrap();
+    std::fs::write(plain.join("x.txt"), "x\n").unwrap();
+    let store = f.store();
+    let c = capture(
+        &f.env(),
+        &store,
+        &SourceRequest::Directory { dir: plain },
+        &CaptureParams::default(),
+    )
+    .unwrap();
+    let m = store.manifest(&c.manifest.ci_source_id).unwrap().unwrap();
+    let ws = f.workspaces(&b.fw(&f));
+    let w = ws.create(&AttemptId::generate(), &store, &m, None).unwrap();
+    let locked = w.root.join("run/locked");
+    std::fs::create_dir_all(&locked).unwrap();
+    std::fs::write(locked.join("f"), "f").unwrap();
+    std::fs::set_permissions(&locked, std::os::unix::fs::PermissionsExt::from_mode(0o000)).unwrap();
+    std::fs::set_permissions(
+        w.root.join("run"),
+        std::os::unix::fs::PermissionsExt::from_mode(0o500),
+    )
+    .unwrap();
+    ws.remove(&w).unwrap();
+    assert!(!w.root.exists());
+}
+
+#[test]
+fn an_existing_clone_must_come_from_the_same_seed() {
+    let b = &backends(&common_home())[0];
+    let f = fixture();
+    let ws = f.workspaces(&b.fw(&f));
+    ws.ensure_clone("github:example/repo", Some(f.dir.to_str().unwrap()))
+        .unwrap();
+    // the same place by another spelling is the same
+    let spelled = format!("{}/./", f.dir.display());
+    ws.ensure_clone("github:example/repo", Some(&spelled))
+        .unwrap();
+    let other = f.root.join("other");
+    std::fs::create_dir_all(&other).unwrap();
+    f.git(&other, &["init", "-q", "-b", "main"]);
+    for seed in [Some(other.to_str().unwrap()), None] {
+        let e = ws.ensure_clone("github:example/repo", seed).unwrap_err();
+        assert_eq!(e.code, ErrorCode::Conflict, "{seed:?}");
+    }
+    // an empty clone is not a clone of a seed either
+    ws.ensure_clone("github:example/empty", None).unwrap();
+    let e = ws
+        .ensure_clone("github:example/empty", Some(f.dir.to_str().unwrap()))
+        .unwrap_err();
+    assert_eq!(e.code, ErrorCode::Conflict);
+}
+
+#[test]
+fn in_place_wants_the_top_of_a_worktree_inside_which_the_cwd_stays() {
+    let b = &backends(&common_home())[0];
+    let f = fixture();
+    let ws = f.workspaces(&b.fw(&f));
+    // not a Git worktree
+    let plain = f.root.join("plain");
+    std::fs::create_dir_all(&plain).unwrap();
+    let e = ws.open_in_place(&plain, Path::new(""), true).unwrap_err();
+    assert_eq!(e.code, ErrorCode::InvalidInput);
+    // inside one, not its top
+    let e = ws
+        .open_in_place(&f.dir.join("pkg"), Path::new(""), true)
+        .unwrap_err();
+    assert_eq!(e.code, ErrorCode::InvalidInput);
+    // the home directory (from the env map) is not a project
+    let home = f.root.join("home");
+    f.git(&home, &["init", "-q", "-b", "main"]);
+    let e = ws.open_in_place(&home, Path::new(""), true).unwrap_err();
+    assert!(e.message.contains("project directory"), "{}", e.message);
+    // a working directory that is a link out of the worktree
+    let outside = f.root.join("outside");
+    std::fs::create_dir_all(&outside).unwrap();
+    std::os::unix::fs::symlink(&outside, f.dir.join("escape")).unwrap();
+    let e = ws
+        .open_in_place(&f.dir, Path::new("escape"), true)
+        .unwrap_err();
+    assert_eq!(e.code, ErrorCode::InvalidInput);
+    // a link that stays inside resolves
+    std::os::unix::fs::symlink("pkg", f.dir.join("inside")).unwrap();
+    let w = ws.open_in_place(&f.dir, Path::new("inside"), true).unwrap();
+    assert_eq!(w.cwd, w.root.join("pkg"));
+    // a file is not a working directory
+    let e = ws
+        .open_in_place(&f.dir, Path::new("a.txt"), true)
+        .unwrap_err();
+    assert_eq!(e.code, ErrorCode::NotFound);
+}
+
+/// `fast-worktree add` for the fairness test: slow, as an `npm ci` is.
+struct Slow(Arc<dyn FastWorktree>);
+
+impl FastWorktree for Slow {
+    fn add(&self, repo: &Path, dest: &Path, branch: &str, start: &str) -> Result<(), FwFailure> {
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        self.0.add(repo, dest, branch, start)
+    }
+    fn remove(&self, repo: &Path, path: &Path) -> Result<(), FwFailure> {
+        self.0.remove(repo, path)
+    }
+}
+
+#[test]
+fn adds_of_one_commit_do_not_starve_an_add_of_another() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let b = &backends(&common_home())[0];
+    let f = fixture();
+    let store = Arc::new(f.store());
+    let first = f.git(&f.dir, &["rev-parse", "HEAD"]);
+    let second = f.commit("second.txt", "two\n");
+    let m1 = f.capture_commit(&store, &first);
+    let m2 = f.capture_commit(&store, &second);
+    {
+        let ws = f.workspaces(&b.fw(&f));
+        let repo = f.clone_of(&ws);
+        f.deliver(&store, &repo, &m1);
+        f.deliver(&store, &repo, &m2);
+        // the checkout starts at the first commit
+        let w = ws
+            .create(&AttemptId::generate(), &store, &m1, Some(&repo))
+            .unwrap();
+        ws.remove(&w).unwrap();
+    }
+    let slow: Arc<dyn FastWorktree> = Arc::new(Slow(b.fw(&f)));
+    let stop = AtomicBool::new(false);
+    let waited = std::thread::scope(|s| {
+        for _ in 0..4 {
+            let (f, store, slow, m1, stop) = (&f, &store, &slow, &m1, &stop);
+            s.spawn(move || {
+                let started = std::time::Instant::now();
+                while !stop.load(Ordering::SeqCst) && started.elapsed().as_secs() < 40 {
+                    let ws = Workspaces::new(f.state.clone(), f.env(), slow.clone());
+                    let repo = f.clone_of(&ws);
+                    let w = ws
+                        .create(&AttemptId::generate(), store, m1, Some(&repo))
+                        .unwrap();
+                    ws.remove(&w).unwrap();
+                }
+            });
+        }
+        std::thread::sleep(std::time::Duration::from_millis(400));
+        let ws = Workspaces::new(f.state.clone(), f.env(), slow.clone());
+        let repo = f.clone_of(&ws);
+        let t = std::time::Instant::now();
+        let w = ws
+            .create(&AttemptId::generate(), &store, &m2, Some(&repo))
+            .unwrap();
+        let waited = t.elapsed();
+        stop.store(true, Ordering::SeqCst);
+        assert!(w.root.join("second.txt").exists());
+        ws.remove(&w).unwrap();
+        waited
+    });
+    assert!(
+        waited.as_secs() < 15,
+        "an add of another commit waited {waited:?} behind adds of the first"
+    );
+}
+
+// ---- the real command's wrapper, with scripts in its place -------------
+
+fn script_env(f: &Fixture, bin: &Path) -> BTreeMap<String, String> {
+    let mut e = f.env();
+    e.insert("PATH".into(), format!("{}:/usr/bin:/bin", bin.display()));
+    e
+}
+
+fn fake_tool(f: &Fixture, body: &str) -> (PathBuf, BTreeMap<String, String>) {
+    let bin = f.root.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let path = bin.join("fast-worktree");
+    std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
+    std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    let env = script_env(f, &bin);
+    (bin, env)
+}
+
+#[test]
+fn a_flood_of_output_is_kept_to_its_tail() {
+    let f = fixture();
+    let (_bin, env) = fake_tool(
+        &f,
+        "yes 0123456789 | head -c 30000000 >&2\necho THE-END-MARKER >&2\nexit 3",
+    );
+    let fw = CliFastWorktree::new(env);
+    let started = std::time::Instant::now();
+    let e = fw.add(&f.dir, &f.root.join("d"), "b", "c").unwrap_err();
+    let FwFailure::Failed { code, stderr } = e else {
+        panic!("{e:?}")
+    };
+    assert_eq!(code, Some(3));
+    assert!(stderr.len() < 200_000, "{} bytes kept", stderr.len());
+    assert!(stderr.contains("THE-END-MARKER"));
+    assert!(stderr.contains("earlier output dropped"));
+    assert!(started.elapsed().as_secs() < 60);
+}
+
+fn alive(pid: &str) -> bool {
+    Command::new("kill")
+        .args(["-0", pid])
+        .output()
+        .unwrap()
+        .status
+        .success()
+}
+
+#[test]
+fn a_hook_that_never_ends_is_killed_with_its_children() {
+    let f = fixture();
+    let pidfile = f.root.join("child.pid");
+    let (_bin, env) = fake_tool(
+        &f,
+        &format!(
+            "echo starting >&2\nsleep 300 &\necho $! > '{}'\nwait",
+            pidfile.display()
+        ),
+    );
+    let fw = CliFastWorktree::with_timeout(env, std::time::Duration::from_secs(1));
+    let started = std::time::Instant::now();
+    let e = fw.add(&f.dir, &f.root.join("d"), "b", "c").unwrap_err();
+    assert!(started.elapsed().as_secs() < 30);
+    let FwFailure::TimedOut { secs, stderr } = e else {
+        panic!("{e:?}")
+    };
+    assert_eq!(secs, 1);
+    assert!(stderr.contains("starting"));
+    let pid = std::fs::read_to_string(&pidfile)
+        .unwrap()
+        .trim()
+        .to_string();
+    for _ in 0..100 {
+        if !alive(&pid) {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    panic!("the hook's child {pid} is still running");
+}
+
+#[test]
+fn an_environment_without_home_or_path_is_named() {
+    let f = fixture();
+    for drop_key in ["HOME", "PATH"] {
+        let mut env = f.env();
+        env.remove(drop_key);
+        let fw = CliFastWorktree::new(env);
+        let e = fw.remove(&f.dir, &f.root.join("d")).unwrap_err();
+        assert_eq!(
+            e,
+            FwFailure::NoEnv {
+                missing: vec![drop_key.to_string()]
+            }
+        );
+    }
+}
+
+#[test]
+fn a_tool_that_succeeds_and_one_that_writes_only_to_stdout() {
+    let f = fixture();
+    let (_bin, env) = fake_tool(&f, "echo fine");
+    assert!(CliFastWorktree::new(env).remove(&f.dir, &f.root).is_ok());
+    let (_bin, env) = fake_tool(&f, "echo only-on-stdout\nexit 2");
+    let e = CliFastWorktree::new(env)
+        .remove(&f.dir, &f.root)
+        .unwrap_err();
+    assert_eq!(
+        e,
+        FwFailure::Failed {
+            code: Some(2),
+            stderr: "only-on-stdout\n".into()
+        }
+    );
+    // a directory that does not exist is not "not installed"
+    let (_bin, env) = fake_tool(&f, "exit 0");
+    let e = CliFastWorktree::new(env)
+        .remove(&f.root.join("nope"), &f.root)
+        .unwrap_err();
+    assert!(matches!(e, FwFailure::Failed { code: None, .. }), "{e:?}");
 }

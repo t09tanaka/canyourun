@@ -49,8 +49,9 @@ pub enum Flavor {
     Directory,
 }
 
-fn is_hex40(s: &str) -> bool {
-    s.len() == 40 && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+/// A Git commit id: 40 hex digits (SHA-1) or 64 (SHA-256 repositories).
+pub fn is_commit_id(s: &str) -> bool {
+    matches!(s.len(), 40 | 64) && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
 /// A source with an execution commit is a Git source and needs the repository
@@ -62,7 +63,7 @@ pub fn flavor_of(
     let Some(commit) = execution_commit else {
         return Ok(Flavor::Directory);
     };
-    if !is_hex40(commit) {
+    if !is_commit_id(commit) {
         return Err(ApiError::new(
             ErrorCode::InvalidInput,
             format!("the execution commit {commit:?} is not a commit id"),
@@ -99,12 +100,15 @@ fn overlaps(a: &Path, b: &Path) -> bool {
 }
 
 /// `exec --in-place` runs in the user's own worktree: only on the parent's
-/// local worker, only in an absolute directory, and never where the runner
-/// keeps its own state (a run there could rewrite what the runner trusts).
+/// local worker, only in an absolute directory that is neither the file
+/// system root nor the user's home (`home`, canonical, from the env map the
+/// caller holds), and never where the runner keeps its own state (a run there
+/// could rewrite what the runner trusts).
 pub fn check_in_place(
     dir: &Path,
     cwd_relative: &Path,
     state_dir: &Path,
+    home: Option<&Path>,
     parent_local: bool,
 ) -> Result<(), ApiError> {
     if !parent_local {
@@ -117,6 +121,12 @@ pub fn check_in_place(
         return Err(ApiError::new(
             ErrorCode::InvalidInput,
             format!("--in-place needs an absolute directory, got {dir:?}"),
+        ));
+    }
+    if dir.parent().is_none() || home == Some(dir) {
+        return Err(ApiError::new(
+            ErrorCode::InvalidInput,
+            format!("--in-place needs a project directory, not {dir:?}"),
         ));
     }
     check_cwd_relative(cwd_relative)?;
@@ -150,6 +160,125 @@ pub fn check_owned(workspaces_root: &Path, path: &Path) -> Result<AttemptId, Api
     AttemptId::parse(name).map_err(|_| refuse())
 }
 
+/// The clone a worktree belongs to, from the content of the worktree's `.git`
+/// file (`gitdir: <clone>/.git/worktrees/<name>`): `None` unless it has
+/// exactly that shape with an absolute path of plain components.
+pub fn gitdir_clone(content: &str) -> Option<PathBuf> {
+    let line = content.lines().next()?;
+    let p = Path::new(line.strip_prefix("gitdir: ")?.trim());
+    let plain = p
+        .components()
+        .all(|c| matches!(c, Component::RootDir | Component::Normal(_)));
+    if !p.is_absolute() || !plain {
+        return None;
+    }
+    let admin = p.parent()?;
+    let dotgit = admin.parent()?;
+    if admin.file_name()? != "worktrees" || dotgit.file_name()? != ".git" {
+        return None;
+    }
+    Some(dotgit.parent()?.to_path_buf())
+}
+
+/// The record of a worktree workspace says where its clone is and which
+/// branch to drop; both are used to run Git, so a record that does not match
+/// what [`Workspaces::create`] makes (a clone directly under the clones root,
+/// the attempt's own branch) is refused.
+pub fn check_worktree_record(
+    clones_root: &Path,
+    clone: &Path,
+    branch: &str,
+    attempt: &AttemptId,
+) -> Result<(), ApiError> {
+    let is_clone = clone.parent() == Some(clones_root)
+        && clone
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.starts_with("r-"));
+    if !is_clone || branch != branch_name(attempt) {
+        return Err(ApiError::new(
+            ErrorCode::InvalidInput,
+            format!(
+                "the record of {attempt} (clone {clone:?}, branch {branch:?}) is not one made here"
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// Whether `git worktree list --porcelain` output lists a worktree of
+/// `attempt` directly under one of `roots` (the workspaces root as written and
+/// as resolved: Git prints whichever it recorded).
+pub fn registered_for(list: &str, roots: &[PathBuf], attempt: &AttemptId) -> bool {
+    list.lines()
+        .filter_map(|l| l.strip_prefix("worktree "))
+        .map(Path::new)
+        .any(|p| {
+            p.file_name().is_some_and(|n| n == attempt.as_str())
+                && p.parent().is_some_and(|d| roots.iter().any(|r| r == d))
+        })
+}
+
+/// What an entry of the workspaces directory is.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Entry {
+    /// An attempt's workspace.
+    Attempt(AttemptId),
+    /// A scratch directory of a create (`.staging.*`, `.clone.*`).
+    Scratch,
+    /// Not ours: left alone.
+    Foreign,
+}
+
+pub fn classify_entry(name: &str) -> Entry {
+    if name.starts_with(".staging.") || name.starts_with(".clone.") {
+        Entry::Scratch
+    } else {
+        AttemptId::parse(name).map_or(Entry::Foreign, Entry::Attempt)
+    }
+}
+
+/// The last `cap` bytes of a stream: a tool's output is kept in bounded
+/// memory, the end being where its failure is reported.
+#[derive(Debug)]
+pub struct Tail {
+    cap: usize,
+    buf: Vec<u8>,
+    cut: bool,
+}
+
+impl Tail {
+    pub fn new(cap: usize) -> Self {
+        Tail {
+            cap,
+            buf: Vec::new(),
+            cut: false,
+        }
+    }
+
+    pub fn push(&mut self, data: &[u8]) {
+        self.buf.extend_from_slice(data);
+        if self.buf.len() > self.cap {
+            let over = self.buf.len() - self.cap;
+            self.buf.drain(..over);
+            self.cut = true;
+        }
+    }
+
+    pub fn text(&self) -> String {
+        let t = String::from_utf8_lossy(&self.buf);
+        if self.cut {
+            format!("[earlier output dropped] {t}")
+        } else {
+            t.into_owned()
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.buf.is_empty()
+    }
+}
+
 /// Why a `fast-worktree` call did not work.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FwFailure {
@@ -157,6 +286,12 @@ pub enum FwFailure {
     Missing,
     /// It ran and failed (`None`: killed by a signal).
     Failed { code: Option<i32>, stderr: String },
+    /// It ran longer than the caller allowed and was killed (its whole
+    /// process group); `stderr` is the tail of what it had said.
+    TimedOut { secs: u64, stderr: String },
+    /// The environment map the caller gave lacks something it cannot run
+    /// without (the process's own environment is never consulted).
+    NoEnv { missing: Vec<String> },
 }
 
 /// A missing or failing `fast-worktree` is an environment mismatch: the
@@ -172,6 +307,14 @@ pub fn fw_error(op: &str, f: &FwFailure) -> ApiError {
             let code = code.map_or("signal".to_string(), |c| c.to_string());
             format!("fast-worktree {op} failed ({code}): {tail}")
         }
+        FwFailure::TimedOut { secs, stderr } => {
+            let tail: String = stderr.trim().chars().take(MAX_STDERR_CHARS).collect();
+            format!("fast-worktree {op} timed out after {secs}s: {tail}")
+        }
+        FwFailure::NoEnv { missing } => format!(
+            "fast-worktree {op}: the environment given to it has no {} (the caller passes HOME, PATH and whatever the project's hooks read, such as NPM_CONFIG_* and PORTOOL_*)",
+            missing.join(", ")
+        ),
     };
     ApiError::blocked(BlockedReason::EnvironmentMismatch, msg)
 }
@@ -222,6 +365,11 @@ mod tests {
             let e = flavor_of(Some(bad), Some("r")).unwrap_err();
             assert_eq!(e.code, ErrorCode::InvalidInput, "{bad}");
         }
+        // a SHA-256 repository's commit id
+        let long = "ab".repeat(32);
+        assert!(flavor_of(Some(&long), Some("r")).is_ok());
+        assert!(flavor_of(Some(&long[..63]), Some("r")).is_err());
+        assert!(flavor_of(Some(&format!("{long}0")), Some("r")).is_err());
         let g = format!("g{}", &C[1..]);
         assert!(flavor_of(Some(&g), Some("r")).is_err());
         for none in [None, Some("")] {
@@ -244,7 +392,23 @@ mod tests {
     #[test]
     fn in_place_rules() {
         let st = Path::new("/home/u/.state");
-        let ok = |d: &str, c: &str, local| check_in_place(Path::new(d), Path::new(c), st, local);
+        let home = Path::new("/home/u");
+        let ok = |d: &str, c: &str, local| {
+            check_in_place(
+                Path::new(d),
+                Path::new(c),
+                st,
+                Some(Path::new("/home/h")),
+                local,
+            )
+        };
+        // the home directory and the root are not project directories
+        let e = check_in_place(home, Path::new(""), Path::new("/s"), Some(home), true).unwrap_err();
+        assert!(e.message.contains("project directory"), "{}", e.message);
+        assert!(check_in_place(home, Path::new(""), Path::new("/s"), None, true).is_ok());
+        let e =
+            check_in_place(Path::new("/"), Path::new(""), Path::new("/s"), None, true).unwrap_err();
+        assert!(e.message.contains("project directory"), "{}", e.message);
         assert!(ok("/home/u/work", "pkg", true).is_ok());
         assert!(ok("/home/u/work", "", true).is_ok());
         let e = ok("/home/u/work", "", false).unwrap_err();
@@ -308,6 +472,27 @@ mod tests {
             "{}",
             f.message
         );
+        let t = fw_error(
+            "add",
+            &FwFailure::TimedOut {
+                secs: 30,
+                stderr: " hung\n".into(),
+            },
+        );
+        assert_eq!(t.blocked_reason, Some(BlockedReason::EnvironmentMismatch));
+        assert!(
+            t.message.contains("add timed out after 30s: hung"),
+            "{}",
+            t.message
+        );
+        let n = fw_error(
+            "add",
+            &FwFailure::NoEnv {
+                missing: vec!["HOME".into(), "PATH".into()],
+            },
+        );
+        assert_eq!(n.blocked_reason, Some(BlockedReason::EnvironmentMismatch));
+        assert!(n.message.contains("no HOME, PATH"), "{}", n.message);
         let s = fw_error(
             "add",
             &FwFailure::Failed {
@@ -320,5 +505,89 @@ mod tests {
             s.message.chars().filter(|c| *c == 'x').count(),
             MAX_STDERR_CHARS
         );
+    }
+
+    #[test]
+    fn a_worktree_file_names_its_clone() {
+        let g = |c: &str| gitdir_clone(c);
+        assert_eq!(
+            g("gitdir: /s/clones/r-1/.git/worktrees/att_x\n"),
+            Some(PathBuf::from("/s/clones/r-1"))
+        );
+        for bad in [
+            "",
+            "ref: x",
+            "gitdir: rel/.git/worktrees/a",
+            "gitdir: /s/../x/.git/worktrees/a",
+            "gitdir: /s/c/.git/other/a",
+            "gitdir: /s/c/notgit/worktrees/a",
+            "gitdir: /worktrees",
+            "gitdir: /",
+        ] {
+            assert_eq!(g(bad), None, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn a_worktree_record_must_be_one_made_here() {
+        let cl = Path::new("/s/clones");
+        let a = att();
+        assert!(check_worktree_record(cl, &cl.join("r-ab"), &branch_name(&a), &a).is_ok());
+        for (clone, branch) in [
+            (PathBuf::from("/elsewhere/r-ab"), branch_name(&a)),
+            (cl.join("x/r-ab"), branch_name(&a)),
+            (cl.join("other"), branch_name(&a)),
+            (cl.to_path_buf(), branch_name(&a)),
+            (cl.join("r-ab"), "main".to_string()),
+            (
+                cl.join("r-ab"),
+                "rtr/att_01J0000000000000000000000B".to_string(),
+            ),
+        ] {
+            let e = check_worktree_record(cl, &clone, &branch, &a).unwrap_err();
+            assert_eq!(e.code, ErrorCode::InvalidInput, "{clone:?} {branch}");
+        }
+    }
+
+    #[test]
+    fn registrations_are_matched_by_directory_and_attempt() {
+        let a = att();
+        let roots = [PathBuf::from("/s/ws"), PathBuf::from("/private/s/ws")];
+        let list =
+            format!("worktree /s/clones/r-1\nHEAD abc\n\nworktree /private/s/ws/{a}\nHEAD abc\n");
+        assert!(registered_for(&list, &roots, &a));
+        assert!(!registered_for(&list, &roots[..1], &a));
+        let other = AttemptId::parse("att_01J0000000000000000000000B").unwrap();
+        assert!(!registered_for(&list, &roots, &other));
+        assert!(!registered_for(&format!("worktree /x/{a}\n"), &roots, &a));
+        assert!(!registered_for("", &roots, &a));
+    }
+
+    #[test]
+    fn entries_of_the_workspaces_directory() {
+        assert_eq!(
+            classify_entry("att_01J0000000000000000000000A"),
+            Entry::Attempt(att())
+        );
+        assert_eq!(classify_entry(".staging.x1"), Entry::Scratch);
+        assert_eq!(classify_entry(".clone.x1"), Entry::Scratch);
+        assert_eq!(classify_entry("notes.txt"), Entry::Foreign);
+        assert_eq!(classify_entry("att_short"), Entry::Foreign);
+    }
+
+    #[test]
+    fn a_tail_keeps_the_end() {
+        let mut exact = Tail::new(5);
+        exact.push(b"12345");
+        assert_eq!(exact.text(), "12345");
+        let mut t = Tail::new(5);
+        assert!(t.is_empty());
+        t.push(b"abc");
+        assert_eq!(t.text(), "abc");
+        assert!(!t.is_empty());
+        t.push(b"defgh");
+        assert_eq!(t.text(), "[earlier output dropped] defgh");
+        t.push(b"i");
+        assert_eq!(t.text(), "[earlier output dropped] efghi");
     }
 }
