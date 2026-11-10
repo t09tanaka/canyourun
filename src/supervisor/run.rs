@@ -685,13 +685,6 @@ impl Control<'_> {
                 w.noted = true;
             }
         }
-        self.heartbeat()?;
-        if w.reason.is_none() && self.beat.failure.is_some() {
-            // The output can no longer be stored: the command is stopped
-            // rather than left to run with its output lost.
-            w.reason = Some(StopReason::SpoolFailed);
-            self.begin_stop(StopReason::SpoolFailed)?;
-        }
         if w.reason.is_none() {
             let stage = timeouts::Stage::Running {
                 since_ms: run_since,
@@ -700,6 +693,15 @@ impl Control<'_> {
             if let Some(r) = w.reason {
                 self.begin_stop(r)?;
             }
+        }
+        // After the look: a database too busy for the positions must not
+        // keep a cancel or an expired lease from being seen.
+        self.heartbeat()?;
+        if w.reason.is_none() && self.beat.failure.is_some() {
+            // The output can no longer be stored: the command is stopped
+            // rather than left to run with its output lost.
+            w.reason = Some(StopReason::SpoolFailed);
+            self.begin_stop(StopReason::SpoolFailed)?;
         }
         Ok(())
     }

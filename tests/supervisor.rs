@@ -393,7 +393,9 @@ fn each_heartbeat_publishes_the_output_and_advances_the_stored_position() {
             .written_bytes
     };
     wait_for("the first output to be stored", || written() == 3);
-    assert_eq!(f.state(), AttemptState::Active);
+    wait_for("the command to be shown as running", || {
+        f.state() == AttemptState::Active
+    });
     assert_eq!(f.output(), "one");
     let seq = reader.log_position(f.attempt(), "stdout").unwrap().last_seq;
     std::fs::write(&go, b"").unwrap();

@@ -1611,6 +1611,7 @@ fn an_index_scan_over_any_sixteen_bytes_keeps_a_valid_prefix() {
 
 use super::pump::{pump, Pipe};
 use super::run::{settle, SpoolBeat};
+use std::os::unix::fs::OpenOptionsExt;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
@@ -1742,7 +1743,24 @@ fn the_heartbeat_records_a_spool_failure_once_and_is_not_an_error() {
     assert!(beat.failure.is_none());
 }
 
-/// Run the pump against writers in this process (threads), as a command's
+/// Write all of `data` to a pipe opened without blocking, within a bound: a
+/// reader that died must fail the test, not hang it.
+fn write_bounded(mut out: fs::File, data: &[u8]) {
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let mut rest = data;
+    while !rest.is_empty() {
+        match out.write(rest) {
+            Ok(n) => rest = &rest[n..],
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                assert!(std::time::Instant::now() < until, "nobody reads the pipe");
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            Err(e) => panic!("{e}"),
+        }
+    }
+}
+
+/// Run the pump against a writer in this process, as a command's
 /// descriptors would write.
 fn pumped(s: &AttemptSpool, pipe: &Pipe, write: impl FnOnce(fs::File) + Send) -> Option<String> {
     let done = AtomicBool::new(false);
@@ -1751,6 +1769,7 @@ fn pumped(s: &AttemptSpool, pipe: &Pipe, write: impl FnOnce(fs::File) + Send) ->
         let feeder = sc.spawn(|| pump(pipe, s.writer(Stdout), &done, &error));
         let out = fs::OpenOptions::new()
             .append(true)
+            .custom_flags(libc::O_NONBLOCK)
             .open(pipe.path())
             .unwrap();
         write(out);
@@ -1767,7 +1786,7 @@ fn the_pump_carries_everything_written_before_the_end() {
     let pipe = Pipe::open(&path).unwrap();
     // More than a pipe holds: the writer only gets through if it is read.
     let data = pattern(0, 600_000);
-    let err = pumped(&s, &pipe, |mut out| out.write_all(&data).unwrap());
+    let err = pumped(&s, &pipe, |out| write_bounded(out, &data));
     assert_eq!(err, None);
     s.finish().unwrap();
     let r = SpoolReader::open(dir.path(), &a).unwrap();
@@ -1782,7 +1801,7 @@ fn the_pump_keeps_reading_when_the_spool_is_full_or_has_failed() {
     let (_d, a, s) = spool(10);
     let pipe = Pipe::open(&Pipe::path_for(_d.path(), &a, 0)).unwrap();
     let data = pattern(0, 300_000);
-    assert_eq!(pumped(&s, &pipe, |mut o| o.write_all(&data).unwrap()), None);
+    assert_eq!(pumped(&s, &pipe, |o| write_bounded(o, &data)), None);
     let st = s.writer(Stdout).status();
     assert_eq!((st.end, st.dropped), (10, 299_990));
 
@@ -1790,7 +1809,7 @@ fn the_pump_keeps_reading_when_the_spool_is_full_or_has_failed() {
     let (_d, a, s) = spool(BIG);
     let pipe = Pipe::open(&Pipe::path_for(_d.path(), &a, 3)).unwrap();
     s.writer(Stdout).poison();
-    let err = pumped(&s, &pipe, |mut o| o.write_all(&data).unwrap());
+    let err = pumped(&s, &pipe, |o| write_bounded(o, &data));
     assert!(err.is_some_and(|e| e.contains("spool")));
 }
 
