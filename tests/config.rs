@@ -19,6 +19,7 @@ schema_version = 1
 
 [coordinator]
 local_worker = true
+local_worker_priority = -1
 heartbeat_seconds = 5
 lease_seconds = 60
 
@@ -26,11 +27,13 @@ lease_seconds = 60
 strategy = "earliest_finish"
 forecast_ttl_ms = 2000
 prefetch_per_worker = 1
+priority_step_seconds = 60
 
 [[workers]]
 id = "mini-a"
 ssh = "ci@mini-a.local"
 service_mode = "user"
+priority = 10
 labels = ["macos", "arm64", "node"]
 
 [[workers]]
@@ -318,7 +321,7 @@ fn entries_list_every_value_with_its_origin() {
     assert_eq!(get("execution.timeout_seconds").value, "3600");
     assert_eq!(get("toolchain.match").value, "exact");
     assert_eq!(get("ci.unsupported").value, "error");
-    assert_eq!(e.len(), 24);
+    assert_eq!(e.len(), 26);
     assert_eq!(get("ci.no_cache").value, "[]");
     let none = run(None, None, None, &Overlay::default())
         .unwrap()
@@ -1124,4 +1127,86 @@ fn unsupported_legacy_keys_become_notices_only_when_set() {
         .unwrap()
         .notices
         .is_empty());
+}
+
+// ---- worker priority -------------------------------------------------------
+
+#[test]
+fn priority_defaults_and_origins() {
+    let d = Origin::Default;
+    let r = run(None, None, None, &Overlay::default()).unwrap();
+    assert_eq!(r.local_worker_priority, v(0, d.clone()));
+    assert_eq!(r.priority_step_seconds, v(60, d.clone()));
+    let none = r.entries();
+    let g = |k: &str| none.iter().find(|x| x.key == k).unwrap().clone();
+    assert_eq!(g("coordinator.local_worker_priority").value, "0");
+    assert_eq!(g("scheduler.priority_step_seconds").value, "60");
+
+    let u = Origin::User("/u/config.toml".into());
+    let r = run(Some(USER_EXAMPLE), None, None, &Overlay::default()).unwrap();
+    assert_eq!(r.local_worker_priority, v(-1, u.clone()));
+    assert_eq!(r.priority_step_seconds, v(60, u.clone()));
+    assert_eq!(r.workers[0].priority, v(10, u.clone()));
+    // unset on a worker: the default, with the default origin
+    assert_eq!(r.workers[1].priority, v(0, d.clone()));
+    assert_eq!(r.workers[2].priority, v(0, d));
+    let e = r.entries();
+    let g = |k: &str| e.iter().find(|x| x.key == k).unwrap().clone();
+    assert_eq!(g("coordinator.local_worker_priority").value, "-1");
+    assert_eq!(g("coordinator.local_worker_priority").origin, u);
+}
+
+#[test]
+fn priority_bounds() {
+    let w = |p: i64, extra: &str| {
+        format!(
+            "schema_version = 1\n{extra}\n[[workers]]\nid = \"w\"\nssh = \"h\"\npriority = {p}\n"
+        )
+    };
+    for ok in [-100, 0, 100] {
+        run(Some(&w(ok, "")), None, None, &Overlay::default()).unwrap();
+    }
+    for bad in [-101, 101, i64::MAX] {
+        let p = problems(run(Some(&w(bad, "")), None, None, &Overlay::default()));
+        assert!(
+            p.iter().any(|m| m.starts_with(&format!(
+                "worker \"w\": priority = {bad} (user config /u/config.toml) must be between -100 and 100"
+            ))),
+            "{p:?}"
+        );
+    }
+    for ok in [-100, 100] {
+        let t = format!("schema_version = 1\n[coordinator]\nlocal_worker_priority = {ok}\n");
+        run(Some(&t), None, None, &Overlay::default()).unwrap();
+    }
+    for bad in [-101, 101] {
+        let t = format!("schema_version = 1\n[coordinator]\nlocal_worker_priority = {bad}\n");
+        let p = problems(run(Some(&t), None, None, &Overlay::default()));
+        assert!(p
+            .iter()
+            .any(|m| m.starts_with(&format!("local_worker_priority = {bad} ("))));
+    }
+    for ok in [0, 3600] {
+        let t = format!("schema_version = 1\n[scheduler]\npriority_step_seconds = {ok}\n");
+        run(Some(&t), None, None, &Overlay::default()).unwrap();
+    }
+    let t = "schema_version = 1\n[scheduler]\npriority_step_seconds = 3601\n";
+    let p = problems(run(Some(t), None, None, &Overlay::default()));
+    assert!(p
+        .iter()
+        .any(|m| m.starts_with("priority_step_seconds = 3601 (") && m.contains("at most 3600")));
+}
+
+#[test]
+fn priority_wrong_types_and_unknown_keys_are_errors() {
+    for t in [
+        "schema_version = 1\n[scheduler]\npriority_step_seconds = -1\n",
+        "schema_version = 1\n[scheduler]\npriority_step_seconds = \"60\"\n",
+        "schema_version = 1\n[coordinator]\nlocal_worker_priority = 1.5\n",
+        "schema_version = 1\n[[workers]]\nid = \"w\"\nssh = \"h\"\npriority = \"high\"\n",
+        "schema_version = 1\n[[workers]]\nid = \"w\"\nssh = \"h\"\npriorty = 1\n",
+        "schema_version = 1\n[scheduler]\npriority_step = 1\n",
+    ] {
+        assert!(parse_user("/u/config.toml", t).is_err(), "{t}");
+    }
 }
