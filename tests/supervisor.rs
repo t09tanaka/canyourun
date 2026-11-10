@@ -18,6 +18,9 @@ use std::time::{Duration, Instant};
 use tempfile::TempDir;
 
 struct Fx {
+    /// Processes this test started that must not outlive it (they would write
+    /// into the directory while it is being removed): (pid, whole group).
+    strays: std::sync::Mutex<Vec<(i32, bool)>>,
     dir: TempDir,
     store: WorkerStore,
     spec: SuperviseSpec,
@@ -79,10 +82,39 @@ fn fx(nodes: Vec<NodeSpec>) -> Fx {
         deadline_ms: None,
         inhibit_sleep: false,
     };
-    Fx { dir, store, spec }
+    Fx {
+        strays: Default::default(),
+        dir,
+        store,
+        spec,
+    }
+}
+
+impl Drop for Fx {
+    fn drop(&mut self) {
+        let mut all = self.strays.lock().unwrap().clone();
+        let launched = self
+            .store
+            .launches(&self.spec.attempt_id)
+            .unwrap_or_default();
+        for (_, _, ident) in launched {
+            if let Some(i) = ident {
+                all.push((i.pid as i32, true));
+            }
+        }
+        for (pid, group) in all {
+            unsafe { libc::kill(if group { -pid } else { pid }, libc::SIGKILL) };
+        }
+    }
 }
 
 impl Fx {
+    fn track(&self, pid: u32) {
+        self.strays.lock().unwrap().push((pid as i32, false));
+    }
+    fn track_group(&self, pid: u32) {
+        self.strays.lock().unwrap().push((pid as i32, true));
+    }
     fn path(&self, name: &str) -> PathBuf {
         self.dir.path().join(name)
     }
@@ -614,6 +646,7 @@ fn the_supervisor_finishes_the_attempt_after_its_agent_is_killed() {
         .spawn()
         .unwrap();
     let agent_pid = agent.id() as i32;
+    f.track_group(agent.id());
     wait_for("the command to be running", || {
         f.store.get(f.attempt()).unwrap().unwrap().state == AttemptState::Active
     });
@@ -633,6 +666,7 @@ fn a_detached_supervisor_runs_without_its_parent_waiting() {
     let f = fx(vec![node("n", "exit 7")]);
     let spec_path = write_spec(&f, &f.spec);
     let mut child = spawn_detached(&exe(), &spec_path).unwrap();
+    f.track(child.id());
     let status = child.wait().unwrap();
     assert_eq!(status.code(), Some(code::SETTLED));
     assert_eq!(f.term().outcome(), Outcome::Failed);
@@ -648,6 +682,7 @@ fn a_killed_supervisor_leaves_the_command_for_recovery_to_stop() {
     spec.term_grace_ms = 300;
     let spec_path = write_spec(&f, &spec);
     let mut sup = spawn_detached(&exe(), &spec_path).unwrap();
+    f.track(sup.id());
     wait_for("the command to be running", || {
         read_pid(&leader).is_some() && read_pid(&bg).is_some() && f.state() == AttemptState::Active
     });
@@ -702,6 +737,7 @@ fn the_command_keeps_the_default_sighup_disposition() {
     let f = fx(vec![node("n", "kill -HUP $$; sleep 1; exit 0")]);
     let spec_path = write_spec(&f, &f.spec);
     let mut child = spawn_detached(&exe(), &spec_path).unwrap();
+    f.track(child.id());
     child.wait().unwrap();
     // Killed by the hang-up (the default), not ignoring it.
     assert_eq!(f.term().exit(), Some(Exit::Signal(libc::SIGHUP)));
@@ -712,6 +748,7 @@ fn the_supervisor_survives_a_hangup_and_finishes_the_attempt() {
     let f = fx(vec![node("n", "sleep 1.5; exit 0")]);
     let spec_path = write_spec(&f, &f.spec);
     let mut sup = spawn_detached(&exe(), &spec_path).unwrap();
+    f.track(sup.id());
     wait_for("the command to be running", || {
         f.state() == AttemptState::Active
     });
@@ -726,6 +763,7 @@ fn only_one_supervisor_may_hold_an_attempt() {
     let f = fx(vec![node("n", "sleep 2")]);
     let spec_path = write_spec(&f, &f.spec);
     let mut first = spawn_detached(&exe(), &spec_path).unwrap();
+    f.track(first.id());
     wait_for("the first supervisor to run", || {
         f.state() == AttemptState::Active
     });
