@@ -1610,7 +1610,7 @@ fn an_index_scan_over_any_sixteen_bytes_keeps_a_valid_prefix() {
 // ------------------------------------------------- the supervisor and the spool
 
 use super::pump::{pump, Pipe};
-use super::run::{settle, SpoolBeat};
+use super::run::{account_for_reader, settle, SpoolBeat};
 use crate::secrets::mask::Masker;
 use std::os::unix::fs::OpenOptionsExt;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -1742,6 +1742,50 @@ fn the_heartbeat_records_a_spool_failure_once_and_is_not_an_error() {
     let mut beat = SpoolBeat::default();
     assert!(beat.beat(&w.store, &unknown, &s, None).is_err());
     assert!(beat.failure.is_none());
+}
+
+#[test]
+fn a_reader_error_the_heartbeat_never_recorded_is_not_a_success() {
+    use super::termination::{after_output, termination};
+    let w = wk();
+    let a = accept(&w);
+    let s = AttemptSpool::open(&w.root, &a, BIG).unwrap();
+    s.writer(Stdout).append(b"partial").unwrap();
+    // The reader failed, and every heartbeat since was skipped (a busy
+    // database): nothing recorded it, and the command exited 0.
+    let beat = SpoolBeat::default();
+    let lost = account_for_reader(&w.store, &a, &beat, Some("read failed".into())).unwrap();
+    assert!(lost);
+    let ev = spool_failures(&w, &a);
+    assert_eq!(ev.len(), 1, "{ev:?}");
+    assert_eq!(
+        (&ev[0]["stage"], &ev[0]["error"]),
+        (&json!("write"), &json!("read failed"))
+    );
+    let exit = Some(crate::state::Exit::Code(0));
+    let term = termination(after_output(None, lost), exit);
+    let (t, here) = settle(&w.store, &w.root, &a, &s, term).unwrap();
+    assert!(here);
+    assert_eq!(t.outcome(), Outcome::Interrupted);
+    // The spool itself is whole: what it holds is described in a result.
+    let result = w.store.get_result(&a).unwrap().expect("a result");
+    assert_eq!(result["termination"]["outcome"], "interrupted");
+    assert_eq!(spool_failures(&w, &a).len(), 1);
+
+    // Recorded by the heartbeat already: not written a second time.
+    let b = accept(&w);
+    let s = AttemptSpool::open(&w.root, &b, BIG).unwrap();
+    let mut beat = SpoolBeat::default();
+    beat.beat(&w.store, &b, &s, Some("disk full".into()))
+        .unwrap();
+    assert!(account_for_reader(&w.store, &b, &beat, Some("disk full".into())).unwrap());
+    assert!(account_for_reader(&w.store, &b, &beat, None).unwrap());
+    assert_eq!(spool_failures(&w, &b).len(), 1);
+
+    // Nothing failed: nothing is written and nothing is lost.
+    let c = accept(&w);
+    assert!(!account_for_reader(&w.store, &c, &SpoolBeat::default(), None).unwrap());
+    assert!(spool_failures(&w, &c).is_empty());
 }
 
 /// Write all of `data` to a pipe opened without blocking, within a bound: a

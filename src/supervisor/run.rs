@@ -351,23 +351,76 @@ pub(crate) fn settle_without_spool(
 /// came between the two). The spool is closed or found closed, its files
 /// referenced and the result stored for the termination that holds. An
 /// attempt that has its result, or that was settled without its spool (it
-/// has a `spool_failed` event and no result by design), is left as it is.
+/// has a `spool_failed` event of the stage `open` or `finish`, the two
+/// [`settle_without_spool`] is called with, and no result by design), is
+/// left as it is. A `spool_failed` event of another stage (`write`, `pipe`)
+/// does not say that: such an attempt is settled through its spool, and a
+/// crash on the way is completed like any other.
+///
+/// A terminal attempt has no command left, so the FIFOs of its nodes are
+/// removed here as well.
 pub(crate) fn complete_terminal(
     spec: &SuperviseSpec,
     store: &WorkerStore,
     fixed: Termination,
 ) -> Result<()> {
     let attempt = &spec.attempt_id;
-    if store.get_result(attempt)?.is_some() || !store.events_of(attempt, "spool_failed")?.is_empty()
-    {
+    let root = spec.spool_dir();
+    remove_fifos(spec);
+    let without_spool = store
+        .events_of(attempt, "spool_failed")?
+        .iter()
+        .any(|e| settled_without_spool_at(e.payload["stage"].as_str()));
+    if store.get_result(attempt)?.is_some() || without_spool {
         return Ok(());
     }
-    let root = spec.spool_dir();
     match open_spool(spec, store)? {
         Ok(spool) => settle(store, &root, attempt, spool.end(), fixed)?,
         Err(e) => settle_without_spool(store, &root, attempt, "open", &e.to_string(), fixed)?,
     };
     Ok(())
+}
+
+/// True for the stages of a `spool_failed` event that mean the attempt was
+/// settled without its spool.
+fn settled_without_spool_at(stage: Option<&str>) -> bool {
+    matches!(stage, Some("open" | "finish"))
+}
+
+/// Remove the FIFOs the attempt's nodes got their output through. Only when
+/// no command of the attempt is alive: they have no writer and no reader
+/// then. Best effort: one that stays goes with the attempt's directory.
+pub(crate) fn remove_fifos(spec: &SuperviseSpec) {
+    use std::os::unix::fs::FileTypeExt;
+    let root = spec.spool_dir();
+    for index in 0..spec.nodes.len() {
+        let path = Pipe::path_for(&root, &spec.attempt_id, index);
+        // Never anything but a FIFO: the name is ours, but a file found
+        // there is not removed on the name alone.
+        if std::fs::symlink_metadata(&path).is_ok_and(|m| m.file_type().is_fifo()) {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+}
+
+/// What the reader thread reported (`pump`) when the heartbeat did not get
+/// to record it (a busy database made it skip): the `spool_failed` event is
+/// written now, before the attempt is settled. Returns whether output was
+/// lost, by either account.
+pub(crate) fn account_for_reader(
+    store: &WorkerStore,
+    attempt: &AttemptId,
+    beat: &SpoolBeat,
+    pump: Option<String>,
+) -> Result<bool> {
+    match (&beat.failure, pump) {
+        (Some(_), _) => Ok(true),
+        (None, Some(why)) => {
+            note_spool_failure(store, attempt, "write", &why)?;
+            Ok(true)
+        }
+        (None, None) => Ok(false),
+    }
 }
 
 /// The spool side of the supervisor's heartbeat.
@@ -982,25 +1035,23 @@ pub fn run(spec: &SuperviseSpec) -> Result<Report> {
     let spool = match open_spool(spec, &store)? {
         Ok(Spool::Open(s)) => s,
         other => {
-            // Nothing is started without a place for its output; a spool
-            // that is closed before anything ran is not one.
-            let why = match other {
-                Err(e) => e.to_string(),
-                Ok(_) => SpoolError::Finished.to_string(),
-            };
+            // Nothing is started without a place for its output. A spool
+            // that is closed already was closed by a supervisor that died
+            // while settling this attempt before any command (a cancel
+            // before the start): the attempt is settled through it, which
+            // is no spool failure. Any other spool is settled without.
             let reason =
                 (rec.cancel_requested_at_ms.is_some() || rec.retired).then_some(StopReason::Cancel);
             if reason.is_some() {
                 move_to(&store, attempt, AttemptState::Cancelling)?;
             }
-            let (termination, finalized_here) = settle_without_spool(
-                &store,
-                &root,
-                attempt,
-                "open",
-                &why,
-                termination(reason, None),
-            )?;
+            let term = termination(reason, None);
+            let (termination, finalized_here) = match other {
+                Ok(closed) => settle(&store, &root, attempt, closed.end(), term)?,
+                Err(e) => {
+                    settle_without_spool(&store, &root, attempt, "open", &e.to_string(), term)?
+                }
+            };
             return Ok(Report {
                 termination: Some(termination),
                 finalized_here,
@@ -1048,10 +1099,9 @@ pub fn run(spec: &SuperviseSpec) -> Result<Report> {
             sleep_inhibit,
         );
     }
-    if let (Some(why), None) = (ctl.pump_failure(), &ctl.beat.failure) {
-        // The heartbeat that would have recorded it did not get through.
-        note_spool_failure(&store, attempt, "write", &why)?;
-    }
+    // The heartbeat that would have recorded a reader error may not have got
+    // through; `run_piped` made the stop reason of it already.
+    account_for_reader(&store, attempt, &ctl.beat, ctl.pump_failure())?;
     let term = termination(end.reason, end.exit);
     let (termination, finalized_here) = settle(&store, &root, attempt, &spool, term)?;
     Ok(Report {
@@ -1090,33 +1140,6 @@ mod tests {
         }));
         assert!(panicked.is_err());
         assert!(done.load(Ordering::SeqCst));
-    }
-
-    #[test]
-    fn the_done_flag_is_set_also_when_the_supervising_side_panics() {
-        // The thread that waits for the flag is joined by the scope: were
-        // the flag not set by the unwinding, this test would never return.
-        let done = AtomicBool::new(false);
-        let waited = AtomicBool::new(false);
-        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            std::thread::scope(|s| {
-                s.spawn(|| {
-                    while !done.load(Ordering::SeqCst) {
-                        std::thread::sleep(Duration::from_millis(1));
-                    }
-                    waited.store(true, Ordering::SeqCst);
-                });
-                let _over = SetOnDrop(&done);
-                assert!(!done.load(Ordering::SeqCst));
-                panic!("the command runner panicked");
-            })
-        }));
-        assert!(r.is_err());
-        assert!(waited.load(Ordering::SeqCst));
-        // The normal end sets it as well.
-        let flag = AtomicBool::new(false);
-        drop(SetOnDrop(&flag));
-        assert!(flag.load(Ordering::SeqCst));
     }
 
     #[test]

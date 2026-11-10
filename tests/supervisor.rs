@@ -569,7 +569,9 @@ fn a_secret_across_the_cut_of_a_long_warning_leaves_no_part_of_itself() {
     let ev = f.events(f.attempt(), "workspace_warning");
     assert_eq!(ev.len(), 3, "{ev:?}");
     let cut = ev[0]["message"].as_str().unwrap();
-    assert_eq!(cut, format!("{}***", "x".repeat(4091)));
+    // Masked whole, then cut at 4096 bytes: the mask and two bytes after it.
+    assert_eq!(cut.len(), 4096);
+    assert_eq!(cut, format!("{}*** a", "x".repeat(4091)));
     assert_eq!(ev[1]["message"], "token ***");
     assert_eq!(ev[2]["message"], "token ***");
     assert!(!format!("{ev:?}").contains("hunt"));
@@ -1106,6 +1108,100 @@ fn a_crash_before_the_spool_was_closed_is_completed_too() {
     let r = recover(&f.spec, &f.store).unwrap();
     assert_eq!((r.termination, r.finalized_here), (Some(cancelled), false));
     assert_settled_with_output(&f, 3);
+}
+
+#[test]
+fn a_crash_while_settling_after_a_write_failure_is_completed_too() {
+    // The reader failed (`spool_failed`, stage `write`), the supervisor
+    // settled through the spool all the same and died between fixing the
+    // termination and storing the result.
+    let f = fx(vec![node("n", "true")]);
+    let run_id = f.store.get(f.attempt()).unwrap().unwrap().run_id;
+    f.store
+        .append_event(
+            Some(&run_id),
+            Some(f.attempt()),
+            "spool_failed",
+            &serde_json::json!({ "stage": "write", "error": "read failed" }),
+            40,
+        )
+        .unwrap();
+    closed_spool(&f, b"partial");
+    f.store.add_blob_ref(&log_ref(&f), 50).unwrap();
+    f.store
+        .transition(f.attempt(), AttemptState::Finalizing, 51)
+        .unwrap();
+    let interrupted = remote_task_runner::state::Termination::new(
+        Outcome::Interrupted,
+        Some(Exit::Code(0)),
+        None,
+    )
+    .unwrap();
+    f.store.finalize(f.attempt(), interrupted, 52).unwrap();
+    assert!(f.store.get_result(f.attempt()).unwrap().is_none());
+    // That event does not say "settled without its spool": the result is
+    // stored by the next start.
+    let r = run(&f.spec).unwrap();
+    assert_eq!(
+        (r.termination, r.finalized_here),
+        (Some(interrupted), false)
+    );
+    let result = f.store.get_result(f.attempt()).unwrap().expect("a result");
+    assert_eq!(result["termination"]["outcome"], "interrupted");
+    assert_eq!(result["logs"]["stdout"]["bytes"], 7);
+    assert!(has_log_ref(&f));
+    assert_eq!(f.events(f.attempt(), "spool_failed").len(), 1);
+    let again = recover(&f.spec, &f.store).unwrap();
+    assert_eq!(again.termination, Some(interrupted));
+    assert_eq!(f.store.get_result(f.attempt()).unwrap(), Some(result));
+}
+
+#[test]
+fn a_closed_spool_of_an_attempt_that_never_launched_is_settled_through_it() {
+    // Cancelled before the start; the supervisor closed the (empty) spool and
+    // died before the reference, the termination and the result.
+    let f = fx(vec![node("n", "touch /nonexistent-dir/never")]);
+    f.store.cancel(f.attempt(), CoordinatorEpoch(1), 5).unwrap();
+    closed_spool(&f, b"");
+    let r = run(&f.spec).unwrap();
+    assert!(r.finalized_here);
+    assert_eq!(settled(&r).outcome(), Outcome::Cancelled);
+    assert_settled_with_output(&f, 0);
+    assert!(f.store.launches(f.attempt()).unwrap().is_empty());
+    let again = run(&f.spec).unwrap();
+    assert_eq!(
+        (again.termination, again.finalized_here),
+        (r.termination, false)
+    );
+
+    // The same without a cancel: nothing ran, so it is interrupted, and
+    // nothing is started for it now.
+    let f = fx(vec![node("n", "touch /nonexistent-dir/never")]);
+    closed_spool(&f, b"");
+    let r = run(&f.spec).unwrap();
+    assert!(r.finalized_here);
+    assert_eq!(settled(&r).outcome(), Outcome::Interrupted);
+    assert_settled_with_output(&f, 0);
+    assert!(f.store.launches(f.attempt()).unwrap().is_empty());
+}
+
+#[test]
+fn a_terminal_attempt_loses_the_pipes_its_supervisor_left() {
+    let f = fx(vec![node("n", "true")]);
+    run(&f.spec).unwrap();
+    let logs = f
+        .spec
+        .spool_dir()
+        .join(f.attempt().to_string())
+        .join("logs");
+    let fifo = logs.join("node-0.pipe");
+    assert!(Command::new("mkfifo")
+        .arg(&fifo)
+        .status()
+        .unwrap()
+        .success());
+    recover(&f.spec, &f.store).unwrap();
+    assert!(!fifo.exists());
 }
 
 #[test]

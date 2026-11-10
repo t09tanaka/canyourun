@@ -29,10 +29,9 @@
 
 use super::error::Result;
 use super::identity::{verdict, Verdict};
-use super::pump::Pipe;
 use super::run::{
-    complete_terminal, open_spool, settle, settle_without_spool, sidecar_child, stop_confirmed,
-    unresolved_report, Report, Traffic,
+    complete_terminal, open_spool, remove_fifos, settle, settle_without_spool, sidecar_child,
+    stop_confirmed, unresolved_report, Report, Traffic,
 };
 use super::spec::{command_id, SuperviseSpec};
 use super::stop::{group_alive, StopResult, StopTarget};
@@ -148,9 +147,7 @@ pub fn recover(spec: &SuperviseSpec, store: &WorkerStore) -> Result<Report> {
     let root = spec.spool_dir();
     // No command of the attempt is alive any more: the FIFOs the lost
     // supervisor made for them have no writer and no reader.
-    for index in 0..spec.nodes.len() {
-        remove_fifo(&Pipe::path_for(&root, attempt, index));
-    }
+    remove_fifos(spec);
     let (t, here) = match open_spool(spec, store)? {
         Ok(spool) => settle(store, &root, attempt, spool.end(), term)?,
         Err(e) => settle_without_spool(store, &root, attempt, "open", &e.to_string(), term)?,
@@ -161,14 +158,4 @@ pub fn recover(spec: &SuperviseSpec, store: &WorkerStore) -> Result<Report> {
         unresolved: None,
         sleep_inhibit: "not held".into(),
     })
-}
-
-/// Remove `path` when it is a FIFO (never anything else: the name is ours,
-/// but a file found there is not removed on the name alone). Best effort: a
-/// FIFO that stays is removed with the attempt's directory by GC.
-fn remove_fifo(path: &std::path::Path) {
-    use std::os::unix::fs::FileTypeExt;
-    if std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_fifo()) {
-        let _ = std::fs::remove_file(path);
-    }
 }
