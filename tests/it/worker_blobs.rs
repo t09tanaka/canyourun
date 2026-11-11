@@ -340,6 +340,12 @@ impl Host for RealButCore {
     fn secrets_ready(&self, a: &AcceptedAttempt) -> Result<bool, ApiError> {
         self.0.secrets_ready(a)
     }
+    fn mask_values(
+        &self,
+        a: &AcceptedAttempt,
+    ) -> Result<remote_task_runner::secrets::envfile::Values, ApiError> {
+        self.0.mask_values(a)
+    }
     fn cleanup(&self, a: &AttemptId, ws: Option<&Workspace>) -> Result<(), ApiError> {
         self.0.cleanup(a, ws)
     }
