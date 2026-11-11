@@ -105,13 +105,19 @@ pub fn listen_unix(path: &Path) -> io::Result<UnixListener> {
     }
     match std::fs::symlink_metadata(path) {
         Ok(meta) if meta.file_type().is_socket() => {
-            if std::os::unix::net::UnixStream::connect(path).is_ok() {
-                return Err(io::Error::new(
-                    io::ErrorKind::AddrInUse,
-                    "another agent is listening on this socket",
-                ));
+            match std::os::unix::net::UnixStream::connect(path) {
+                Ok(_) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::AddrInUse,
+                        "another agent is listening on this socket",
+                    ))
+                }
+                Err(e) if probe_error_means_dead(&e) => std::fs::remove_file(path)?,
+                // Any other failure (a timeout, a full backlog, an interrupted
+                // call) does not show that nobody listens: a slow live agent
+                // must never be mistaken for a stale file and unlinked.
+                Err(e) => return Err(e),
             }
-            std::fs::remove_file(path)?;
         }
         Ok(_) => {
             return Err(io::Error::new(
@@ -125,6 +131,16 @@ pub fn listen_unix(path: &Path) -> io::Result<UnixListener> {
     let listener = UnixListener::bind(path)?;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
     Ok(listener)
+}
+
+/// Whether a failed probe connect proves the socket file is a leftover: the
+/// kernel answers "connection refused" when nothing listens, or "not found"
+/// when the file vanished in the meantime. Everything else is inconclusive.
+fn probe_error_means_dead(e: &io::Error) -> bool {
+    matches!(
+        e.kind(),
+        io::ErrorKind::ConnectionRefused | io::ErrorKind::NotFound
+    )
 }
 
 /// A started child process whose stdin and stdout carry the protocol (for
@@ -317,6 +333,47 @@ mod tests {
         assert!(out.is_empty());
     }
 
+    /// Leave a socket file behind that nothing listens on, like the one a dead
+    /// agent leaves.
+    fn bind_without_listening(path: &Path) {
+        use std::os::unix::ffi::OsStrExt;
+        let bytes = path.as_os_str().as_bytes();
+        // SAFETY: plain socket/bind/close on a descriptor owned here, with a
+        // zeroed sockaddr_un whose path is length-checked before the copy.
+        unsafe {
+            let fd = libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0);
+            assert!(fd > 2, "socket() failed");
+            let mut addr: libc::sockaddr_un = std::mem::zeroed();
+            addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
+            assert!(bytes.len() < addr.sun_path.len());
+            for (dst, src) in addr.sun_path.iter_mut().zip(bytes) {
+                *dst = *src as libc::c_char;
+            }
+            let rc = libc::bind(
+                fd,
+                std::ptr::addr_of!(addr).cast::<libc::sockaddr>(),
+                std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t,
+            );
+            assert_eq!(rc, 0, "bind() failed");
+            libc::close(fd);
+        }
+    }
+
+    #[test]
+    fn only_refused_or_missing_proves_a_probe_target_dead() {
+        for kind in [io::ErrorKind::ConnectionRefused, io::ErrorKind::NotFound] {
+            assert!(probe_error_means_dead(&io::Error::from(kind)));
+        }
+        for kind in [
+            io::ErrorKind::TimedOut,
+            io::ErrorKind::WouldBlock,
+            io::ErrorKind::Interrupted,
+            io::ErrorKind::PermissionDenied,
+        ] {
+            assert!(!probe_error_means_dead(&io::Error::from(kind)));
+        }
+    }
+
     #[tokio::test]
     async fn a_live_socket_is_not_replaced_but_a_stale_file_is() {
         let dir = short_tempdir();
@@ -324,10 +381,13 @@ mod tests {
         let first = listen_unix(&sock).unwrap();
         let err = listen_unix(&sock).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::AddrInUse);
-        // A socket file nobody listens on (the agent died) is stale. Made with
-        // std so the close on drop is immediate.
+        // A socket file nobody listens on (the agent died) is stale. It is made
+        // by binding without ever calling listen: a listening socket closed on
+        // drop can stay connectable while another test's fork has not yet
+        // exec'd and still holds the inherited descriptor, which under heavy
+        // load made the probe see a live agent.
         let stale = dir.path().join("s").join("stale.sock");
-        drop(std::os::unix::net::UnixListener::bind(&stale).unwrap());
+        bind_without_listening(&stale);
         assert!(stale.exists());
         let _second = listen_unix(&stale).unwrap();
         let _keep = first;
