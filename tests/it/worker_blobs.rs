@@ -7,7 +7,7 @@
 use crate::proto_common::client_cfg;
 use local_ci::source::SourceManifest as CiManifest;
 use local_ci::ExecContext;
-use remote_task_runner::error::{ApiError, ErrorCode};
+use remote_task_runner::error::{ApiError, ConflictReason, ErrorCode};
 use remote_task_runner::ids::*;
 use remote_task_runner::protocol::transfer::put_blob_as;
 use remote_task_runner::protocol::transport::duplex_pair;
@@ -17,12 +17,14 @@ use remote_task_runner::state::{AttemptState, Outcome, Termination};
 use remote_task_runner::storage::{AcceptedAttempt, NewAcceptance, WorkerStore};
 use remote_task_runner::supervisor::outcome::{store_artifact, ArtifactInput};
 use remote_task_runner::wire::*;
-use remote_task_runner::worker::blob_policy::{lock_shard, staged_name, BlobLimits};
+use remote_task_runner::worker::blob_policy::{
+    bundle_prerequisites, lock_shard, staged_name, BlobLimits,
+};
 use remote_task_runner::worker::blobs::{self, BlobSink};
 use remote_task_runner::worker::machine::Machine;
 use remote_task_runner::worker::serve::serve_connection;
 use remote_task_runner::worker::{Agent, AgentConfig, Host};
-use remote_task_runner::workspace::{CliFastWorktree, Workspace, Workspaces};
+use remote_task_runner::workspace::Workspace;
 use serde_json::json;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
@@ -83,6 +85,25 @@ struct Fx {
     dir: TempDir,
     cluster: ClusterId,
     agents: Mutex<Vec<Arc<Agent>>>,
+    /// Where `fast-worktree` is, when the worker of the test needs it.
+    tools: Option<PathBuf>,
+}
+
+/// The directory of the installed `fast-worktree` (a Git source is prepared
+/// with it). Without one the test cannot run an attempt: that is a failure
+/// where it is required (`RTR_REQUIRE_FAST_WORKTREE`, set in CI), and said
+/// aloud elsewhere.
+fn fast_worktree_dir() -> Option<PathBuf> {
+    let path = std::env::var_os("PATH").unwrap_or_default();
+    let found = std::env::split_paths(&path).find(|d| d.join("fast-worktree").is_file());
+    if found.is_none() {
+        assert!(
+            std::env::var_os("RTR_REQUIRE_FAST_WORKTREE").is_none(),
+            "fast-worktree is required here and is not installed"
+        );
+        eprintln!("fast-worktree is not installed: no attempt is run from the Git source");
+    }
+    found
 }
 
 fn fx() -> Fx {
@@ -95,6 +116,7 @@ fn fx() -> Fx {
         dir,
         cluster: ClusterId::generate(),
         agents: Mutex::default(),
+        tools: None,
     }
 }
 
@@ -126,8 +148,12 @@ impl Fx {
         self.path("state")
     }
     fn env(&self) -> BTreeMap<String, String> {
+        let path = match &self.tools {
+            Some(dir) => format!("{PATH}:{}", dir.display()),
+            None => PATH.to_string(),
+        };
         [
-            ("PATH", PATH),
+            ("PATH", path.as_str()),
             ("HOME", self.path("home").to_str().unwrap()),
             ("GIT_CONFIG_GLOBAL", "/dev/null"),
             ("GIT_CONFIG_NOSYSTEM", "1"),
@@ -150,13 +176,44 @@ impl Fx {
     fn incoming(&self, source: &SourceId) -> PathBuf {
         self.state().join("incoming").join(source.as_str())
     }
+    /// The staged files of a source: manifests and bundle, the files that
+    /// are part-way (`parts/`) and the ones that wait whole (`files/`).
     fn staged(&self, source: &SourceId) -> BTreeSet<String> {
-        std::fs::read_dir(self.incoming(source))
-            .map(|d| {
-                d.map(|e| e.unwrap().file_name().into_string().unwrap())
-                    .collect()
-            })
-            .unwrap_or_default()
+        let dir = self.incoming(source);
+        let mut out = BTreeSet::new();
+        for d in [dir.clone(), dir.join("parts"), dir.join("files")] {
+            for e in std::fs::read_dir(d).into_iter().flatten() {
+                let name = e.unwrap().file_name().into_string().unwrap();
+                if !["parts", "files", "reserved"].contains(&name.as_str()) {
+                    out.insert(name);
+                }
+            }
+        }
+        out
+    }
+    /// The bytes the worker lets the source take in all.
+    fn reserved(&self, source: &SourceId) -> u64 {
+        std::fs::read_to_string(self.incoming(source).join("reserved"))
+            .unwrap()
+            .parse()
+            .unwrap()
+    }
+    /// The worker's clones (each a repository with no remote).
+    fn clones(&self) -> Vec<PathBuf> {
+        std::fs::read_dir(self.state().join("clones"))
+            .into_iter()
+            .flatten()
+            .map(|e| e.unwrap().path())
+            .filter(|p| p.join(".git").exists())
+            .collect()
+    }
+    /// The bundle of a captured source for a worker that holds `have`.
+    fn bundle(&self, root: &CiManifest, have: &[String]) -> Vec<u8> {
+        let path = self
+            .parent()
+            .export_bundle(&ExecContext::new(self.env()), root, have)
+            .unwrap();
+        std::fs::read(path).unwrap()
     }
 
     /// A directory with a few files, one of them several chunks long.
@@ -181,12 +238,11 @@ impl Fx {
                 blobs.insert(e.hash.clone(), store.read_blob(&e.hash).unwrap());
             }
         }
-        let bundle = root.execution_commit.as_ref().map(|_| {
-            let path = store
-                .export_bundle(&ExecContext::new(self.env()), &root)
-                .unwrap();
-            std::fs::read(path).unwrap()
-        });
+        // for a worker that holds nothing: the whole history
+        let bundle = root
+            .execution_commit
+            .as_ref()
+            .map(|_| self.bundle(&root, &[]));
         Parcel {
             source: got.manifest.source_id.clone(),
             manifest_digest: got.manifest.manifest_digest.clone(),
@@ -198,18 +254,6 @@ impl Fx {
             blobs,
             bundle,
         }
-    }
-
-    /// The worker's clone of the parcel's repository, made from `repo`: a
-    /// bundle never carries the history below its base, so the clone has it.
-    fn seed_clone(&self, p: &Parcel, repo: &Path) {
-        let fw = Arc::new(CliFastWorktree::new(self.env()));
-        Workspaces::new(self.state(), self.env(), fw)
-            .ensure_clone(
-                p.root.repository_id.as_deref().unwrap(),
-                Some(repo.to_str().unwrap()),
-            )
-            .unwrap();
     }
 
     fn directory(&self, name: &str, seed: u64) -> Parcel {
@@ -637,7 +681,6 @@ fn a_git_source_needs_its_bundle_and_a_wrong_one_is_dropped() {
     std::fs::write(repo.join("a.txt"), "edited\n").unwrap();
     std::fs::write(repo.join("new.txt"), "untracked\n").unwrap();
     let p = f.capture(&SourceRequest::Worktree { dir: repo.clone() });
-    f.seed_clone(&p, &repo);
     let commit = p.root.execution_commit.clone().unwrap();
     let bundle = p.bundle.as_ref().unwrap();
     let bundle_ref = |b: &[u8]| BlobRef {
@@ -754,7 +797,6 @@ fn a_submodule_capture_travels_with_its_parent_and_only_when_it_is_named() {
     git(&repo, &["commit", "-qm", "add submodule"]);
     std::fs::write(repo.join("vendor/lib/lib.txt"), "edited lib\n").unwrap();
     let p = f.capture(&SourceRequest::Worktree { dir: repo.clone() });
-    f.seed_clone(&p, &repo);
     assert_eq!(p.manifests.len(), 2);
     let other = f.directory("plain", 3);
 
@@ -848,12 +890,20 @@ fn a_transfer_that_was_cut_resumes_from_what_is_held() {
     assert_eq!((r.received, r.complete), (2500, false));
     let part = f
         .incoming(&p.source)
-        .join(staged_name(Content, hash, false));
+        .join("parts")
+        .join(staged_name(Content, hash, 5000, false));
     assert_eq!(std::fs::read(&part).unwrap(), big[..2500]);
     let r = put_part(sink, &l, &p.source, Content, big, 2500, 5000).unwrap();
     assert_eq!((r.received, r.complete), (5000, true));
     assert!(!part.exists());
-    assert_eq!(f.worker_store().read_blob(hash).unwrap(), big);
+    // Whole, it waits in the staging area: the store takes the files of a
+    // source when the source is published, not before.
+    let whole = f
+        .incoming(&p.source)
+        .join("files")
+        .join(staged_name(Content, hash, 5000, true));
+    assert_eq!(std::fs::read(&whole).unwrap(), big);
+    assert!(!f.worker_store().has_blob(hash));
     assert_eq!(verify(sink, &l, &p.source, big_ref()).present.len(), 1);
     // The same blob again is whole already.
     let r = put_part(sink, &l, &p.source, Content, big, 0, 100).unwrap();
@@ -1180,6 +1230,13 @@ fn only_so_many_sources_are_part_way_and_an_abandoned_one_makes_room() {
     for p in &parcels[..2] {
         put_all(sink, &two, &p.source, Manifest, &p.manifests[0]).unwrap();
     }
+    // A file of the second one arrived whole.
+    let (hash, big) = parcels[1].blob_of_len(5000);
+    assert!(
+        put_all(sink, &two, &parcels[1].source, Content, big)
+            .unwrap()
+            .complete
+    );
     let third = &parcels[2];
     let e = put_all(sink, &two, &third.source, Manifest, &third.manifests[0]).unwrap_err();
     assert_eq!(e.code, ErrorCode::Overloaded);
@@ -1197,6 +1254,9 @@ fn only_so_many_sources_are_part_way_and_an_abandoned_one_makes_room() {
     put_all(sink, &aged, &third.source, Manifest, &third.manifests[0]).unwrap();
     assert!(f.incoming(&third.source).exists());
     assert!(!f.incoming(&parcels[1].source).exists());
+    // Nothing of a source that was dropped is in the store: its files
+    // waited in the staging area.
+    assert!(!f.worker_store().has_blob(hash));
     assert_eq!(
         f.staged(&parcels[0].source),
         BTreeSet::from(["notes.txt".to_string()])
@@ -1412,4 +1472,534 @@ fn a_source_whose_last_step_was_lost_is_published_by_sending_anything_again() {
     // And a whole source sent once more is answered as held, storing nothing.
     send_all(sink, &l, &p);
     assert!(!f.incoming(&p.source).exists());
+}
+
+// ------------------------------------- Git sources, with no origin to ask
+
+/// A repository cloned from an upstream (`up`), with a submodule (upstream:
+/// `lib`): one commit that was never pushed, an edit that was never
+/// committed, and an edit in the submodule.
+fn project(f: &Fx) -> PathBuf {
+    let lib = f.path("lib");
+    std::fs::create_dir_all(&lib).unwrap();
+    git(&lib, &["init", "-q", "-b", "main"]);
+    std::fs::write(lib.join("lib.txt"), "lib\n").unwrap();
+    git(&lib, &["add", "."]);
+    git(&lib, &["commit", "-qm", "lib"]);
+    let up = f.path("up");
+    std::fs::create_dir_all(&up).unwrap();
+    git(&up, &["init", "-q", "-b", "main"]);
+    std::fs::write(up.join("a.txt"), "a\n").unwrap();
+    std::fs::write(up.join("history.bin"), noise(77, 40_000)).unwrap();
+    git(&up, &["add", "."]);
+    git(&up, &["commit", "-qm", "base"]);
+    git(
+        &up,
+        &[
+            "submodule",
+            "add",
+            "-q",
+            lib.to_str().unwrap(),
+            "vendor/lib",
+        ],
+    );
+    git(&up, &["commit", "-qm", "add submodule"]);
+    git(
+        f.dir.path(),
+        &[
+            "clone",
+            "-q",
+            "--recurse-submodules",
+            up.to_str().unwrap(),
+            "repo",
+        ],
+    );
+    let repo = f.path("repo");
+    std::fs::write(repo.join("a.txt"), "unpushed\n").unwrap();
+    git(&repo, &["commit", "-qam", "never pushed"]);
+    std::fs::write(repo.join("a.txt"), "edited\n").unwrap();
+    std::fs::write(repo.join("vendor/lib/lib.txt"), "edited lib\n").unwrap();
+    repo
+}
+
+/// What `blob_verify` says of the source before its bundle is built: asked
+/// about the manifests and the files only.
+async fn verify_before_bundle(c: &Client, p: &Parcel) -> BlobVerifyResponse {
+    let r = Request::BlobVerify(BlobVerifyRequest {
+        schema_version: SchemaVersion::CURRENT,
+        request_id: RequestId::generate(),
+        source_id: p.source.clone(),
+        blobs: p.refs().into_iter().filter(|b| b.kind != Bundle).collect(),
+    });
+    match call(c, r).await.unwrap() {
+        Response::BlobVerify(v) => v,
+        other => panic!("{other:?}"),
+    }
+}
+
+/// Send a Git source as a coordinator does: manifests and files, then ask
+/// what the worker's clone holds, then a bundle built on exactly that.
+/// Returns the commits the worker listed and the bundle that was sent.
+async fn send_git(c: &Client, f: &Fx, p: &Parcel) -> (Vec<String>, Vec<u8>) {
+    let e1 = CoordinatorEpoch(1);
+    for m in &p.manifests {
+        let r = put_blob_as(c, e1, &p.source, Manifest, m, 0, 4000, T).await;
+        assert!(r.unwrap().complete);
+    }
+    for b in p.blobs.values() {
+        let r = put_blob_as(c, e1, &p.source, Content, b, 0, 4000, T).await;
+        assert!(r.unwrap().complete);
+    }
+    let v = verify_before_bundle(c, p).await;
+    assert!(!v.ready && v.bundle_needed, "{v:?}");
+    assert!(v.missing.is_empty() && v.corrupt.is_empty(), "{v:?}");
+    assert_eq!(v.have.len(), 1);
+    assert_eq!(
+        Some(&v.have[0].repository_id),
+        p.root.repository_id.as_ref()
+    );
+    let have = v.have[0].commits.clone();
+    let bundle = f.bundle(&p.root, &have);
+    let r = put_blob_as(c, e1, &p.source, Bundle, &bundle, 0, 4000, T).await;
+    assert!(r.unwrap().complete);
+    let v = verify_before_bundle(c, p).await;
+    assert!(v.ready && !v.bundle_needed, "{v:?}");
+    (have, bundle)
+}
+
+/// Run `script` in an attempt made from the source and wait for it to
+/// succeed. `false`: no attempt can be made here (see [`fast_worktree_dir`]).
+async fn run_script(c: &Client, f: &Fx, p: &Parcel, script: &str) -> bool {
+    if f.tools.is_none() {
+        return false;
+    }
+    let a = AttemptId::generate();
+    let submit = Request::SubmitAttempt(
+        SubmitAttemptRequest::new(
+            RequestId::generate(),
+            CoordinatorEpoch(1),
+            a.clone(),
+            payload(p, script),
+        )
+        .unwrap(),
+    );
+    call(c, submit).await.unwrap();
+    let outcome = f.wait_terminal(&a);
+    let store = WorkerStore::open_read_only(&f.state()).unwrap();
+    let events = store.events_of_attempt(&a, 50);
+    assert_eq!(outcome, Outcome::Succeeded, "{events:?}");
+    true
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_git_source_runs_on_a_worker_that_holds_nothing_and_the_next_one_travels_thin() {
+    let mut f = fx();
+    f.tools = fast_worktree_dir();
+    let repo = project(&f);
+    let first = f.capture(&SourceRequest::Worktree { dir: repo.clone() });
+    assert_eq!(first.manifests.len(), 2);
+    assert!(first.root.submodules[0].dirty);
+    // The next source: one more edit; the dirty submodule stays as it is.
+    std::fs::write(repo.join("a.txt"), "edited again\n").unwrap();
+    let second = f.capture(&SourceRequest::Worktree { dir: repo.clone() });
+    assert_ne!(first.source, second.source);
+    let lib_capture = first.root.submodules[0].source_id.clone().unwrap();
+    assert_eq!(
+        second.root.submodules[0].source_id,
+        Some(lib_capture.clone())
+    );
+    // There is nowhere to fetch from: the upstream of the repository and the
+    // upstream of its submodule are gone before the worker sees anything.
+    std::fs::remove_dir_all(f.path("up")).unwrap();
+    std::fs::remove_dir_all(f.path("lib")).unwrap();
+
+    let agent = f.start();
+    let c = f.connect(&agent).await;
+    assert!(f.clones().is_empty());
+
+    // The worker holds nothing: the bundle is built on nothing, and brings
+    // the whole history.
+    let (have, bundle) = send_git(&c, &f, &first).await;
+    assert_eq!(have, Vec::<String>::new());
+    assert_eq!(bundle_prerequisites(&bundle), Ok(vec![]));
+    let clones = f.clones();
+    assert_eq!(clones.len(), 1);
+    assert_eq!(git(&clones[0], &["remote"]), "");
+    let out = f.path("out-1");
+    let script = |out: &Path| {
+        format!(
+            "cat a.txt vendor/lib/lib.txt > {0} && git log -1 --format=%s HEAD >> {0} && wc -c < history.bin >> {0}",
+            out.display()
+        )
+    };
+    if run_script(&c, &f, &first, &script(&out)).await {
+        let text = std::fs::read_to_string(&out).unwrap();
+        let lines: Vec<&str> = text.lines().map(str::trim).collect();
+        assert_eq!(lines, ["edited", "edited lib", "never pushed", "40000"]);
+    }
+
+    // The next source of the repository: the worker lists what its clone
+    // holds, and the bundle brings only what is new.
+    let lib_manifest = f.worker_store().object_store().manifest_path(&lib_capture);
+    let inode = |p: &Path| std::os::unix::fs::MetadataExt::ino(&std::fs::metadata(p).unwrap());
+    let before = inode(&lib_manifest);
+    let (have, thin) = send_git(&c, &f, &second).await;
+    assert!(have.len() <= 64);
+    assert!(
+        have.contains(first.root.execution_commit.as_ref().unwrap()),
+        "{have:?}"
+    );
+    let prerequisites = bundle_prerequisites(&thin).unwrap();
+    assert!(!prerequisites.is_empty());
+    let whole = second.bundle.as_ref().unwrap();
+    assert_eq!(bundle_prerequisites(whole), Ok(vec![]));
+    assert!(
+        thin.len() + 30_000 < whole.len(),
+        "{} against {}",
+        thin.len(),
+        whole.len()
+    );
+    // The submodule's capture was published with the first source: it is
+    // taken as held, and the store's copy is not written again.
+    assert_eq!(inode(&lib_manifest), before);
+    let out = f.path("out-2");
+    if run_script(&c, &f, &second, &script(&out)).await {
+        let text = std::fs::read_to_string(&out).unwrap();
+        let lines: Vec<&str> = text.lines().map(str::trim).collect();
+        assert_eq!(
+            lines,
+            ["edited again", "edited lib", "never pushed", "40000"]
+        );
+    }
+    assert_eq!(f.clones().len(), 1);
+}
+
+#[test]
+fn a_bundle_built_on_what_the_worker_lacks_is_answered_with_what_it_holds() {
+    let f = fx();
+    let repo = project(&f);
+    let first = f.capture(&SourceRequest::Worktree { dir: repo.clone() });
+    git(&repo, &["commit", "-qam", "later"]);
+    let later = git(&repo, &["rev-parse", "HEAD"]);
+    std::fs::write(repo.join("a.txt"), "edited after that\n").unwrap();
+    let second = f.capture(&SourceRequest::Worktree { dir: repo.clone() });
+    // Built on a commit the coordinator has and the worker does not.
+    let thin = f.bundle(&second.root, std::slice::from_ref(&later));
+    assert_eq!(bundle_prerequisites(&thin), Ok(vec![later.clone()]));
+    let base_missing = |e: &ApiError| match &e.conflict_reason {
+        Some(ConflictReason::BundleBaseMissing { have }) => have.clone(),
+        other => panic!("{other:?} in {e:?}"),
+    };
+    let no_bundle = |f: &Fx, p: &Parcel| {
+        f.staged(&p.source)
+            .iter()
+            .all(|n| !n.starts_with("bundle-"))
+    };
+
+    let m = f.machine();
+    let (sink, l) = (m.blobs().unwrap(), limits());
+    for man in &second.manifests {
+        put_all(sink, &l, &second.source, Manifest, man).unwrap();
+    }
+    for b in second.blobs.values() {
+        put_all(sink, &l, &second.source, Content, b).unwrap();
+    }
+    // A worker with no clone at all: the answer says so, the bundle is not
+    // kept, and no clone is made for it.
+    let e = put_all(sink, &l, &second.source, Bundle, &thin).unwrap_err();
+    assert_eq!(e.code, ErrorCode::Conflict);
+    assert_eq!(base_missing(&e), Vec::<String>::new());
+    assert!(no_bundle(&f, &second));
+    assert!(f.clones().is_empty());
+    let v = verify(sink, &l, &second.source, vec![]);
+    assert!(!v.ready && v.bundle_needed);
+    assert_eq!(v.have[0].commits, Vec::<String>::new());
+
+    // A worker whose clone holds another part of the history.
+    send_all(sink, &l, &first);
+    assert!(verify(sink, &l, &first.source, vec![]).ready);
+    let e = put_all(sink, &l, &second.source, Bundle, &thin).unwrap_err();
+    assert_eq!(e.code, ErrorCode::Conflict);
+    let have = base_missing(&e);
+    assert!(have.contains(first.root.execution_commit.as_ref().unwrap()));
+    assert!(!have.contains(&later));
+    assert!(no_bundle(&f, &second));
+    assert_eq!(
+        verify(sink, &l, &second.source, vec![]).have[0].commits,
+        have
+    );
+
+    // A bundle that is broken is another matter: it is not asked for again
+    // with another base.
+    let whole = second.bundle.as_ref().unwrap();
+    let mut broken = whole.clone();
+    broken.truncate(whole.len() - 40);
+    let e = put_all(sink, &l, &second.source, Bundle, &broken).unwrap_err();
+    assert_eq!(e.code, ErrorCode::InvalidInput);
+    assert_eq!(e.conflict_reason, None);
+    assert!(no_bundle(&f, &second));
+    assert!(!verify(sink, &l, &second.source, vec![]).ready);
+
+    // Built on what the worker said it holds, it fits.
+    let fitting = f.bundle(&second.root, &have);
+    assert!(!bundle_prerequisites(&fitting).unwrap().is_empty());
+    assert!(
+        put_all(sink, &l, &second.source, Bundle, &fitting)
+            .unwrap()
+            .complete
+    );
+    assert!(verify(sink, &l, &second.source, vec![]).ready);
+    assert_eq!(f.clones().len(), 1);
+}
+
+// ------------------------------------------------- what a source may take
+
+/// The bytes of everything a parcel of a directory brings.
+fn total_of(p: &Parcel) -> u64 {
+    let files: usize = p.blobs.values().map(Vec::len).sum();
+    (p.manifests[0].len() + files) as u64
+}
+
+#[test]
+fn what_a_source_takes_is_reserved_before_it_is_written() {
+    let f = fx();
+    let (p, q, r) = (
+        f.directory("p", 50),
+        f.directory("q", 51),
+        f.directory("r", 52),
+    );
+    let m = f.machine();
+    let (sink, l) = (m.blobs().unwrap(), limits());
+    let man = &p.manifests[0];
+
+    // The manifest itself counts for the source, with the files it names.
+    let tight = BlobLimits {
+        max_source_bytes: total_of(&p) - 1,
+        ..limits()
+    };
+    let e = put_all(sink, &tight, &p.source, Manifest, man).unwrap_err();
+    assert_eq!(e.code, ErrorCode::InvalidInput);
+    assert!(e.message.contains("larger"), "{}", e.message);
+    assert!(!f.incoming(&p.source).exists());
+    let exact = BlobLimits {
+        max_source_bytes: total_of(&p),
+        ..limits()
+    };
+    // Reserved from the first chunk of the manifest on, then with its files.
+    put_part(sink, &exact, &p.source, Manifest, man, 0, 10).unwrap();
+    assert_eq!(f.reserved(&p.source), man.len() as u64);
+    put_part(sink, &exact, &p.source, Manifest, man, 10, man.len()).unwrap();
+    assert_eq!(f.reserved(&p.source), total_of(&p));
+
+    // All the sources that are part-way share one bound. A manifest there is
+    // no room for stays where it is, and is taken once there is room.
+    let shared = BlobLimits {
+        max_incoming_bytes: total_of(&p) + total_of(&q) - 1,
+        ..limits()
+    };
+    let e = put_all(sink, &shared, &q.source, Manifest, &q.manifests[0]).unwrap_err();
+    assert_eq!(e.code, ErrorCode::Overloaded);
+    assert_eq!(f.reserved(&q.source), q.manifests[0].len() as u64);
+    let (_, big) = q.blob_of_len(5000);
+    let e = put_all(sink, &shared, &q.source, Content, big).unwrap_err();
+    assert_eq!(e.code, ErrorCode::Conflict);
+    let last = q.manifests[0].len() - 1;
+    let r1 = put_part(
+        sink,
+        &l,
+        &q.source,
+        Manifest,
+        &q.manifests[0],
+        last,
+        last + 1,
+    )
+    .unwrap();
+    assert!(r1.complete);
+    assert_eq!(f.reserved(&q.source), total_of(&q));
+    // Not even the first byte of a manifest, when all the room is taken.
+    let full = BlobLimits {
+        max_incoming_bytes: total_of(&p) + total_of(&q),
+        ..limits()
+    };
+    let e = put_part(sink, &full, &r.source, Manifest, &r.manifests[0], 0, 1).unwrap_err();
+    assert_eq!(e.code, ErrorCode::Overloaded);
+    assert!(!f.incoming(&r.source).exists());
+
+    // The disk keeps its floor.
+    let floor = BlobLimits {
+        min_free_bytes: u64::MAX / 2,
+        ..limits()
+    };
+    let e = put_part(sink, &floor, &r.source, Manifest, &r.manifests[0], 0, 1).unwrap_err();
+    assert_eq!(e.code, ErrorCode::Overloaded);
+    assert!(e.message.contains("disk"), "{}", e.message);
+    assert!(!f.incoming(&r.source).exists());
+
+    // Before the source's own manifest is staged, one manifest is part-way:
+    // another one takes its place.
+    let stray = noise(5, 300);
+    put_part(sink, &l, &r.source, Manifest, &stray, 0, 100).unwrap();
+    put_part(sink, &l, &r.source, Manifest, &r.manifests[0], 0, 10).unwrap();
+    let parts: Vec<String> = f.staged(&r.source).into_iter().collect();
+    let d = Digest::of_bytes(&r.manifests[0]);
+    let hex = d.as_str().strip_prefix("sha256:").unwrap();
+    assert_eq!(
+        parts,
+        [staged_name(
+            Manifest,
+            hex,
+            r.manifests[0].len() as u64,
+            false
+        )]
+    );
+}
+
+#[test]
+fn a_source_holds_one_bundle_and_its_size_counts() {
+    let f = fx();
+    let repo = f.path("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    git(&repo, &["init", "-q", "-b", "main"]);
+    std::fs::write(repo.join("a.txt"), "committed\n").unwrap();
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-qm", "base"]);
+    let p = f.capture(&SourceRequest::Worktree { dir: repo.clone() });
+    let m = f.machine();
+    let (sink, l) = (m.blobs().unwrap(), limits());
+    put_all(sink, &l, &p.source, Manifest, &p.manifests[0]).unwrap();
+    let base = f.reserved(&p.source);
+    let bundles = |f: &Fx| -> Vec<String> {
+        f.staged(&p.source)
+            .into_iter()
+            .filter(|n| n.starts_with("bundle-"))
+            .collect()
+    };
+    let name = |b: &[u8]| {
+        let d = Digest::of_bytes(b);
+        let hex = d.as_str().strip_prefix("sha256:").unwrap().to_string();
+        staged_name(Bundle, &hex, b.len() as u64, false)
+    };
+
+    let (one, two) = (noise(1, 3000), noise(2, 4000));
+    put_part(sink, &l, &p.source, Bundle, &one, 0, 1000).unwrap();
+    assert_eq!(bundles(&f), [name(&one)]);
+    assert_eq!(f.reserved(&p.source), base + 3000);
+    // Another bundle takes the place of the first: never two.
+    put_part(sink, &l, &p.source, Bundle, &two, 0, 10).unwrap();
+    assert_eq!(bundles(&f), [name(&two)]);
+    assert_eq!(f.reserved(&p.source), base + 4000);
+    // The same digest under another size is another blob.
+    let d = Digest::of_bytes(&two);
+    put_raw(sink, &l, &p.source, Bundle, &d, 4001, 0, &two[..10]).unwrap();
+    assert_eq!(bundles(&f).len(), 1);
+    // A bundle that does not fit the source with the rest of it.
+    let tight = BlobLimits {
+        max_source_bytes: base + 4999,
+        ..limits()
+    };
+    let e = put_part(sink, &tight, &p.source, Bundle, &noise(3, 5000), 0, 10).unwrap_err();
+    assert_eq!(e.code, ErrorCode::InvalidInput);
+    assert!(e.message.contains("larger"), "{}", e.message);
+    assert!(bundles(&f).is_empty());
+}
+
+#[test]
+fn a_hash_keeps_the_size_the_first_manifest_gave_it() {
+    use local_ci::source::{seal_manifest, RelPath, SubmoduleRef};
+    use remote_task_runner::source::classify::source_id_of_ci;
+    let f = fx();
+    let (top, sub) = (f.directory("top", 60), f.directory("sub", 61));
+    let (hash, big) = top.blob_of_len(5000);
+    // A capture that gives a file of the source another size, and a source
+    // that names that capture. Both are sealed: only the sizes disagree.
+    let mut lying = sub.root.clone();
+    let entry = &mut lying.object_manifest.entries[0];
+    entry.hash = hash.to_string();
+    entry.size = 4 << 30;
+    let lying = seal_manifest(lying);
+    let mut root = top.root.clone();
+    root.submodules = vec![SubmoduleRef {
+        path: RelPath::new("vendor/sub"),
+        revision: "0123456789abcdef0123456789abcdef01234567".into(),
+        source_id: Some(lying.source_id.clone()),
+        dirty: false,
+    }];
+    let root = seal_manifest(root);
+    let source = source_id_of_ci(&root.source_id).unwrap();
+    let root_bytes = serde_json::to_vec(&root).unwrap();
+
+    let m = f.machine();
+    let (sink, l) = (m.blobs().unwrap(), limits());
+    put_all(sink, &l, &source, Manifest, &root_bytes).unwrap();
+    let before = (f.staged(&source), f.reserved(&source));
+    let e = put_all(
+        sink,
+        &l,
+        &source,
+        Manifest,
+        &serde_json::to_vec(&lying).unwrap(),
+    )
+    .unwrap_err();
+    assert_eq!(e.code, ErrorCode::InvalidInput);
+    assert!(e.message.contains("another size"), "{}", e.message);
+    // (what the refused manifest announced stays reserved: a reservation
+    // never shrinks)
+    let after = (f.staged(&source), f.reserved(&source));
+    assert_eq!(after.0, before.0);
+    assert!(after.1 >= before.1 && after.1 < before.1 + 4096);
+    // The file is still taken with the size the source's manifest gives.
+    let d = Digest::of_bytes(big);
+    let e = put_raw(sink, &l, &source, Content, &d, 4 << 30, 0, &big[..10]).unwrap_err();
+    assert_eq!(e.code, ErrorCode::InvalidInput);
+    assert!(put_all(sink, &l, &source, Content, big).unwrap().complete);
+    // After a restart the staged manifests say the same.
+    drop(m);
+    let m = f.machine();
+    let sink = m.blobs().unwrap();
+    let e = put_raw(sink, &l, &source, Content, &d, 4 << 30, 0, &big[..10]).unwrap_err();
+    assert_eq!(e.code, ErrorCode::InvalidInput);
+}
+
+#[test]
+fn sources_admitted_at_once_never_exceed_the_bound() {
+    let f = fx();
+    let parcels: Vec<Parcel> = (0..10)
+        .map(|i| f.directory(&format!("d{i}"), 70 + i))
+        .collect();
+    let shards: BTreeSet<u64> = parcels
+        .iter()
+        .map(|p| lock_shard(p.source.as_str()))
+        .collect();
+    assert!(shards.len() > 3, "the sources share too few locks to race");
+    let three = BlobLimits {
+        max_staged_sources: 3,
+        ..limits()
+    };
+    // Two openings of the state, as two processes; every source at once.
+    let machines = [f.machine(), f.machine()];
+    let go = std::sync::Barrier::new(parcels.len());
+    let codes: Vec<Option<ErrorCode>> = std::thread::scope(|s| {
+        let handles: Vec<_> = parcels
+            .iter()
+            .enumerate()
+            .map(|(i, p)| {
+                let (m, go, l) = (&machines[i % 2], &go, &three);
+                s.spawn(move || {
+                    go.wait();
+                    put_all(m.blobs().unwrap(), l, &p.source, Manifest, &p.manifests[0])
+                        .err()
+                        .map(|e| e.code)
+                })
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+    let admitted = codes.iter().filter(|c| c.is_none()).count();
+    assert_eq!(admitted, 3, "{codes:?}");
+    assert!(codes.iter().flatten().all(|c| *c == ErrorCode::Overloaded));
+    let staged = parcels
+        .iter()
+        .filter(|p| f.incoming(&p.source).exists())
+        .count();
+    assert_eq!(staged, 3);
 }

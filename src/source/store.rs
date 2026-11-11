@@ -9,8 +9,8 @@ use super::safety::{check_entries, check_rel_path};
 use crate::ids::RunId;
 use anyhow::{bail, Context, Result};
 use local_ci::source::{
-    export_from, import_objects, materialize_from, seal_manifest, ObjectStore, SourceError,
-    SourceKind, SourceManifest as CiManifest, SCHEMA_VERSION,
+    import_objects, materialize_from, seal_manifest, ObjectStore, SourceError, SourceKind,
+    SourceManifest as CiManifest, SCHEMA_VERSION,
 };
 use local_ci::ExecContext;
 use serde::{Deserialize, Serialize};
@@ -70,6 +70,10 @@ impl Inventory for Peer<'_> {
     }
 }
 
+/// Where the commit of a source is kept (local-ci's names).
+const SNAPSHOTS: &str = "refs/local-ci/snapshots/";
+const INDEXES: &str = "refs/local-ci/index/";
+
 fn is_hex40(s: &str) -> bool {
     s.len() == 40 && s.bytes().all(|c| matches!(c, b'0'..=b'9' | b'a'..=b'f'))
 }
@@ -118,10 +122,23 @@ impl ObjectsRepo {
         let Some(commit) = &m.execution_commit else {
             return Ok(());
         };
+        self.check_snapshot(&m.source_id, commit, m.worktree_tree.as_deref())
+    }
+
+    /// [`Self::check_reachable`] from the three things it reads of a manifest.
+    pub fn check_snapshot(
+        &self,
+        ci_source_id: &str,
+        commit: &str,
+        tree: Option<&str>,
+    ) -> Result<()> {
         if !is_hex40(commit) {
             return Err(corrupt(format!("not a commit id: {commit:?}")));
         }
-        let r = format!("refs/local-ci/snapshots/{}", m.source_id);
+        if source_id_of_ci(ci_source_id).is_none() {
+            return Err(corrupt(format!("not a source id: {ci_source_id:?}")));
+        }
+        let r = format!("{SNAPSHOTS}{ci_source_id}");
         git_run(
             &self.env,
             &self.dir,
@@ -129,17 +146,16 @@ impl ObjectsRepo {
         )
         .map_err(|e| {
             corrupt(format!(
-                "{}: the execution commit {commit} is not reachable in the receiving objects ({e:#})",
-                m.source_id
+                "{ci_source_id}: the execution commit {commit} is not reachable in the receiving objects ({e:#})"
             ))
         })?;
-        if let Some(tree) = &m.worktree_tree {
+        if let Some(tree) = tree {
             let got = git_run(
                 &self.env,
                 &self.dir,
                 &["rev-parse", &format!("{commit}^{{tree}}")],
             )?;
-            if &got != tree {
+            if got != tree {
                 return Err(corrupt(format!(
                     "commit {commit} has tree {got}, the manifest says {tree}"
                 )));
@@ -147,7 +163,77 @@ impl ObjectsRepo {
         }
         Ok(())
     }
+
+    /// The snapshots this repository holds: the source id of each snapshot
+    /// ref, its tip, and the committer time of the tip's first parent (the
+    /// commit the capture was made on; 0 when there is none). At most
+    /// `limit` refs are read. The tip itself says nothing about when: a
+    /// snapshot commit has a fixed date.
+    pub fn snapshot_tips(&self, limit: usize) -> Result<Vec<(String, String, u64)>> {
+        let out = git_run(
+            &self.env,
+            &self.dir,
+            &[
+                "for-each-ref",
+                &format!("--count={limit}"),
+                "--format=%(refname) %(objectname) %(parent)",
+                SNAPSHOTS,
+            ],
+        )?;
+        let mut tips = vec![];
+        for line in out.lines() {
+            let mut words = line.split(' ');
+            let (Some(name), Some(tip)) = (words.next(), words.next()) else {
+                continue;
+            };
+            let Some(id) = name.strip_prefix(SNAPSHOTS) else {
+                continue;
+            };
+            if !is_hex40(tip) {
+                continue;
+            }
+            let parent = words.next().filter(|p| is_hex40(p)).map(str::to_string);
+            tips.push((id.to_string(), tip.to_string(), parent));
+        }
+        let parents: BTreeSet<&str> = tips.iter().filter_map(|t| t.2.as_deref()).collect();
+        let mut when: BTreeMap<String, u64> = BTreeMap::new();
+        if !parents.is_empty() {
+            let mut args = vec!["log", "--no-walk=unsorted", "--format=%H %ct"];
+            args.extend(parents.iter().copied());
+            for line in git_run(&self.env, &self.dir, &args)?.lines() {
+                if let Some((sha, ct)) = line.split_once(' ') {
+                    when.insert(sha.to_string(), ct.trim().parse().unwrap_or(0));
+                }
+            }
+        }
+        Ok(tips
+            .into_iter()
+            .map(|(id, tip, parent)| {
+                let at = parent.and_then(|p| when.get(&p).copied()).unwrap_or(0);
+                (id, tip, at)
+            })
+            .collect())
+    }
+
+    /// Does a bundle with these prerequisites fit this repository: is every
+    /// one of them here, with its whole history, below a ref? (What `git
+    /// bundle verify` asks, apart from the bundle itself.)
+    pub fn holds_base(&self, prerequisites: &[String]) -> bool {
+        if prerequisites.is_empty() {
+            return true;
+        }
+        if prerequisites.iter().any(|p| !is_hex40(p)) {
+            return false;
+        }
+        let mut args = vec!["rev-list", "-n", "1"];
+        args.extend(prerequisites.iter().map(String::as_str));
+        args.extend(["--not", "--all"]);
+        matches!(git_run(&self.env, &self.dir, &args), Ok(out) if out.is_empty())
+    }
 }
+
+/// Commits of a peer an export looks at, at most.
+const MAX_BASIS: usize = 256;
 
 fn corrupt(what: impl Into<String>) -> anyhow::Error {
     SourceError::Corrupt { what: what.into() }.into()
@@ -347,6 +433,22 @@ impl SourceStore {
         Ok(())
     }
 
+    /// One step of [`Self::publish_received_all`], for a caller that holds
+    /// one manifest at a time: `carried` says whether the bundle carries the
+    /// commit of `m` (the requested source, or a dirty submodule's capture).
+    pub fn publish_received_one(
+        &self,
+        m: &CiManifest,
+        carried: bool,
+        objects: Option<&ObjectsRepo>,
+    ) -> Result<()> {
+        if carried {
+            self.publish_received(m, objects)
+        } else {
+            self.publish_checked(m)
+        }
+    }
+
     fn publish_checked(&self, m: &CiManifest) -> Result<()> {
         verify_manifest(m)?;
         for e in &m.object_manifest.entries {
@@ -422,11 +524,169 @@ impl SourceStore {
         Ok(())
     }
 
-    /// The `git bundle` that carries the Git objects of `m` (the synthetic
-    /// commit, the unpushed history below it down to the merge base, and
-    /// dirty submodules' commits). A worker never fetches these from origin.
-    pub fn export_bundle(&self, ctx: &ExecContext, m: &CiManifest) -> Result<PathBuf> {
-        export_from(ctx, &self.inner, m)
+    /// The private repository of the store that holds the snapshot ref of
+    /// the source `ci_source_id`.
+    fn holder(&self, env: &BTreeMap<String, String>, ci_source_id: &str) -> Result<PathBuf> {
+        let r = format!("{SNAPSHOTS}{ci_source_id}");
+        for ent in std::fs::read_dir(self.inner.root().join("git"))? {
+            let dir = ent?.path();
+            if git_run(env, &dir, &["rev-parse", "--verify", "-q", &r]).is_ok() {
+                return Ok(dir);
+            }
+        }
+        bail!("the Git objects of {ci_source_id} are not in this store")
+    }
+
+    /// The captures of the dirty submodules below `m`, nested ones included.
+    fn dirty_submodules(&self, m: &CiManifest, out: &mut Vec<String>) -> Result<()> {
+        for s in &m.submodules {
+            let Some(id) = &s.source_id else { continue };
+            let nested = self.inner.load_manifest(id)?.with_context(|| {
+                format!(
+                    "submodule {}: manifest {id} is not in the store",
+                    s.path.display()
+                )
+            })?;
+            verify_manifest(&nested)?;
+            if s.dirty && !out.contains(id) {
+                out.push(id.clone());
+            }
+            self.dirty_submodules(&nested, out)?;
+        }
+        Ok(())
+    }
+
+    /// The `git bundle` that carries the Git objects of `m` to a peer that
+    /// holds the commits `have` with their whole history (what a worker said
+    /// of its clone; see `blob_verify`): the execution commit, the commit
+    /// around the index tree, the commits of dirty submodules, and all the
+    /// history below them that is not below a commit of `have`. With an empty
+    /// `have` that is the whole history: the peer never fetches from origin,
+    /// so nothing is left for it to find elsewhere. A commit of `have` this
+    /// store does not know is ignored.
+    ///
+    /// The bundle always names every ref the peer will ask it for. Git leaves
+    /// a ref out when its commit is below an excluded one (a dirty submodule
+    /// that did not change keeps its capture, so the peer holds its commit
+    /// already): then the parents of that commit are excluded instead.
+    pub fn export_bundle(
+        &self,
+        ctx: &ExecContext,
+        m: &CiManifest,
+        have: &[String],
+    ) -> Result<PathBuf> {
+        let env = ctx.env();
+        verify_manifest(m)?;
+        if m.execution_commit.is_none() {
+            bail!("{} has no Git objects ({:?})", m.source_id, m.source_kind);
+        }
+        let dir = self.holder(env, &m.source_id)?;
+        let mut refs = vec![format!("{SNAPSHOTS}{}", m.source_id)];
+        if m.index_tree.is_some() {
+            // made by the capture, next to the snapshot ref
+            refs.push(format!("{INDEXES}{}", m.source_id));
+        }
+        let mut subs = vec![];
+        self.dirty_submodules(m, &mut subs)?;
+        for id in &subs {
+            let r = format!("{SNAPSHOTS}{id}");
+            let from = self.holder(env, id)?;
+            if from != dir {
+                let from = from.to_string_lossy();
+                let spec = format!("+{r}:{r}");
+                git_run(
+                    env,
+                    &dir,
+                    &[
+                        "fetch",
+                        "-q",
+                        "--no-tags",
+                        "--no-write-fetch-head",
+                        &from,
+                        &spec,
+                    ],
+                )
+                .with_context(|| format!("cannot bring the objects of {id} along"))?;
+            }
+            refs.push(r);
+        }
+        let mut tips = vec![];
+        for r in &refs {
+            let tip = git_run(
+                env,
+                &dir,
+                &["rev-parse", "--verify", "-q", &format!("{r}^{{commit}}")],
+            )
+            .with_context(|| format!("{r} is not in this store"))?;
+            tips.push(tip);
+        }
+        let known = |c: &str| {
+            is_hex40(c)
+                && git_run(env, &dir, &["cat-file", "-e", &format!("{c}^{{commit}}")]).is_ok()
+        };
+        let mut not: BTreeSet<String> = have
+            .iter()
+            .take(MAX_BASIS)
+            .filter(|c| known(c))
+            .cloned()
+            .collect();
+        // Would the bundle leave `tip` out, with these exclusions?
+        let left_out = |tip: &str, not: &BTreeSet<String>| -> Result<bool> {
+            if not.is_empty() {
+                return Ok(false);
+            }
+            let mut args = vec!["rev-list".to_string(), "-n".into(), "1".into(), tip.into()];
+            args.extend(not.iter().map(|c| format!("^{c}")));
+            let args: Vec<&str> = args.iter().map(String::as_str).collect();
+            Ok(git_run(env, &dir, &args)?.is_empty())
+        };
+        let below = |tip: &str, c: &str| {
+            git_run(env, &dir, &["merge-base", "--is-ancestor", tip, c]).is_ok()
+        };
+        // first the parents stand in for an exclusion that covers a tip; the
+        // second round only drops what still covers one
+        for stand_in in [true, false] {
+            let mut parents = vec![];
+            for tip in &tips {
+                if !left_out(tip, &not)? {
+                    continue;
+                }
+                not.retain(|c| !below(tip, c));
+                if stand_in {
+                    let ps = git_run(env, &dir, &["rev-parse", &format!("{tip}^@")])?;
+                    parents.extend(ps.lines().filter(|p| is_hex40(p)).map(str::to_string));
+                }
+            }
+            not.extend(parents);
+        }
+        let out_dir = self.inner.root().join("bundles");
+        std::fs::create_dir_all(&out_dir)?;
+        let mut h = Sha256::new();
+        for c in &not {
+            h.update(c.as_bytes());
+        }
+        let basis: String = h
+            .finalize()
+            .iter()
+            .take(8)
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        let dest = out_dir.join(format!("{}.{basis}.bundle", m.source_id));
+        let tmp = tempfile::Builder::new()
+            .prefix(".bundle.")
+            .tempfile_in(&out_dir)?
+            .into_temp_path();
+        // git writes the bundle through a lock file of its own beside it
+        std::fs::remove_file(&tmp)?;
+        let tmp_str = tmp.to_string_lossy().into_owned();
+        let mut args: Vec<String> = vec!["bundle".into(), "create".into(), "-q".into(), tmp_str];
+        args.extend(refs);
+        args.extend(not.iter().map(|c| format!("^{c}")));
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        git_run(env, &dir, &args)
+            .with_context(|| format!("cannot bundle the commits of {}", m.source_id))?;
+        tmp.persist(&dest).map_err(|e| e.error)?;
+        Ok(dest)
     }
 
     fn run_record_path(&self, run: &RunId) -> PathBuf {

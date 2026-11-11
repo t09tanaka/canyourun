@@ -224,7 +224,7 @@ impl Fixture {
             return;
         }
         let bundle = store
-            .export_bundle(&ExecContext::new(self.env()), m)
+            .export_bundle(&ExecContext::new(self.env()), m, &[])
             .unwrap();
         repo.receive_bundle(&bundle, m).unwrap();
     }

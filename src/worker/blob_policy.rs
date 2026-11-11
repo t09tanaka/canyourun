@@ -7,11 +7,20 @@
 //! bytes themselves are handled in [`super::blobs`].
 
 use crate::wire::SourceBlobKind;
+use std::collections::BTreeMap;
 
 /// Bytes of one `blob_put` chunk, at most (1 MiB; a frame holds 2 MiB).
 pub const MAX_PUT_CHUNK: usize = 1_048_576;
 /// Lock files the sources share (a source always maps to the same one).
 pub const LOCK_SHARDS: u64 = 64;
+/// Commits a `blob_verify` lists of one clone, at most.
+pub const MAX_HAVE: usize = 64;
+/// Snapshot refs of a clone that are looked at to make that list.
+pub const MAX_SNAPSHOT_REFS: usize = 4096;
+/// Bytes of a bundle that are read to find its header (1 MiB).
+pub const MAX_BUNDLE_HEADER: usize = 1_048_576;
+/// Prerequisite commits a bundle may name.
+pub const MAX_PREREQUISITES: usize = 4096;
 
 /// What the worker accepts from a coordinator, per blob and per source.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -22,8 +31,14 @@ pub struct BlobLimits {
     pub max_manifest_bytes: u64,
     /// The Git bundle of a source.
     pub max_bundle_bytes: u64,
-    /// The files of one source, each once.
+    /// Everything of one source that is staged or still to come: its
+    /// manifests, its bundle, and its files (each once).
     pub max_source_bytes: u64,
+    /// The same, over all the sources that are part-way.
+    pub max_incoming_bytes: u64,
+    /// Free space of the disk that must be left after what a source still
+    /// has to bring.
+    pub min_free_bytes: u64,
     /// Manifests of one source (its own and its submodule captures).
     pub max_manifests: u32,
     /// Blobs of one source that are part-way at once.
@@ -44,6 +59,8 @@ impl Default for BlobLimits {
             max_manifest_bytes: 67_108_864,
             max_bundle_bytes: 4_294_967_296,
             max_source_bytes: 34_359_738_368,
+            max_incoming_bytes: 68_719_476_736,
+            min_free_bytes: 1_073_741_824,
             max_manifests: 256,
             max_partials: 64,
             max_staged_sources: 16,
@@ -127,24 +144,38 @@ fn is_hex64(s: &str) -> bool {
     s.len() == 64 && s.bytes().all(|c| matches!(c, b'0'..=b'9' | b'a'..=b'f'))
 }
 
-/// The name of a staged file: `<kind>-<hex>.part` while bytes are missing,
-/// `.done` once the digest was checked. `hex` is the digest without its
-/// prefix; nothing else of a request ever becomes part of a path.
-pub fn staged_name(kind: SourceBlobKind, hex: &str, done: bool) -> String {
-    let ext = if done { "done" } else { "part" };
-    format!("{}-{hex}.{ext}", kind_word(kind))
+/// A staged file, as its name tells.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StagedName<'a> {
+    pub kind: SourceBlobKind,
+    /// The digest without its prefix.
+    pub hex: &'a str,
+    /// The size the sender announced for the whole blob.
+    pub size: u64,
+    pub done: bool,
 }
 
-/// The inverse of [`staged_name`]: kind, digest hex and whether it is done.
-/// `None` for a name this module would not have made.
-pub fn parse_staged_name(name: &str) -> Option<(SourceBlobKind, &str, bool)> {
+/// The name of a staged file: `<kind>-<hex>-<size>.part` while bytes are
+/// missing, `.done` once the digest was checked. `hex` is the digest without
+/// its prefix, `size` the announced size of the whole blob (so what a source
+/// is going to take is known from the names alone, after a restart too);
+/// nothing else of a request ever becomes part of a path.
+pub fn staged_name(kind: SourceBlobKind, hex: &str, size: u64, done: bool) -> String {
+    let ext = if done { "done" } else { "part" };
+    format!("{}-{hex}-{size}.{ext}", kind_word(kind))
+}
+
+/// The inverse of [`staged_name`]. `None` for a name this module would not
+/// have made.
+pub fn parse_staged_name(name: &str) -> Option<StagedName<'_>> {
     let (stem, ext) = name.rsplit_once('.')?;
     let done = match ext {
         "done" => true,
         "part" => false,
         _ => return None,
     };
-    let (word, hex) = stem.split_once('-')?;
+    let mut words = stem.split('-');
+    let (word, hex, digits) = (words.next()?, words.next()?, words.next()?);
     let kind = [
         SourceBlobKind::Content,
         SourceBlobKind::Manifest,
@@ -152,7 +183,28 @@ pub fn parse_staged_name(name: &str) -> Option<(SourceBlobKind, &str, bool)> {
     ]
     .into_iter()
     .find(|k| kind_word(*k) == word)?;
-    is_hex64(hex).then_some((kind, hex, done))
+    let size: u64 = digits.parse().ok()?;
+    // one spelling per size, and nothing after it
+    (words.next().is_none() && is_hex64(hex) && size.to_string() == digits).then_some(StagedName {
+        kind,
+        hex,
+        size,
+        done,
+    })
+}
+
+/// Does starting the staged file of `new` put `old` away? A source holds one
+/// bundle; before its own manifest is staged it holds one manifest part-way;
+/// and a blob is staged under one size only.
+pub fn displaces(new: &StagedName<'_>, root_staged: bool, old: &StagedName<'_>) -> bool {
+    if new.kind != old.kind || (new.hex == old.hex && new.size == old.size) {
+        return false;
+    }
+    match new.kind {
+        SourceBlobKind::Bundle => true,
+        SourceBlobKind::Manifest => !old.done && (!root_staged || new.hex == old.hex),
+        SourceBlobKind::Content => !old.done && new.hex == old.hex,
+    }
 }
 
 /// Which lock file a source uses: FNV-1a of its id, over [`LOCK_SHARDS`].
@@ -217,26 +269,140 @@ pub fn manifest_role(
     Ok(ManifestRole::Submodule)
 }
 
-/// The files a manifest adds to a source: none larger than a blob may be,
-/// and the source's files (each once; `already` bytes are staged) within the
-/// source's cap. `sizes` are the sizes of the files that are new to the
-/// source. Returns the new total.
-pub fn check_manifest_files(
+/// The files a manifest adds to a source: by hash, the ones no staged
+/// manifest named yet. None may be larger than a blob may be, and a hash has
+/// one size: a manifest that gives another size than `wanted` (what the
+/// staged manifests name) or than itself is refused, never taken over.
+pub fn check_manifest_files<'a>(
     limits: &BlobLimits,
-    already: u64,
-    sizes: impl IntoIterator<Item = u64>,
-) -> Result<u64, &'static str> {
-    let mut sum = already;
-    for size in sizes {
+    wanted: &BTreeMap<String, u64>,
+    entries: impl IntoIterator<Item = (&'a str, u64)>,
+) -> Result<BTreeMap<&'a str, u64>, &'static str> {
+    let mut new: BTreeMap<&'a str, u64> = BTreeMap::new();
+    for (hash, size) in entries {
         if size > limits.max_blob_bytes {
             return Err("the manifest names a file larger than this worker accepts");
         }
-        sum = match sum.checked_add(size) {
-            Some(s) if s <= limits.max_source_bytes => s,
-            _ => return Err("the source is larger than this worker accepts"),
-        };
+        let known = wanted.get(hash).or_else(|| new.get(hash)).copied();
+        match known {
+            Some(k) if k != size => {
+                return Err("the manifest gives a file another size than its hash has");
+            }
+            Some(_) if wanted.contains_key(hash) => {}
+            _ => {
+                new.insert(hash, size);
+            }
+        }
     }
-    Ok(sum)
+    Ok(new)
+}
+
+/// What a source takes in all: the announced sizes of its manifests and its
+/// bundle, and the files its staged manifests name. `None`: more than a
+/// number holds.
+pub fn source_total(manifests: u64, bundle: u64, files: u64) -> Option<u64> {
+    manifests.checked_add(bundle)?.checked_add(files)
+}
+
+/// Why a source may not grow.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Refusal {
+    /// The source alone is larger than a source may be.
+    Source,
+    /// The sources that are part-way would take more than they may together.
+    Incoming,
+    /// The disk would be left with too little.
+    Disk,
+}
+
+/// May a source grow to `total` bytes ([`source_total`])? `held` is what it
+/// had reserved, `others` what the other sources that are part-way have,
+/// `free` the free space of the disk. Returns what the source has reserved
+/// from now on (a reservation never shrinks).
+pub fn check_reservation(
+    limits: &BlobLimits,
+    total: Option<u64>,
+    held: u64,
+    others: u64,
+    free: u64,
+) -> Result<u64, Refusal> {
+    let total = match total {
+        Some(t) if t <= limits.max_source_bytes => t,
+        _ => return Err(Refusal::Source),
+    };
+    let Some(growth) = total.checked_sub(held).filter(|g| *g > 0) else {
+        return Ok(held);
+    };
+    match others.checked_add(total) {
+        Some(all) if all <= limits.max_incoming_bytes => {}
+        _ => return Err(Refusal::Incoming),
+    }
+    match growth.checked_add(limits.min_free_bytes) {
+        Some(need) if need <= free => Ok(total),
+        _ => Err(Refusal::Disk),
+    }
+}
+
+fn is_hex40(s: &str) -> bool {
+    s.len() == 40 && s.bytes().all(|c| matches!(c, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// The commits a Git bundle needs its receiver to hold already, read from
+/// the first bytes of the file (`head`: at most [`MAX_BUNDLE_HEADER`] of
+/// them). An error is about the file: it is not a bundle this worker takes.
+pub fn bundle_prerequisites(head: &[u8]) -> Result<Vec<String>, &'static str> {
+    let end = head
+        .windows(2)
+        .position(|w| w == b"\n\n")
+        .ok_or("the bundle has no header")?;
+    let text = std::str::from_utf8(&head[..end]).map_err(|_| "the bundle has no header")?;
+    let mut lines = text.split('\n');
+    let v3 = match lines.next() {
+        Some("# v2 git bundle") => false,
+        Some("# v3 git bundle") => true,
+        _ => return Err("the file is not a Git bundle"),
+    };
+    let mut out = vec![];
+    for line in lines {
+        if let Some(rest) = line.strip_prefix('-') {
+            let id = rest.split(' ').next().unwrap_or(rest);
+            if !is_hex40(id) {
+                return Err("the bundle names a prerequisite that is not a commit id");
+            }
+            if out.len() == MAX_PREREQUISITES {
+                return Err("the bundle has too many prerequisites");
+            }
+            out.push(id.to_string());
+        } else if v3 && line.starts_with('@') {
+            if line != "@object-format=sha1" {
+                return Err("the bundle needs something this worker does not do");
+            }
+        } else if !line
+            .split_once(' ')
+            .is_some_and(|(id, name)| is_hex40(id) && !name.is_empty())
+        {
+            return Err("the bundle has a header line that is not a ref");
+        }
+    }
+    Ok(out)
+}
+
+/// The commits a `blob_verify` lists of a clone, at most `cap`: first the
+/// ones the source asks about (`needed`), then the tips of the snapshots the
+/// clone holds, the one made on the newest commit first (`tips`: commit and
+/// the time of the commit it was made on), each once.
+pub fn order_have(needed: &[String], mut tips: Vec<(String, u64)>, cap: usize) -> Vec<String> {
+    tips.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    let mut out: Vec<String> = vec![];
+    for c in needed.iter().chain(tips.iter().map(|t| &t.0)) {
+        if out.len() >= cap {
+            break;
+        }
+        if !out.contains(c) {
+            out.push(c.clone());
+        }
+    }
+    out
 }
 
 /// A file is taken only when a staged manifest names it with this size.
@@ -260,9 +426,10 @@ pub enum Verdict {
     Corrupt,
 }
 
-/// A file of the source: `stored_size` is the size of the blob in the store
-/// when it is there, `partial` the length of its staged file when there is
-/// one. A staged file never counts for more than the blob's size.
+/// A file of the source: `stored_size` is the size it is held with when it
+/// is held whole (in the store, or waiting for the source to be published),
+/// `partial` the length of its staged file when there is one. A staged file
+/// never counts for more than the blob's size.
 pub fn content_verdict(stored_size: Option<u64>, partial: Option<u64>, total_size: u64) -> Verdict {
     match stored_size {
         Some(s) if s == total_size => Verdict::Present,
@@ -313,6 +480,8 @@ mod tests {
             max_manifest_bytes: 50,
             max_bundle_bytes: 70,
             max_source_bytes: 250,
+            max_incoming_bytes: 400,
+            min_free_bytes: 30,
             max_manifests: 3,
             max_partials: 2,
             max_staged_sources: 2,
@@ -328,6 +497,10 @@ mod tests {
         assert_eq!(d.max_manifest_bytes, 64 << 20);
         assert_eq!(d.max_bundle_bytes, 4 << 30);
         assert_eq!(d.max_source_bytes, 32 << 30);
+        assert_eq!(d.max_incoming_bytes, 64 << 30);
+        assert_eq!(d.min_free_bytes, 1 << 30);
+        assert_eq!((MAX_HAVE, MAX_SNAPSHOT_REFS), (64, 4096));
+        assert_eq!((MAX_BUNDLE_HEADER, MAX_PREREQUISITES), (1 << 20, 4096));
         assert_eq!(
             (d.max_manifests, d.max_partials, d.max_staged_sources),
             (256, 64, 16)
@@ -407,36 +580,101 @@ mod tests {
     #[test]
     fn staged_names_round_trip_and_nothing_else_parses() {
         assert_eq!(
-            staged_name(Content, HEX, false),
-            format!("content-{HEX}.part")
+            staged_name(Content, HEX, 7, false),
+            format!("content-{HEX}-7.part")
         );
         assert_eq!(
-            staged_name(Manifest, HEX, true),
-            format!("manifest-{HEX}.done")
+            staged_name(Manifest, HEX, 0, true),
+            format!("manifest-{HEX}-0.done")
         );
-        assert_eq!(staged_name(Bundle, HEX, true), format!("bundle-{HEX}.done"));
+        assert_eq!(
+            staged_name(Bundle, HEX, u64::MAX, true),
+            format!("bundle-{HEX}-18446744073709551615.done")
+        );
         for kind in [Content, Manifest, Bundle] {
             for done in [false, true] {
-                let name = staged_name(kind, HEX, done);
-                assert_eq!(parse_staged_name(&name), Some((kind, HEX, done)));
+                for size in [0, 10, u64::MAX] {
+                    let name = staged_name(kind, HEX, size, done);
+                    let want = StagedName {
+                        kind,
+                        hex: HEX,
+                        size,
+                        done,
+                    };
+                    assert_eq!(parse_staged_name(&name), Some(want));
+                }
             }
         }
         let upper = HEX.to_uppercase();
         for bad in [
             String::new(),
             "lock".to_string(),
-            format!("content-{HEX}"),
-            format!("content-{HEX}.tmp"),
-            format!("other-{HEX}.part"),
-            format!("content{HEX}.part"),
-            format!("content-{}.part", &HEX[1..]),
-            format!("content-{HEX}0.part"),
-            format!("content-{upper}.part"),
-            format!("content-{}g.part", &HEX[1..]),
-            format!("content-{}/.part", &HEX[1..]),
+            "reserved".to_string(),
+            format!("content-{HEX}-1"),
+            format!("content-{HEX}-1.tmp"),
+            format!("other-{HEX}-1.part"),
+            format!("content{HEX}-1.part"),
+            format!("content-{HEX}.part"),
+            format!("content-{HEX}-.part"),
+            format!("content-{HEX}-01.part"),
+            format!("content-{HEX}-+1.part"),
+            format!("content-{HEX}-1-1.part"),
+            format!("content-{HEX}-18446744073709551616.part"),
+            format!("content-{}-1.part", &HEX[1..]),
+            format!("content-{HEX}0-1.part"),
+            format!("content-{upper}-1.part"),
+            format!("content-{}g-1.part", &HEX[1..]),
+            format!("content-{}/-1.part", &HEX[1..]),
         ] {
             assert_eq!(parse_staged_name(&bad), None, "{bad}");
         }
+    }
+
+    #[test]
+    fn a_new_staged_file_puts_away_what_it_replaces() {
+        const OTHER: &str = "1123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let n = |kind, hex, size, done| StagedName {
+            kind,
+            hex,
+            size,
+            done,
+        };
+        // itself, and another kind, never
+        for kind in [Content, Manifest, Bundle] {
+            let new = n(kind, HEX, 5, false);
+            assert!(!displaces(&new, false, &n(kind, HEX, 5, false)));
+            assert!(!displaces(&new, false, &n(kind, HEX, 5, true)));
+        }
+        assert!(!displaces(
+            &n(Bundle, HEX, 5, false),
+            true,
+            &n(Manifest, OTHER, 5, false)
+        ));
+        assert!(!displaces(
+            &n(Manifest, HEX, 5, false),
+            false,
+            &n(Bundle, OTHER, 5, false)
+        ));
+        // one bundle
+        let bundle = n(Bundle, HEX, 5, false);
+        assert!(displaces(&bundle, true, &n(Bundle, OTHER, 5, false)));
+        assert!(displaces(&bundle, true, &n(Bundle, OTHER, 5, true)));
+        assert!(displaces(&bundle, true, &n(Bundle, HEX, 6, true)));
+        assert!(displaces(&bundle, true, &n(Bundle, OTHER, 6, false)));
+        // one manifest part-way until the source's own is staged
+        let manifest = n(Manifest, HEX, 5, false);
+        assert!(displaces(&manifest, false, &n(Manifest, OTHER, 5, false)));
+        assert!(!displaces(&manifest, true, &n(Manifest, OTHER, 5, false)));
+        assert!(!displaces(&manifest, true, &n(Manifest, OTHER, 6, false)));
+        assert!(!displaces(&manifest, false, &n(Manifest, OTHER, 5, true)));
+        assert!(displaces(&manifest, true, &n(Manifest, HEX, 6, false)));
+        assert!(!displaces(&manifest, true, &n(Manifest, HEX, 6, true)));
+        // a file under one size
+        let content = n(Content, HEX, 5, false);
+        assert!(displaces(&content, true, &n(Content, HEX, 6, false)));
+        assert!(!displaces(&content, true, &n(Content, HEX, 6, true)));
+        assert!(!displaces(&content, true, &n(Content, OTHER, 6, false)));
+        assert!(!displaces(&content, false, &n(Content, OTHER, 5, false)));
     }
 
     #[test]
@@ -494,25 +732,208 @@ mod tests {
     }
 
     #[test]
-    fn the_files_of_a_manifest_fit_the_blob_and_the_source_caps() {
+    fn the_files_of_a_manifest_are_new_ones_of_one_size_each() {
         let l = limits();
-        assert_eq!(check_manifest_files(&l, 0, []), Ok(0));
-        assert_eq!(check_manifest_files(&l, 50, [100, 100]), Ok(250));
+        let wanted: BTreeMap<String, u64> = [("a".to_string(), 5), ("b".to_string(), 0)].into();
+        let new = |pairs: &[(&'static str, u64)]| -> BTreeMap<&'static str, u64> {
+            pairs.iter().copied().collect()
+        };
+        assert_eq!(check_manifest_files(&l, &wanted, []), Ok(new(&[])));
         assert_eq!(
-            check_manifest_files(&l, 51, [100, 100]),
-            Err("the source is larger than this worker accepts")
+            check_manifest_files(&l, &wanted, [("a", 5), ("c", 100), ("b", 0), ("c", 100)]),
+            Ok(new(&[("c", 100)]))
         );
         assert_eq!(
-            check_manifest_files(&l, 0, [1, 101]),
+            check_manifest_files(&l, &BTreeMap::new(), [("a", 5), ("d", 0)]),
+            Ok(new(&[("a", 5), ("d", 0)]))
+        );
+        assert_eq!(
+            check_manifest_files(&l, &wanted, [("c", 101)]),
             Err("the manifest names a file larger than this worker accepts")
         );
-        let wide = BlobLimits {
-            max_blob_bytes: u64::MAX,
-            max_source_bytes: u64::MAX,
+        // a hash keeps the size it has: among the staged manifests ...
+        assert_eq!(
+            check_manifest_files(&l, &wanted, [("a", 6)]),
+            Err("the manifest gives a file another size than its hash has")
+        );
+        assert!(check_manifest_files(&l, &wanted, [("b", 1)]).is_err());
+        // ... and within the manifest
+        assert!(check_manifest_files(&l, &wanted, [("c", 1), ("c", 2)]).is_err());
+        assert!(check_manifest_files(&l, &wanted, [("c", 2), ("c", 1)]).is_err());
+    }
+
+    #[test]
+    fn a_source_reserves_what_it_takes_within_three_bounds() {
+        let l = limits();
+        assert_eq!(source_total(1, 2, 3), Some(6));
+        assert_eq!(source_total(u64::MAX, 0, 0), Some(u64::MAX));
+        assert_eq!(source_total(u64::MAX, 1, 0), None);
+        assert_eq!(source_total(u64::MAX - 1, 1, 1), None);
+        assert_eq!(source_total(0, u64::MAX, 1), None);
+
+        // the source's own cap
+        assert_eq!(check_reservation(&l, Some(250), 0, 0, 280), Ok(250));
+        assert_eq!(
+            check_reservation(&l, Some(251), 0, 0, 1000),
+            Err(Refusal::Source)
+        );
+        assert_eq!(
+            check_reservation(&l, None, 0, 0, 1000),
+            Err(Refusal::Source)
+        );
+        // all the sources together
+        assert_eq!(check_reservation(&l, Some(100), 0, 300, 1000), Ok(100));
+        assert_eq!(check_reservation(&l, Some(100), 40, 300, 1000), Ok(100));
+        assert_eq!(
+            check_reservation(&l, Some(101), 0, 300, 1000),
+            Err(Refusal::Incoming)
+        );
+        assert_eq!(
+            check_reservation(&l, Some(101), 100, 300, 1000),
+            Err(Refusal::Incoming)
+        );
+        assert_eq!(
+            check_reservation(&l, Some(1), 0, u64::MAX, 1000),
+            Err(Refusal::Incoming)
+        );
+        // the disk: what is still to come, and the floor
+        assert_eq!(check_reservation(&l, Some(100), 0, 0, 130), Ok(100));
+        assert_eq!(
+            check_reservation(&l, Some(100), 0, 0, 129),
+            Err(Refusal::Disk)
+        );
+        assert_eq!(check_reservation(&l, Some(100), 60, 0, 70), Ok(100));
+        assert_eq!(
+            check_reservation(&l, Some(100), 60, 0, 69),
+            Err(Refusal::Disk)
+        );
+        let floor = BlobLimits {
+            min_free_bytes: u64::MAX,
             ..limits()
         };
-        assert_eq!(check_manifest_files(&wide, 1, [u64::MAX - 1]), Ok(u64::MAX));
-        assert!(check_manifest_files(&wide, 2, [u64::MAX - 1]).is_err());
+        assert_eq!(
+            check_reservation(&floor, Some(1), 0, 0, u64::MAX),
+            Err(Refusal::Disk)
+        );
+        // nothing grows: nothing is asked, and the reservation stays
+        assert_eq!(check_reservation(&l, Some(100), 100, 400, 0), Ok(100));
+        assert_eq!(check_reservation(&l, Some(40), 100, 400, 0), Ok(100));
+        assert_eq!(check_reservation(&l, Some(0), 0, 400, 0), Ok(0));
+        assert_eq!(
+            check_reservation(&l, Some(251), 300, 0, 1000),
+            Err(Refusal::Source)
+        );
+    }
+
+    #[test]
+    fn the_prerequisites_of_a_bundle_are_read_from_its_header() {
+        const A: &str = "0123456789abcdef0123456789abcdef01234567";
+        const B: &str = "1123456789abcdef0123456789abcdef01234567";
+        let ok = |text: String| bundle_prerequisites(text.as_bytes());
+        assert_eq!(
+            ok(format!("# v2 git bundle\n{A} refs/x\n\nPACK")),
+            Ok(vec![])
+        );
+        assert_eq!(ok("# v2 git bundle\n\n".to_string()), Ok(vec![]));
+        assert_eq!(
+            ok(format!(
+                "# v2 git bundle\n-{A} a subject line\n-{B}\n{A} refs/x\n{B} refs/y z\n\nPACK\n\n-junk"
+            )),
+            Ok(vec![A.to_string(), B.to_string()])
+        );
+        assert_eq!(
+            ok(format!(
+                "# v3 git bundle\n@object-format=sha1\n-{B} s\n{A} refs/x\n\n"
+            )),
+            Ok(vec![B.to_string()])
+        );
+        // not a bundle, or one this worker does not take
+        assert_eq!(
+            ok(format!("# v2 git bundle\n{A} refs/x\n")),
+            Err("the bundle has no header")
+        );
+        assert_eq!(bundle_prerequisites(b""), Err("the bundle has no header"));
+        assert_eq!(
+            bundle_prerequisites(b"# v2 git bundle\n\xff\n\n"),
+            Err("the bundle has no header")
+        );
+        assert_eq!(
+            ok("# v4 git bundle\n\n".to_string()),
+            Err("the file is not a Git bundle")
+        );
+        assert_eq!(ok("\n\n".to_string()), Err("the file is not a Git bundle"));
+        for line in [
+            format!("-{}", &A[1..]),
+            format!("-{A}x"),
+            format!("-{}", A.to_uppercase()),
+            "-".to_string(),
+        ] {
+            assert_eq!(
+                ok(format!("# v2 git bundle\n{line}\n\n")),
+                Err("the bundle names a prerequisite that is not a commit id"),
+                "{line}"
+            );
+        }
+        for line in [
+            A.to_string(),
+            format!("{A} "),
+            format!("{} refs/x", &A[1..]),
+            "@object-format=sha1".to_string(),
+            "junk".to_string(),
+        ] {
+            assert_eq!(
+                ok(format!("# v2 git bundle\n{line}\n\n")),
+                Err("the bundle has a header line that is not a ref"),
+                "{line}"
+            );
+        }
+        for line in ["@object-format=sha256", "@filter=blob:none", "@"] {
+            assert_eq!(
+                ok(format!("# v3 git bundle\n{line}\n\n")),
+                Err("the bundle needs something this worker does not do"),
+                "{line}"
+            );
+        }
+        let many = |n: usize| {
+            let mut text = String::from("# v2 git bundle\n");
+            for i in 0..n {
+                text.push_str(&format!("-{i:040x}\n"));
+            }
+            text.push('\n');
+            bundle_prerequisites(text.as_bytes())
+        };
+        assert_eq!(many(MAX_PREREQUISITES).map(|p| p.len()), Ok(4096));
+        assert_eq!(
+            many(MAX_PREREQUISITES + 1),
+            Err("the bundle has too many prerequisites")
+        );
+    }
+
+    #[test]
+    fn have_lists_what_is_asked_first_then_the_newest_each_once() {
+        let s = |x: &str| x.to_string();
+        let tips = vec![
+            (s("c"), 5),
+            (s("a"), 9),
+            (s("b"), 9),
+            (s("d"), 0),
+            (s("n"), 7),
+        ];
+        assert_eq!(
+            order_have(&[], tips.clone(), 64),
+            ["a", "b", "n", "c", "d"].map(s)
+        );
+        assert_eq!(
+            order_have(&[s("n"), s("d"), s("n")], tips.clone(), 64),
+            ["n", "d", "a", "b", "c"].map(s)
+        );
+        assert_eq!(
+            order_have(&[s("d")], tips.clone(), 3),
+            ["d", "a", "b"].map(s)
+        );
+        assert_eq!(order_have(&[s("d"), s("c")], tips.clone(), 1), [s("d")]);
+        assert_eq!(order_have(&[s("d")], tips, 0), Vec::<String>::new());
+        assert_eq!(order_have(&[], vec![], 64), Vec::<String>::new());
     }
 
     #[test]

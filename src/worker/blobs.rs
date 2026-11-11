@@ -5,28 +5,46 @@
 //! then the captures of the submodules it names), its files (named by the
 //! hash of their content) and, for a Git source, one bundle. A manifest is the
 //! authority: only what a staged manifest names is taken, with the size it
-//! gives. Bytes land in `<state_dir>/incoming/<source_id>/`; the only state
-//! of a transfer is the length of its staged file, so a transfer that was cut
-//! resumes on another connection or after a restart of the agent. The digest
-//! is checked when the last byte is there. Once a source has everything, the
-//! bundle is unpacked into the repository's clone and the manifests are
-//! published in the store (leaf first, the source's own last); only then can
-//! an attempt be prepared from it.
+//! gives. Everything waits in `<state_dir>/incoming/<source_id>/` until the
+//! source is whole:
+//!
+//! ```text
+//! manifest-<hex>-<size>.part|.done   bundle-<hex>-<size>.part|.done
+//! parts/content-<hex>-<size>.part    files/content-<hex>-<size>.done
+//! reserved                           (the bytes the source may take in all)
+//! ```
+//!
+//! The only state of a transfer is those files (the length of a `.part` is
+//! what was received), so a transfer that was cut resumes on another
+//! connection or after a restart of the agent. The digest is checked when the
+//! last byte is there. Once a source has everything, the bundle is unpacked
+//! into the repository's clone, the files are moved into the store and the
+//! manifests are published (leaf first, the source's own last); only then
+//! can an attempt be prepared from it. A source that is dropped before that
+//! leaves nothing in the store.
+//!
+//! The worker never asks origin for anything: the clone a bundle is unpacked
+//! into has no remote and is made when the first bundle arrives. A
+//! `blob_verify` tells the coordinator which commits the clone holds, so the
+//! next bundle carries only what is missing.
 //!
 //! Requests for one source are serialized by a file lock, whichever
-//! connection or process they come from. The decisions are in
-//! [`super::blob_policy`].
+//! connection or process they come from; what the sources take together
+//! (how many, how many bytes) is decided under one more lock for all of
+//! them. The decisions are in [`super::blob_policy`].
 
 use super::blob_policy::{
-    check_content, check_manifest_files, check_put, content_verdict, get_range, is_stale,
-    lock_shard, manifest_role, may_stage_source, may_start_partial, parse_staged_name, plan_chunk,
-    staged_name, staged_verdict, BlobLimits, ChunkStep, Verdict,
+    bundle_prerequisites, check_content, check_manifest_files, check_put, check_reservation,
+    content_verdict, displaces, get_range, is_stale, lock_shard, manifest_role, may_stage_source,
+    may_start_partial, order_have, parse_staged_name, plan_chunk, source_total, staged_name,
+    staged_verdict, BlobLimits, ChunkStep, Refusal, StagedName, Verdict, MAX_BUNDLE_HEADER,
+    MAX_HAVE, MAX_SNAPSHOT_REFS,
 };
 use super::host::Host;
 use super::policy::MAX_VERIFY_DIGESTS;
-use crate::error::{ApiError, ErrorCode};
+use crate::error::{ApiError, ConflictReason, ErrorCode};
 use crate::ids::{Digest, SourceId};
-use crate::platform::wall_ms;
+use crate::platform::{free_bytes, open_beneath, wall_ms};
 use crate::protocol::chunk::clamp_chunk;
 use crate::source::classify::{ci_id_of, source_id_of_ci};
 use crate::source::diff::{is_blob_hash, BlobWant};
@@ -36,7 +54,7 @@ use crate::storage::WorkerStore;
 use crate::supervisor::spool_plan::relative_path;
 use crate::wire::{
     ArtifactRecord, BlobGetRequest, BlobGetResponse, BlobProgress, BlobPutRequest, BlobPutResponse,
-    BlobVerifyRequest, BlobVerifyResponse, Bytes, SchemaVersion, SourceBlobKind,
+    BlobVerifyRequest, BlobVerifyResponse, Bytes, RepositoryHave, SchemaVersion, SourceBlobKind,
 };
 use crate::workspace::plan::clone_dir_name;
 use crate::workspace::Workspaces;
@@ -60,8 +78,19 @@ pub trait BlobSink: Send + Sync {
     ) -> Result<BlobVerifyResponse, ApiError>;
 }
 
+/// The file in a source's staging directory that holds its reservation.
+const RESERVED: &str = "reserved";
+const RESERVED_TMP: &str = "reserved.tmp";
+/// Where the files of a source wait: part-way, and whole.
+const PARTS: &str = "parts";
+const FILES: &str = "files";
+
 fn invalid(m: impl Into<String>) -> ApiError {
     ApiError::new(ErrorCode::InvalidInput, m)
+}
+
+fn overloaded(m: impl Into<String>) -> ApiError {
+    ApiError::new(ErrorCode::Overloaded, m)
 }
 
 fn internal(what: &str, e: impl std::fmt::Display) -> ApiError {
@@ -120,15 +149,85 @@ fn remove_staged(path: &Path) {
     let _ = fs::remove_file(path);
 }
 
+/// A staged file of a source: its name, and what the name tells.
+#[derive(Debug, Clone)]
+struct StagedFile {
+    name: String,
+    kind: SourceBlobKind,
+    hex: String,
+    size: u64,
+    done: bool,
+}
+
+impl StagedFile {
+    fn as_name(&self) -> StagedName<'_> {
+        StagedName {
+            kind: self.kind,
+            hex: &self.hex,
+            size: self.size,
+            done: self.done,
+        }
+    }
+}
+
+/// The names in a directory that are staged files of ours.
+fn listing(dir: &Path) -> Result<Vec<StagedFile>, ApiError> {
+    let entries = match fs::read_dir(dir) {
+        Ok(e) => e,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(vec![]),
+        Err(e) => return Err(io_err(e)),
+    };
+    let mut out = vec![];
+    for entry in entries {
+        let name = entry.map_err(io_err)?.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if let Some(n) = parse_staged_name(name) {
+            out.push(StagedFile {
+                name: name.to_string(),
+                kind: n.kind,
+                hex: n.hex.to_string(),
+                size: n.size,
+                done: n.done,
+            });
+        }
+    }
+    Ok(out)
+}
+
+/// What the manifests and the bundle of a source take: the sizes their
+/// staged files (whole or part-way) were announced with.
+fn announced(files: &[StagedFile]) -> (u64, u64) {
+    let sum = |kind| {
+        files
+            .iter()
+            .filter(|f| f.kind == kind)
+            .fold(0u64, |a, f| a.saturating_add(f.size))
+    };
+    (sum(SourceBlobKind::Manifest), sum(SourceBlobKind::Bundle))
+}
+
+/// What is kept of a staged manifest between requests: not its body (that
+/// is read again from its file when the source is published).
+struct ManifestInfo {
+    /// The digest (hex) and size its staged file is named by.
+    hex: String,
+    size: u64,
+    /// The submodule captures it names, and whether each is a dirty one.
+    subs: Vec<(String, bool)>,
+    repository_id: Option<String>,
+    execution_commit: Option<String>,
+    worktree_tree: Option<String>,
+}
+
 /// The manifests staged for a source and what they ask for. Derived from the
 /// staged files alone: it is rebuilt from them whenever it is not at hand.
 #[derive(Default)]
 struct Staged {
     /// By the id local-ci's store knows.
-    manifests: BTreeMap<String, CiManifest>,
+    manifests: BTreeMap<String, ManifestInfo>,
     /// The files the manifests name: hash to size.
     wanted: BTreeMap<String, u64>,
-    /// The ones of `wanted` not seen in the store yet.
+    /// The ones of `wanted` not seen whole yet.
     missing: BTreeSet<String>,
     /// The submodule captures the manifests name.
     named: BTreeSet<String>,
@@ -137,49 +236,60 @@ struct Staged {
 }
 
 impl Staged {
-    /// The sizes of the files `m` names that are new to the source, each once.
-    fn new_files<'a>(&self, m: &'a CiManifest) -> BTreeMap<&'a str, u64> {
-        m.object_manifest
-            .entries
-            .iter()
-            .filter(|e| !self.wanted.contains_key(&e.hash))
-            .map(|e| (e.hash.as_str(), e.size))
-            .collect()
-    }
-
-    fn add(&mut self, m: CiManifest) {
-        for e in &m.object_manifest.entries {
-            if self.wanted.insert(e.hash.clone(), e.size).is_none() {
-                self.bytes = self.bytes.saturating_add(e.size);
-                self.missing.insert(e.hash.clone());
-            }
+    /// Take `m`, whose files new to the source are `new` (see
+    /// [`check_manifest_files`]: a size already known is never replaced).
+    fn add(&mut self, m: &CiManifest, new: &BTreeMap<&str, u64>, hex: &str, size: u64) {
+        for (hash, size) in new {
+            self.wanted.insert(hash.to_string(), *size);
+            self.missing.insert(hash.to_string());
+            self.bytes = self.bytes.saturating_add(*size);
         }
+        let mut subs = vec![];
         for s in &m.submodules {
             if let Some(id) = &s.source_id {
                 self.named.insert(id.clone());
+                subs.push((id.clone(), s.dirty));
             }
         }
-        self.manifests.insert(m.source_id.clone(), m);
+        self.manifests.insert(
+            m.source_id.clone(),
+            ManifestInfo {
+                hex: hex.to_string(),
+                size,
+                subs,
+                repository_id: m.repository_id.clone(),
+                execution_commit: m.execution_commit.clone(),
+                worktree_tree: m.worktree_tree.clone(),
+            },
+        );
     }
 
     /// The staged manifests below `root`, leaf first, `root` last.
-    fn leaf_first(&self, root: &str) -> Vec<CiManifest> {
-        fn walk(s: &Staged, id: &str, seen: &mut BTreeSet<String>, out: &mut Vec<CiManifest>) {
+    fn leaf_first(&self, root: &str) -> Vec<String> {
+        fn walk(s: &Staged, id: &str, seen: &mut BTreeSet<String>, out: &mut Vec<String>) {
             if !seen.insert(id.to_string()) {
                 return;
             }
             let Some(m) = s.manifests.get(id) else {
                 return;
             };
-            for sub in &m.submodules {
-                if let Some(id) = &sub.source_id {
-                    walk(s, id, seen, out);
-                }
+            for (sub, _) in &m.subs {
+                walk(s, sub, seen, out);
             }
-            out.push(m.clone());
+            out.push(id.to_string());
         }
         let mut out = vec![];
         walk(self, root, &mut BTreeSet::new(), &mut out);
+        out
+    }
+
+    /// The sources whose commits the bundle carries: `root` and the dirty
+    /// submodule captures the staged manifests name.
+    fn carried(&self, root: &str) -> BTreeSet<String> {
+        let mut out: BTreeSet<String> = [root.to_string()].into();
+        for m in self.manifests.values() {
+            out.extend(m.subs.iter().filter(|s| s.1).map(|s| s.0.clone()));
+        }
         out
     }
 }
@@ -208,6 +318,43 @@ fn check_manifest(m: &CiManifest) -> Result<(), ApiError> {
         ));
     }
     Ok(())
+}
+
+fn entries_of(m: &CiManifest) -> impl Iterator<Item = (&str, u64)> {
+    m.object_manifest
+        .entries
+        .iter()
+        .map(|e| (e.hash.as_str(), e.size))
+}
+
+/// A manifest that was staged, read again and checked again.
+fn read_manifest(path: &Path, limits: &BlobLimits) -> Result<CiManifest, ApiError> {
+    let fits = staged_len(path)?.is_some_and(|n| n <= limits.max_manifest_bytes);
+    if !fits {
+        return Err(internal("incoming blobs", "a staged manifest is gone"));
+    }
+    let bytes = fs::read(path).map_err(io_err)?;
+    let m: CiManifest = serde_json::from_slice(&bytes)
+        .map_err(|e| invalid(format!("the manifest does not parse: {e}")))?;
+    check_manifest(&m)?;
+    Ok(m)
+}
+
+/// The first bytes of a staged bundle: enough to hold its header.
+fn bundle_head(path: &Path) -> io::Result<Vec<u8>> {
+    let mut head = vec![];
+    File::open(path)?
+        .take(MAX_BUNDLE_HEADER as u64)
+        .read_to_end(&mut head)?;
+    Ok(head)
+}
+
+fn read_reserved(dir: &Path) -> Option<u64> {
+    fs::read_to_string(dir.join(RESERVED))
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
 }
 
 enum Progress {
@@ -251,7 +398,7 @@ impl Incoming {
         self.root.join(source.as_str())
     }
 
-    fn lock_file(&self, source: &str) -> Result<File, ApiError> {
+    fn lock_file(&self, name: &str) -> Result<File, ApiError> {
         let dir = self.root.join("locks");
         private_dir(&dir).map_err(io_err)?;
         fs::OpenOptions::new()
@@ -259,15 +406,13 @@ impl Incoming {
             .truncate(false)
             .write(true)
             .mode(0o600)
-            .open(dir.join(format!("{}.lock", lock_shard(source))))
+            .open(dir.join(format!("{name}.lock")))
             .map_err(io_err)
     }
 
-    /// The lock of `source`, held until the file is dropped. Another request
-    /// on the same source (from any connection or process) is waited for,
-    /// but not for ever.
-    fn lock(&self, source: &SourceId, limits: &BlobLimits) -> Result<File, ApiError> {
-        let f = self.lock_file(source.as_str())?;
+    /// `f` locked, held until it is dropped. Whoever holds it (any
+    /// connection or process) is waited for, but not for ever.
+    fn wait_lock(f: File, limits: &BlobLimits, busy: &str) -> Result<File, ApiError> {
         let start = Instant::now();
         loop {
             match f.try_lock() {
@@ -276,13 +421,26 @@ impl Incoming {
                 Err(TryLockError::Error(e)) => return Err(io_err(e)),
             }
             if start.elapsed() >= Duration::from_millis(limits.lock_wait_ms) {
-                return Err(ApiError::new(
-                    ErrorCode::Overloaded,
-                    format!("source {source} is busy with another transfer"),
-                ));
+                return Err(overloaded(busy));
             }
             std::thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    /// The lock of `source`: one request on a source at a time.
+    fn lock(&self, source: &SourceId, limits: &BlobLimits) -> Result<File, ApiError> {
+        let f = self.lock_file(&lock_shard(source.as_str()).to_string())?;
+        let busy = format!("source {source} is busy with another transfer");
+        Self::wait_lock(f, limits, &busy)
+    }
+
+    /// The lock over all sources: how many are part-way and what they have
+    /// reserved is read and changed only under it. Taken after a source's
+    /// own lock, never before; whoever holds it only tries other sources'
+    /// locks, and never waits for one.
+    fn lock_all(&self, limits: &BlobLimits) -> Result<File, ApiError> {
+        let f = self.lock_file("all")?;
+        Self::wait_lock(f, limits, "the incoming sources are busy")
     }
 
     fn published(&self, ci_id: &str) -> Result<bool, ApiError> {
@@ -290,24 +448,6 @@ impl Incoming {
             .manifest(ci_id)
             .map(|m| m.is_some())
             .map_err(|e| internal("source store", format!("{e:#}")))
-    }
-
-    /// The names in a source's staging directory that are ours.
-    fn staged_files(dir: &Path) -> Result<Vec<(String, SourceBlobKind, bool)>, ApiError> {
-        let entries = match fs::read_dir(dir) {
-            Ok(e) => e,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(vec![]),
-            Err(e) => return Err(io_err(e)),
-        };
-        let mut out = vec![];
-        for entry in entries {
-            let name = entry.map_err(io_err)?.file_name();
-            let Some(name) = name.to_str() else { continue };
-            if let Some((kind, _, done)) = parse_staged_name(name) {
-                out.push((name.to_string(), kind, done));
-            }
-        }
-        Ok(out)
     }
 
     /// Remove what we staged for a source, and its directory when nothing
@@ -318,21 +458,41 @@ impl Incoming {
             .unwrap_or_else(|e| e.into_inner())
             .remove(source);
         let dir = self.root.join(source);
-        for (name, _, _) in Self::staged_files(&dir).unwrap_or_default() {
-            remove_staged(&dir.join(name));
+        for sub in [dir.join(PARTS), dir.join(FILES), dir.clone()] {
+            for f in listing(&sub).unwrap_or_default() {
+                remove_staged(&sub.join(f.name));
+            }
         }
+        let _ = fs::remove_dir(dir.join(PARTS));
+        let _ = fs::remove_dir(dir.join(FILES));
+        // the reservation goes last: a directory without one counts for all
+        // a source may take
+        remove_staged(&dir.join(RESERVED_TMP));
+        remove_staged(&dir.join(RESERVED));
         let _ = fs::remove_dir(&dir);
+    }
+
+    /// Is no staged file of ours in the staging directory `dir`?
+    fn holds_nothing(dir: &Path) -> bool {
+        [dir.join(PARTS), dir.to_path_buf(), dir.join(FILES)]
+            .iter()
+            .all(|d| listing(d).is_ok_and(|l| l.is_empty()))
+    }
+
+    /// Nothing of a source that has no staged file stays.
+    fn discard_if_empty(&self, source: &SourceId) {
+        if Self::holds_nothing(&self.dir(source)) {
+            self.discard(source.as_str());
+        }
     }
 
     /// What is staged for the source: from the cache, or read again from the
     /// staged manifests (after a restart, or when another process added one).
     fn staged(&self, source: &SourceId, limits: &BlobLimits) -> Result<Staged, ApiError> {
         let dir = self.dir(source);
-        let files = Self::staged_files(&dir)?;
-        let done: Vec<&String> = files
-            .iter()
-            .filter(|(_, k, done)| *k == SourceBlobKind::Manifest && *done)
-            .map(|(n, _, _)| n)
+        let done: Vec<StagedFile> = listing(&dir)?
+            .into_iter()
+            .filter(|f| f.kind == SourceBlobKind::Manifest && f.done)
             .collect();
         let cached = self
             .cache
@@ -340,23 +500,25 @@ impl Incoming {
             .unwrap_or_else(|e| e.into_inner())
             .remove(source.as_str());
         if let Some(st) = cached {
-            if st.manifests.len() == done.len() {
+            let same = st.manifests.len() == done.len()
+                && done
+                    .iter()
+                    .all(|f| st.manifests.values().any(|m| m.hex == f.hex));
+            if same {
                 return Ok(st);
             }
         }
         let mut st = Staged::default();
-        for name in done {
-            let path = dir.join(name);
-            let fits = staged_len(&path)?.is_some_and(|n| n <= limits.max_manifest_bytes);
-            let parsed = fits
-                .then(|| fs::read(&path).ok())
-                .flatten()
-                .and_then(|b| serde_json::from_slice::<CiManifest>(&b).ok())
-                .filter(|m| check_manifest(m).is_ok());
-            match parsed {
-                Some(m) => st.add(m),
+        for f in done {
+            let path = dir.join(&f.name);
+            let taken = read_manifest(&path, limits).ok().and_then(|m| {
+                let new = check_manifest_files(limits, &st.wanted, entries_of(&m)).ok()?;
+                st.add(&m, &new, &f.hex, f.size);
+                Some(())
+            });
+            if taken.is_none() {
                 // Not what this module would have promoted: ours, and useless.
-                None => remove_staged(&path),
+                remove_staged(&path);
             }
         }
         Ok(st)
@@ -398,8 +560,10 @@ impl Incoming {
                 .map_or(u64::MAX, |d| d.as_millis() as u64)
         };
         let mut newest = fs::symlink_metadata(dir).map_or(u64::MAX, ms);
-        for entry in fs::read_dir(dir).into_iter().flatten().flatten() {
-            newest = newest.max(entry.metadata().map_or(u64::MAX, ms));
+        for sub in [dir.to_path_buf(), dir.join(PARTS), dir.join(FILES)] {
+            for entry in fs::read_dir(sub).into_iter().flatten().flatten() {
+                newest = newest.max(entry.metadata().map_or(u64::MAX, ms));
+            }
         }
         newest
     }
@@ -407,7 +571,8 @@ impl Incoming {
     /// Room for one more source, or `OVERLOADED`. When there is none, the
     /// sources nobody added to for a long time are dropped first (each under
     /// its own lock, and only when that lock is free). `source` is the one
-    /// whose lock the caller holds.
+    /// whose lock the caller holds; the caller holds the lock over all
+    /// sources too.
     fn admit(&self, limits: &BlobLimits, source: &SourceId) -> Result<(), ApiError> {
         if may_stage_source(limits, self.staged_sources()?.len()) {
             return Ok(());
@@ -421,7 +586,7 @@ impl Incoming {
                 self.discard(&other);
                 continue;
             }
-            let f = self.lock_file(&other)?;
+            let f = self.lock_file(&lock_shard(&other).to_string())?;
             if f.try_lock().is_ok() {
                 self.discard(&other);
             }
@@ -429,27 +594,138 @@ impl Incoming {
         if may_stage_source(limits, self.staged_sources()?.len()) {
             return Ok(());
         }
-        Err(ApiError::new(
-            ErrorCode::Overloaded,
-            "too many sources are being received",
-        ))
+        Err(overloaded("too many sources are being received"))
     }
 
-    /// Take the chunk of `r` into the staged file of its blob.
-    fn append(
+    /// Let the source take `total` bytes in all ([`source_total`]), or say
+    /// why not. With `create`, a source that has no staging directory yet
+    /// gets one (when there is room for one more source). Counting the
+    /// sources, adding up what they reserved, looking at the disk and
+    /// writing the new reservation happen under the one lock over all
+    /// sources, so two requests cannot both take the last room.
+    fn reserve(
         &self,
         limits: &BlobLimits,
-        dir: &Path,
+        source: &SourceId,
+        total: Option<u64>,
+        create: bool,
+    ) -> Result<(), ApiError> {
+        let _all = self.lock_all(limits)?;
+        let dir = self.dir(source);
+        let exists = dir.is_dir();
+        if !exists {
+            if !create {
+                return Err(internal("incoming blobs", "the source is not staged"));
+            }
+            self.admit(limits, source)?;
+        }
+        let held = read_reserved(&dir).unwrap_or(0);
+        let mut others = 0u64;
+        for other in self.staged_sources()? {
+            if other == source.as_str() {
+                continue;
+            }
+            let other_dir = self.root.join(&other);
+            let theirs = match read_reserved(&other_dir) {
+                Some(n) => n,
+                // being removed just now, or only something that is not
+                // ours is left in it
+                None if !other_dir.is_dir() || Self::holds_nothing(&other_dir) => 0,
+                // unknown: it may take all a source may
+                None => limits.max_source_bytes,
+            };
+            others = others.saturating_add(theirs);
+        }
+        let free = free_bytes(&self.root).map_err(io_err)?;
+        let reserved =
+            check_reservation(limits, total, held, others, free).map_err(|r| match r {
+                Refusal::Source => invalid("the source is larger than this worker accepts"),
+                Refusal::Incoming => {
+                    overloaded("the sources being received take all the room there is for them")
+                }
+                Refusal::Disk => overloaded("the disk of this worker has no room for the source"),
+            })?;
+        if !exists {
+            private_dir(&dir).map_err(io_err)?;
+        }
+        if !exists || reserved != held || read_reserved(&dir).is_none() {
+            let tmp = dir.join(RESERVED_TMP);
+            fs::write(&tmp, reserved.to_string()).map_err(io_err)?;
+            fs::rename(&tmp, dir.join(RESERVED)).map_err(io_err)?;
+        }
+        Ok(())
+    }
+
+    /// Before the staged file of the blob of `r` is created: put away what
+    /// it replaces, count what is part-way, and reserve what it adds.
+    fn begin(
+        &self,
+        limits: &BlobLimits,
         r: &BlobPutRequest,
+        st: &Staged,
+        root_staged: bool,
+    ) -> Result<(), ApiError> {
+        let dir = self.dir(&r.source_id);
+        let new = StagedName {
+            kind: r.kind,
+            hex: hex_of(&r.digest),
+            size: r.total_size,
+            done: false,
+        };
+        let home = match r.kind {
+            SourceBlobKind::Content => dir.join(PARTS),
+            _ => dir.clone(),
+        };
+        let mut kept = vec![];
+        for f in listing(&dir)? {
+            if displaces(&new, root_staged, &f.as_name()) {
+                remove_staged(&dir.join(&f.name));
+            } else {
+                kept.push(f);
+            }
+        }
+        let mut parts = kept.iter().filter(|f| !f.done).count();
+        for f in listing(&dir.join(PARTS))? {
+            if displaces(&new, root_staged, &f.as_name()) {
+                remove_staged(&dir.join(PARTS).join(&f.name));
+            } else {
+                parts += 1;
+            }
+        }
+        if !may_start_partial(limits, parts) {
+            return Err(overloaded("too many blobs of the source are part-way"));
+        }
+        if r.kind != SourceBlobKind::Content {
+            // a file is reserved when its manifest is staged; these when
+            // they start
+            let (manifests, bundle) = announced(&kept);
+            let (manifests, bundle) = match r.kind {
+                SourceBlobKind::Manifest => (manifests.checked_add(r.total_size), Some(bundle)),
+                _ => (Some(manifests), bundle.checked_add(r.total_size)),
+            };
+            let total = manifests
+                .zip(bundle)
+                .and_then(|(m, b)| source_total(m, b, st.bytes));
+            self.reserve(limits, &r.source_id, total, true)?;
+        }
+        private_dir(&home).map_err(io_err)
+    }
+
+    /// Take the chunk of `r` into `part`, the staged file of its blob.
+    /// `begin` runs before the file is created.
+    fn append(
+        &self,
+        part: &Path,
+        r: &BlobPutRequest,
+        begin: impl FnOnce() -> Result<(), ApiError>,
     ) -> Result<Progress, ApiError> {
-        let part = dir.join(staged_name(r.kind, hex_of(&r.digest), false));
-        let held = staged_len(&part)?;
+        let held = staged_len(part)?;
         let data = &r.data.0;
         let (skip, complete) =
             match plan_chunk(held.unwrap_or(0), r.total_size, r.offset, data.len()) {
                 ChunkStep::Behind => return Ok(Progress::At(held.unwrap_or(0))),
                 ChunkStep::Overlong => {
-                    remove_staged(&part);
+                    remove_staged(part);
                     return Err(invalid(
                         "the staged bytes are not this blob's; send it again from the start",
                     ));
@@ -459,19 +735,10 @@ impl Incoming {
         let mut open = fs::OpenOptions::new();
         open.append(true).custom_flags(libc::O_NOFOLLOW);
         if held.is_none() {
-            let partials = Self::staged_files(dir)?
-                .iter()
-                .filter(|(_, _, done)| !done)
-                .count();
-            if !may_start_partial(limits, partials) {
-                return Err(ApiError::new(
-                    ErrorCode::Overloaded,
-                    "too many blobs of the source are part-way",
-                ));
-            }
+            begin()?;
             open.create_new(true).mode(0o600);
         }
-        let mut f = open.open(&part).map_err(io_err)?;
+        let mut f = open.open(part).map_err(io_err)?;
         f.write_all(&data[skip..]).map_err(io_err)?;
         if !complete {
             return Ok(Progress::At(
@@ -480,30 +747,32 @@ impl Incoming {
         }
         f.sync_all().map_err(io_err)?;
         drop(f);
-        if digest_of_file(&part).map_err(io_err)? != r.digest {
-            remove_staged(&part);
+        if digest_of_file(part).map_err(io_err)? != r.digest {
+            remove_staged(part);
             return Err(invalid(format!(
                 "the bytes of {} do not have that digest; send it again from the start",
                 r.digest
             )));
         }
-        Ok(Progress::Whole(part))
+        Ok(Progress::Whole(part.to_path_buf()))
     }
 
-    /// A manifest arrived whole: take it for the source, or refuse it.
+    /// A manifest arrived whole: take it for the source, or refuse it. A
+    /// manifest that is refused for what it says is removed; one there is no
+    /// room for right now (`OVERLOADED`) stays, and is taken when its last
+    /// chunk is sent again.
     fn stage_manifest(
         &self,
         limits: &BlobLimits,
+        r: &BlobPutRequest,
         root_id: &str,
         part: &Path,
-        done: &Path,
         st: &mut Staged,
     ) -> Result<(), ApiError> {
+        let dir = self.dir(&r.source_id);
+        let hex = hex_of(&r.digest);
         let checked = (|| {
-            let bytes = fs::read(part).map_err(io_err)?;
-            let m: CiManifest = serde_json::from_slice(&bytes)
-                .map_err(|e| invalid(format!("the manifest does not parse: {e}")))?;
-            check_manifest(&m)?;
+            let m = read_manifest(part, limits)?;
             manifest_role(
                 limits,
                 m.source_id == root_id,
@@ -512,55 +781,202 @@ impl Incoming {
                 st.manifests.len(),
             )
             .map_err(invalid)?;
-            check_manifest_files(limits, st.bytes, st.new_files(&m).into_values())
-                .map_err(invalid)?;
-            Ok(m)
+            if st.manifests.contains_key(&m.source_id) {
+                // The same manifest in another spelling: the staged one stays.
+                return Ok(None);
+            }
+            let stored = self
+                .store
+                .manifest(&m.source_id)
+                .map_err(|e| internal("source store", format!("{e:#}")))?;
+            // A capture the store holds is never written again (the one that
+            // is there is the one attempts were prepared from): the same
+            // manifest is staged as any other, so the source knows it has
+            // it, and is left out when the source is published; another one
+            // under that id is refused.
+            if stored.is_some_and(|stored| stored != m) {
+                return Err(invalid(format!(
+                    "another manifest is published as {}",
+                    m.source_id
+                )));
+            }
+            Ok(Some(m))
         })();
         let m = match checked {
-            Ok(m) => m,
+            Ok(Some(m)) => m,
+            Ok(None) => {
+                remove_staged(part);
+                return Ok(());
+            }
             Err(e) => {
                 remove_staged(part);
                 return Err(e);
             }
         };
-        if st.manifests.contains_key(&m.source_id) {
-            // The same manifest in another spelling: the staged one stays.
-            remove_staged(part);
-            return Ok(());
+        let new = match check_manifest_files(limits, &st.wanted, entries_of(&m)) {
+            Ok(new) => new,
+            Err(why) => {
+                remove_staged(part);
+                return Err(invalid(why));
+            }
+        };
+        let (manifests, bundle) = announced(&listing(&dir)?);
+        let files = new
+            .values()
+            .try_fold(st.bytes, |sum, size| sum.checked_add(*size));
+        let total = files.and_then(|f| source_total(manifests, bundle, f));
+        if let Err(e) = self.reserve(limits, &r.source_id, total, false) {
+            if e.code != ErrorCode::Overloaded {
+                remove_staged(part);
+            }
+            return Err(e);
         }
+        let done = dir.join(staged_name(r.kind, hex, r.total_size, true));
         fs::rename(part, done).map_err(io_err)?;
-        st.add(m);
+        st.add(&m, &new, hex, r.total_size);
         Ok(())
     }
 
-    /// The clone of a repository the bundles are unpacked into: the one that
-    /// is there, or (with `create`) a new empty one.
-    fn objects(&self, repository_id: &str, create: bool) -> Result<Option<ObjectsRepo>, ApiError> {
+    /// The clone of a repository the bundles are unpacked into, when there
+    /// is one. Asking never makes one.
+    fn objects(&self, repository_id: &str) -> Option<ObjectsRepo> {
         let dir = self
             .workspaces
             .clones_root()
             .join(clone_dir_name(repository_id));
-        if dir.join(".git").exists() {
-            return Ok(Some(ObjectsRepo::new(self.env.clone(), dir)));
-        }
-        if !create {
-            return Ok(None);
-        }
-        self.workspaces.ensure_clone(repository_id, None).map(Some)
+        dir.join(".git")
+            .exists()
+            .then(|| ObjectsRepo::new(self.env.clone(), dir))
+    }
+
+    /// Does `repo` hold the commits the bundle of the source carries (those
+    /// of the sources in `carried`), each below its snapshot ref and with
+    /// the tree its manifest gives?
+    fn commits_here(&self, repo: &ObjectsRepo, st: &Staged, carried: &BTreeSet<String>) -> bool {
+        carried.iter().all(|id| match st.manifests.get(id) {
+            Some(info) => info.execution_commit.as_deref().is_none_or(|commit| {
+                repo.check_snapshot(id, commit, info.worktree_tree.as_deref())
+                    .is_ok()
+            }),
+            // published before, by another transfer: ask the store's copy
+            None => matches!(
+                self.store.manifest(id),
+                Ok(Some(m)) if repo.check_reachable(&m).is_ok()
+            ),
+        })
+    }
+
+    /// What the clone of the source's repository holds, for the coordinator
+    /// to build a bundle on: the commits of the source that are there
+    /// already, then the tips of the other snapshots. `None` when the
+    /// repository is not known (no manifest of the source here, or it is not
+    /// a Git source).
+    fn have(&self, root_id: &str, st: &Staged) -> Option<RepositoryHave> {
+        let (repository_id, ids) = match st.manifests.get(root_id) {
+            Some(root) => {
+                root.execution_commit.as_ref()?;
+                (root.repository_id.clone()?, st.carried(root_id))
+            }
+            None => {
+                let m = self.store.manifest(root_id).ok().flatten()?;
+                m.execution_commit.as_ref()?;
+                (m.repository_id.clone()?, [root_id.to_string()].into())
+            }
+        };
+        let tips = self
+            .objects(&repository_id)
+            .and_then(|repo| repo.snapshot_tips(MAX_SNAPSHOT_REFS).ok())
+            .unwrap_or_default();
+        let needed: Vec<String> = tips
+            .iter()
+            .filter(|t| ids.contains(&t.0))
+            .map(|t| t.1.clone())
+            .collect();
+        let tips = tips.into_iter().map(|t| (t.1, t.2)).collect();
+        Some(RepositoryHave {
+            repository_id,
+            commits: order_have(&needed, tips, MAX_HAVE),
+        })
     }
 
     fn bundle_done(dir: &Path) -> Result<Option<PathBuf>, ApiError> {
-        Ok(Self::staged_files(dir)?
+        Ok(listing(dir)?
             .into_iter()
-            .find(|(_, k, done)| *k == SourceBlobKind::Bundle && *done)
-            .map(|(name, _, _)| dir.join(name)))
+            .find(|f| f.kind == SourceBlobKind::Bundle && f.done)
+            .map(|f| dir.join(f.name)))
+    }
+
+    /// Unpack the staged `bundle` into the clone of `repository_id`.
+    ///
+    /// A bundle built on commits the clone does not hold is not a broken
+    /// one: the coordinator built it on a list that is out of date (or on
+    /// none). It is dropped, nothing is made, and the answer (`CONFLICT`,
+    /// `bundle_base_missing`) says what the clone does hold, so the next
+    /// bundle fits. A bundle that is not one, or does not bring what the
+    /// manifest names, is `INVALID_INPUT`.
+    fn unpack(
+        &self,
+        limits: &BlobLimits,
+        bundle: &Path,
+        repository_id: &str,
+        root_id: &str,
+        st: &Staged,
+    ) -> Result<ObjectsRepo, ApiError> {
+        let refuse = |why: String| {
+            remove_staged(bundle);
+            invalid(format!("the bundle is refused: {why}"))
+        };
+        let prerequisites = bundle_head(bundle)
+            .map_err(io_err)
+            .and_then(|head| bundle_prerequisites(&head).map_err(|why| refuse(why.to_string())))?;
+        let existing = self.objects(repository_id);
+        let fits = match &existing {
+            Some(repo) => repo.holds_base(&prerequisites),
+            None => prerequisites.is_empty(),
+        };
+        if !fits {
+            remove_staged(bundle);
+            let have = self.have(root_id, st).map_or(vec![], |h| h.commits);
+            return Err(ApiError::conflict(
+                ConflictReason::BundleBaseMissing { have },
+                "the bundle is built on commits this worker does not hold; build it on what blob_verify lists",
+            ));
+        }
+        let repo = match existing {
+            Some(repo) => repo,
+            None => self.workspaces.ensure_clone(repository_id, None)?,
+        };
+        let root = &st.manifests[root_id];
+        let dir = bundle.parent().expect("a staged file is in a directory");
+        let body = read_manifest(
+            &dir.join(staged_name(
+                SourceBlobKind::Manifest,
+                &root.hex,
+                root.size,
+                true,
+            )),
+            limits,
+        )?;
+        repo.receive_bundle(bundle, &body)
+            .map_err(|e| refuse(format!("{e:#}")))?;
+        if !self.commits_here(&repo, st, &st.carried(root_id)) {
+            return Err(refuse(
+                "it does not bring the commits the manifests name".into(),
+            ));
+        }
+        Ok(repo)
     }
 
     /// Publish the source when everything it needs is here. `Ok(false)`:
     /// something is still missing. An error is about what was sent (a bundle
-    /// that does not hold the commit, a manifest the store refuses).
+    /// that does not fit, a manifest the store refuses).
+    ///
+    /// Everything that can refuse the source comes before the first file is
+    /// moved into the store, so a source that is refused or dropped leaves
+    /// nothing there.
     fn complete(
         &self,
+        limits: &BlobLimits,
         source: &SourceId,
         root_id: &str,
         st: &mut Staged,
@@ -573,39 +989,58 @@ impl Incoming {
                 return Ok(false);
             }
         }
+        let dir = self.dir(source);
+        let waiting = |hash: &str, size: u64| {
+            dir.join(FILES)
+                .join(staged_name(SourceBlobKind::Content, hash, size, true))
+        };
         while let Some(hash) = st.missing.first() {
-            if !self.store.has_blob(hash) {
+            let here =
+                self.store.has_blob(hash) || staged_len(&waiting(hash, st.wanted[hash]))?.is_some();
+            if !here {
                 return Ok(false);
             }
             st.missing.pop_first();
         }
         let root = &st.manifests[root_id];
-        let dir = self.dir(source);
+        let carried = st.carried(root_id);
         let mut objects = None;
         if let (Some(_), Some(repository_id)) = (&root.execution_commit, &root.repository_id) {
-            // A clone is made only to unpack a bundle into it: asking
-            // whether the commits are here never makes one.
             let repo = match Self::bundle_done(&dir)? {
-                Some(bundle) => {
-                    let repo = self
-                        .objects(repository_id, true)?
-                        .expect("a clone is made when there is none");
-                    if let Err(e) = repo.receive_bundle(&bundle, root) {
-                        remove_staged(&bundle);
-                        return Err(invalid(format!("the bundle is refused: {e:#}")));
-                    }
-                    repo
-                }
-                None => match self.objects(repository_id, false)? {
-                    Some(repo) if repo.check_reachable(root).is_ok() => repo,
+                Some(bundle) => self.unpack(limits, &bundle, repository_id, root_id, st)?,
+                None => match self.objects(repository_id) {
+                    Some(repo) if self.commits_here(&repo, st, &carried) => repo,
                     _ => return Ok(false),
                 },
             };
             objects = Some(repo);
         }
-        self.store
-            .publish_received_all(&st.leaf_first(root_id), objects.as_ref())
-            .map_err(|e| invalid(format!("the source is refused: {e:#}")))?;
+        let store_err = |e: anyhow::Error| internal("source store", format!("{e:#}"));
+        for (hash, size) in &st.wanted {
+            if self.store.has_blob(hash) {
+                continue;
+            }
+            let path = waiting(hash, *size);
+            let want = BlobWant {
+                hash: hash.clone(),
+                size: *size,
+            };
+            let mut f = File::open(&path).map_err(io_err)?;
+            self.store.ingest_blob(&want, &mut f).map_err(store_err)?;
+            remove_staged(&path);
+        }
+        for id in st.leaf_first(root_id) {
+            if id != root_id && self.published(&id)? {
+                // published by another transfer meanwhile: it stays as it is
+                continue;
+            }
+            let info = &st.manifests[&id];
+            let name = staged_name(SourceBlobKind::Manifest, &info.hex, info.size, true);
+            let m = read_manifest(&dir.join(name), limits)?;
+            self.store
+                .publish_received_one(&m, carried.contains(&id), objects.as_ref())
+                .map_err(|e| invalid(format!("the source is refused: {e:#}")))?;
+        }
         self.discard(source.as_str());
         Ok(true)
     }
@@ -626,28 +1061,28 @@ impl Incoming {
                 format!("send the manifest of source {} first", r.source_id),
             )
         };
+        let name = |done| staged_name(r.kind, hex, r.total_size, done);
         match r.kind {
             SourceBlobKind::Manifest => {
-                let done = dir.join(staged_name(r.kind, hex, true));
-                if staged_len(&done)?.is_none() {
-                    if !dir.is_dir() {
-                        self.admit(limits, &r.source_id)?;
-                        private_dir(&dir).map_err(io_err)?;
-                    }
-                    let part = match self.append(limits, &dir, r) {
-                        Ok(Progress::At(n)) => return Ok(Some(n)),
-                        Ok(Progress::Whole(part)) => part,
+                if staged_len(&dir.join(name(true)))?.is_none() {
+                    let part = dir.join(name(false));
+                    let taken = self
+                        .append(&part, r, || self.begin(limits, r, st, has_root))
+                        .and_then(|p| match p {
+                            Progress::At(n) => Ok(Some(n)),
+                            Progress::Whole(part) => self
+                                .stage_manifest(limits, r, root_id, &part, st)
+                                .map(|()| None),
+                        });
+                    match taken {
+                        Ok(Some(n)) => return Ok(Some(n)),
+                        Ok(None) => {}
                         Err(e) => {
-                            let _ = fs::remove_dir(&dir);
+                            // Nothing of a source that has nothing staged stays.
+                            self.discard_if_empty(&r.source_id);
                             return Err(e);
                         }
-                    };
-                    let staged = self.stage_manifest(limits, root_id, &part, &done, st);
-                    if staged.is_err() {
-                        // Nothing of a source that never had a manifest stays.
-                        let _ = fs::remove_dir(&dir);
                     }
-                    staged?;
                 }
             }
             SourceBlobKind::Content => {
@@ -655,22 +1090,19 @@ impl Incoming {
                     return Err(first());
                 }
                 check_content(st.wanted.get(hex).copied(), r.total_size).map_err(invalid)?;
-                let part = dir.join(staged_name(r.kind, hex, false));
-                if self.store.has_blob(hex) {
+                let part = dir.join(PARTS).join(name(false));
+                let done = dir.join(FILES).join(name(true));
+                if self.store.has_blob(hex) || staged_len(&done)?.is_some() {
                     remove_staged(&part);
                 } else {
-                    match self.append(limits, &dir, r)? {
+                    match self.append(&part, r, || self.begin(limits, r, st, has_root))? {
                         Progress::At(n) => return Ok(Some(n)),
                         Progress::Whole(part) => {
-                            let want = BlobWant {
-                                hash: hex.to_string(),
-                                size: r.total_size,
-                            };
-                            let taken = File::open(&part)
-                                .map_err(anyhow::Error::from)
-                                .and_then(|mut f| self.store.ingest_blob(&want, &mut f));
-                            remove_staged(&part);
-                            taken.map_err(|e| internal("source store", format!("{e:#}")))?;
+                            // It waits here, whole, until the source is
+                            // published: the store holds nothing of a source
+                            // that may still be dropped.
+                            private_dir(&dir.join(FILES)).map_err(io_err)?;
+                            fs::rename(&part, &done).map_err(io_err)?;
                         }
                     }
                 }
@@ -683,22 +1115,18 @@ impl Incoming {
                 if root.execution_commit.is_none() {
                     return Err(invalid("the source has no Git objects: it takes no bundle"));
                 }
-                let done = dir.join(staged_name(r.kind, hex, true));
-                if staged_len(&done)?.is_none() {
-                    match self.append(limits, &dir, r)? {
+                if staged_len(&dir.join(name(true)))?.is_none() {
+                    let part = dir.join(name(false));
+                    match self.append(&part, r, || self.begin(limits, r, st, has_root))? {
                         Progress::At(n) => return Ok(Some(n)),
                         Progress::Whole(part) => {
-                            // One bundle per source: a newer one replaces ours.
-                            if let Some(old) = Self::bundle_done(&dir)? {
-                                remove_staged(&old);
-                            }
-                            fs::rename(&part, &done).map_err(io_err)?;
+                            fs::rename(&part, dir.join(name(true))).map_err(io_err)?;
                         }
                     }
                 }
             }
         }
-        self.complete(&r.source_id, root_id, st)?;
+        self.complete(limits, &r.source_id, root_id, st)?;
         Ok(None)
     }
 
@@ -710,44 +1138,51 @@ impl Incoming {
         st: &Staged,
     ) -> Result<BlobVerifyResponse, ApiError> {
         let dir = self.dir(&r.source_id);
-        // Do the commits a bundle would bring need no bundle any more?
-        let commits_here = || -> Result<bool, ApiError> {
-            let Some(root) = st.manifests.get(root_id) else {
-                return Ok(false);
-            };
-            let (Some(_), Some(repository_id)) = (&root.execution_commit, &root.repository_id)
-            else {
-                return Ok(root.execution_commit.is_none());
-            };
-            Ok(self
-                .objects(repository_id, false)?
-                .is_some_and(|repo| repo.check_reachable(root).is_ok()))
+        let bundle_staged = Self::bundle_done(&dir)?.is_some();
+        // Are the commits a bundle would bring missing?
+        let commits_missing = match st.manifests.get(root_id) {
+            Some(root) => match (&root.execution_commit, &root.repository_id) {
+                (Some(_), Some(repository_id)) => !self
+                    .objects(repository_id)
+                    .is_some_and(|repo| self.commits_here(&repo, st, &st.carried(root_id))),
+                _ => false,
+            },
+            None => false,
         };
         let mut out = BlobVerifyResponse {
             schema_version: SchemaVersion::CURRENT,
             ready,
+            bundle_needed: !ready && commits_missing && !bundle_staged,
+            have: self.have(root_id, st).into_iter().collect(),
             present: vec![],
             missing: vec![],
             corrupt: vec![],
         };
         for b in &r.blobs {
             let hex = hex_of(&b.digest);
-            let partial = staged_len(&dir.join(staged_name(b.kind, hex, false)))?;
-            let done = || staged_len(&dir.join(staged_name(b.kind, hex, true)));
+            let name = |done| staged_name(b.kind, hex, b.total_size, done);
             let verdict = match b.kind {
                 SourceBlobKind::Content => {
-                    let stored = fs::metadata(self.store.object_store().object_path(hex))
+                    // held whole: in the store, or waiting here under the
+                    // size its manifest gives
+                    let mut stored = fs::metadata(self.store.object_store().object_path(hex))
                         .ok()
                         .filter(|m| m.is_file())
                         .map(|m| m.len());
+                    if let (None, Some(size)) = (stored, st.wanted.get(hex)) {
+                        let waiting = dir.join(FILES).join(staged_name(b.kind, hex, *size, true));
+                        stored = staged_len(&waiting)?;
+                    }
+                    let partial = staged_len(&dir.join(PARTS).join(name(false)))?;
                     content_verdict(stored, partial, b.total_size)
                 }
-                SourceBlobKind::Manifest => {
-                    staged_verdict(done()?.is_some(), ready, partial, b.total_size)
-                }
-                SourceBlobKind::Bundle => {
-                    let done = done()?.is_some();
-                    let settled = ready || (!done && commits_here()?);
+                SourceBlobKind::Manifest | SourceBlobKind::Bundle => {
+                    let done = staged_len(&dir.join(name(true)))?.is_some();
+                    let partial = staged_len(&dir.join(name(false)))?;
+                    let settled = ready
+                        || (b.kind == SourceBlobKind::Bundle
+                            && st.manifests.contains_key(root_id)
+                            && !commits_missing);
                     staged_verdict(done, settled, partial, b.total_size)
                 }
             };
@@ -859,38 +1294,21 @@ pub fn verify(
 }
 
 /// The artifact file below `<attempts_root>/<attempt>/artifacts`, opened
-/// without following a link anywhere on the way.
+/// without following a link anywhere on the way: each directory is opened
+/// relative to the one before ([`open_beneath`]), so nothing that is renamed
+/// between a check and the open can lead elsewhere.
 fn open_artifact(dir: &Path, a: &ArtifactRecord) -> Result<File, ApiError> {
-    let gone = || {
-        ApiError::new(
+    let rel = relative_path(&a.path).ok_or_else(|| internal("stored artifact", &a.path))?;
+    match open_beneath(dir, &rel) {
+        Ok(f) => Ok(f),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Err(ApiError::new(
             ErrorCode::NotFound,
             format!("artifact {} is not on this worker any more", a.digest),
-        )
-    };
-    let rel = relative_path(&a.path).ok_or_else(|| internal("stored artifact", &a.path))?;
-    let real_dir = |p: &Path| match fs::symlink_metadata(p) {
-        Ok(m) if m.is_dir() => Ok(()),
-        Ok(_) => Err(internal("artifact store", "a directory is not one")),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Err(gone()),
-        Err(e) => Err(io_err(e)),
-    };
-    let mut cur = dir.to_path_buf();
-    let comps: Vec<_> = rel.iter().collect();
-    let (last, dirs) = comps.split_last().expect("a relative path has a component");
-    real_dir(&cur)?;
-    for c in dirs {
-        cur.push(c);
-        real_dir(&cur)?;
-    }
-    cur.push(last);
-    match fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(&cur)
-    {
-        Ok(f) => Ok(f),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => Err(gone()),
-        Err(e) => Err(io_err(e)),
+        )),
+        Err(e) => Err(internal(
+            "artifact store",
+            format!("{} is not a plain file below the artifacts: {e}", a.path),
+        )),
     }
 }
 

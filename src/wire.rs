@@ -1085,7 +1085,8 @@ pub enum SourceBlobKind {
     /// capture it names. The source's own manifest is sent first.
     Manifest,
     /// The Git bundle of the source (one per source; it carries the commits
-    /// of dirty submodules too).
+    /// of dirty submodules too). It is built on the commits the worker said
+    /// it has ([`BlobVerifyResponse::have`]).
     Bundle,
 }
 
@@ -1158,12 +1159,29 @@ pub struct BlobVerifyRequest {
     pub blobs: Vec<BlobRef>,
 }
 
+/// Commits a worker's clone of one repository holds with their whole
+/// history: what a bundle for that clone may be built on.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RepositoryHave {
+    /// The repository, as the manifests name it.
+    pub repository_id: String,
+    /// At most 64 commit ids, the most useful first.
+    pub commits: Vec<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BlobVerifyResponse {
     pub schema_version: SchemaVersion,
     /// The source is published in the worker's store: a `submit_attempt`
     /// that names it can be prepared.
     pub ready: bool,
+    /// The source's manifest is staged and the worker's clone lacks the
+    /// commits it names: a bundle has to be sent (built on `have`).
+    pub bundle_needed: bool,
+    /// Per repository the source's bundle is unpacked into (the source's
+    /// own; one entry, or none while the worker does not know the
+    /// repository: no manifest of the source yet, or not a Git source).
+    pub have: Vec<RepositoryHave>,
     pub present: Vec<Digest>,
     pub missing: Vec<BlobProgress>,
     /// Held, but not as described (another size).
@@ -1922,6 +1940,11 @@ mod tests {
             Response::BlobVerify(BlobVerifyResponse {
                 schema_version: SV,
                 ready: false,
+                bundle_needed: true,
+                have: vec![RepositoryHave {
+                    repository_id: "github:example/repo".into(),
+                    commits: vec!["0123456789abcdef0123456789abcdef01234567".into()],
+                }],
                 present: vec![dg("a")],
                 missing: vec![BlobProgress {
                     digest: dg("b"),
