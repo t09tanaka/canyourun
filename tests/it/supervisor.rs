@@ -1,7 +1,7 @@
 //! The supervisor against real processes: lease, cancel, timeouts, stop,
 //! recovery, and survival of the agent's death.
 
-use crate::common::{alive, read_pid};
+use crate::common::{alive, identity_of, kill_recorded, kill_recorded_group, read_pid};
 use remote_task_runner::ids::*;
 use remote_task_runner::platform;
 use remote_task_runner::platform::{signal_pid, signal_process_group};
@@ -24,8 +24,9 @@ use tempfile::TempDir;
 
 struct Fx {
     /// Processes this test started that must not outlive it (they would write
-    /// into the directory while it is being removed): (pid, whole group).
-    strays: std::sync::Mutex<Vec<(i32, bool)>>,
+    /// into the directory while it is being removed): (pid, the start
+    /// identity read when it was started, whole group).
+    strays: std::sync::Mutex<Vec<(u32, String, bool)>>,
     dir: TempDir,
     store: WorkerStore,
     spec: SuperviseSpec,
@@ -113,16 +114,17 @@ impl Drop for Fx {
             .unwrap_or_default();
         for (_, _, ident) in launched {
             if let Some(i) = ident {
-                all.push((i.pid as i32, true));
+                all.push((i.pid, i.start_identity, true));
             }
         }
-        for (pid, group) in all {
-            // Only through the guarded helpers: pid 0, 1 or a wrapped negative
-            // would reach our own group, init or every process of the user.
+        for (pid, start, group) in all {
+            // Never by the number alone: the PID may be another process's by
+            // now. Only what still has the recorded start identity (or, for
+            // a group, what a leader that is definitely gone left behind).
             if group {
-                signal_process_group(pid, libc::SIGKILL);
-            } else if let Ok(p) = u32::try_from(pid) {
-                signal_pid(p, libc::SIGKILL);
+                kill_recorded_group(pid, &start);
+            } else {
+                kill_recorded(pid, &start);
             }
         }
     }
@@ -130,10 +132,16 @@ impl Drop for Fx {
 
 impl Fx {
     fn track(&self, pid: u32) {
-        self.strays.lock().unwrap().push((pid as i32, false));
+        // Without an identity it has ended already: nothing to clean up, and
+        // nothing that could be told from a later process with its PID.
+        if let Some(start) = identity_of(pid) {
+            self.strays.lock().unwrap().push((pid, start, false));
+        }
     }
     fn track_group(&self, pid: u32) {
-        self.strays.lock().unwrap().push((pid as i32, true));
+        if let Some(start) = identity_of(pid) {
+            self.strays.lock().unwrap().push((pid, start, true));
+        }
     }
     fn path(&self, name: &str) -> PathBuf {
         self.dir.path().join(name)
@@ -832,7 +840,10 @@ fn spawn_sleeper() -> (std::process::Child, ProcessIdentityParts) {
         .unwrap();
     let parts = ProcessIdentityParts {
         pid: child.id(),
-        start: platform::process_start_identity(child.id()).unwrap(),
+        start: platform::process_start_identity(child.id())
+            .identity()
+            .expect("the identity of a live child")
+            .to_string(),
     };
     (child, parts)
 }
@@ -933,7 +944,10 @@ fn a_dead_leader_with_a_surviving_descendant_is_stopped_by_recovery() {
     wait_for("the descendant", || read_pid(&bg).is_some());
     let p = ProcessIdentityParts {
         pid: child.id(),
-        start: platform::process_start_identity(child.id()).unwrap(),
+        start: platform::process_start_identity(child.id())
+            .identity()
+            .expect("the identity of a live child")
+            .to_string(),
     };
     claim(&f, "n", Some((&platform::boot_id().unwrap(), &p)));
     // The leader dies (and is reaped); its background child stays.

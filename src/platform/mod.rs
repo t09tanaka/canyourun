@@ -12,7 +12,9 @@ pub mod process;
 pub use boot::boot_id;
 pub use clock::{monotonic_ms, wall_ms};
 pub use inhibit::{Inhibit, SleepGuard};
-pub use process::{process_start_identity, signal_pid, signal_process_group, GroupSignal};
+pub use process::{
+    process_start_identity, signal_pid, signal_process_group, GroupSignal, StartIdentity,
+};
 
 /// Stop this process from leaving a core dump (and, on Linux, from being
 /// attached to by another process of the same user): a dump of a process that

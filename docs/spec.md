@@ -531,6 +531,13 @@ lease期限切れはworker側の停止方針である。親に停止証拠が届
 
 取消要求を先に永続化し、新しいspawnを禁止する。実行中のcommand専用process groupと追跡した子孫・serviceを止め、停止とcleanupを確認してからterminalを確定する。PIDだけではなくboot IDとプロセス開始identityを確認する。
 
+signalを送る前の確認は次の規則に従う（recovery・timeout・lease切れによる停止も同じ）。
+
+- pidが今どのprocessのものかの読み取り結果は、**identity**（生きたprocessがあり開始identityが読めた）、**processなし**（OSが「そのprocessは無い」と確答した場合だけ。zombieを含む）、**不明**（権限・資源不足・解釈できない内容など、それ以外のすべての失敗）の3通りに分ける。不明を「processなし」にも「同じprocess」にも寄せない。
+- 記録したidentityと一致するprocessのgroupだけにsignalを送る。identityが違えばpidの再利用であり、送らない。leaderが「processなし」と確答された場合に限り、groupに残ったmemberを番号で調べて止める（memberが残る間、そのgroup番号は再利用されない）。
+- **不明のprocessにはsignalを送らず、groupの有無も調べない**。停止を確定せず、消えたとも扱わない。実行中のsupervisorは次のpollで読み直し、それでも確定できなければattemptを未解決（unresolved）のまま残して、次回のsupervise（recovery）が同じ確認をやり直す。理由はevent（`supervisor_stop_identity_unknown`、`supervisor_recover_node` の `verdict: Unknown`、`supervisor_unresolved`）に残す。
+- identityは判定のときと、signalを送る直前のたびに読み直す。group番号がleaderのpidと異なる記録は、leaderからgroupを判定できないので不明として扱う。
+
 自然終了とcancelが競合した場合は、条件付きtransactionで一度だけterminalを確定する。cancel受理とcancel完了は別の応答とする。queued／preparingの仕事も遅れてspawnしないことを確認する。
 
 通常の実行契約はforeground commandと、remote-task-runnerが所有を追跡できるserviceである。独立daemonとして脱離する処理はservice宣言とcleanup契約を必要とする。任意コードの外部サービスへの副作用を取り消せるとは約束しない。
@@ -545,7 +552,7 @@ command実行timeout、task全体deadline、資源待ちtimeoutを区別する�
 | SSH切断 | worker spoolへ出力。lease範囲で継続し、再接続で追跡 |
 | 親process再起動 | process lock取得、epoch更新、非terminalをreconcileして同じattemptをadopt |
 | worker agent再起動 | 生存supervisorへ再接続。DBのactive表示だけでcommandを再起動しない |
-| supervisor異常終了 | 子孫・serviceを調査、停止・確定。起動済み不明なら自動再実行しない |
+| supervisor異常終了 | 子孫・serviceを調査、停止・確定。起動済み不明なら自動再実行しない。identityを読めないprocessにはsignalを送らず、未解決のまま残して次回のrecoveryで再確認する |
 | worker OS再起動 | boot ID変更を検出し、旧所有資源を確認・cleanupしてinterruptedへ |
 | 結果転送の中断 | offset・digestから回収だけを再開 |
 | 入力転送の中断 | 同じsource IDの不足blobだけ再送 |
@@ -633,7 +640,7 @@ LinuxのworkerもSSHで導入・起動する。既定はsystemdのuser service�
 | - | - |
 | suspendを含む単調時計 | 第12章のlease・timeout・queue ageに使う。両OSでsuspend中の経過を含める |
 | boot ID | worker OSの再起動を検出する（第12章） |
-| process identity | pidの再利用を区別するため、開始時刻等と組にして記録する |
+| process identity | pidの再利用を区別するため、開始時刻等と組にして記録する。読み取り結果はidentity／processなし（OSの確答だけ）／不明の3通りで、不明をどちらにも寄せない |
 | sleep抑止 | 実行中のidle sleepを抑止する。Linuxでは系統のsuspendも対象とする |
 
 ## 一時worker（Google Colab等）

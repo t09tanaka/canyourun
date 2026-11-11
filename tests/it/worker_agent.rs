@@ -199,8 +199,9 @@ impl Drop for Fx {
         if let Ok(store) = WorkerStore::open_read_only(&state) {
             for rec in store.list_attempts(None, true, 500).unwrap_or_default() {
                 for (_, _, ident) in store.launches(&rec.attempt_id).unwrap_or_default() {
-                    if let Some(pgid) = ident.and_then(|i| i32::try_from(i.pid).ok()) {
-                        kill_group(pgid);
+                    // By the recorded identity, never by the number alone.
+                    if let Some(i) = ident {
+                        crate::common::kill_recorded_group(i.pid, &i.start_identity);
                     }
                 }
             }
