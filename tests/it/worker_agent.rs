@@ -3463,6 +3463,28 @@ async fn an_attempt_whose_commands_are_all_prepared_succeeds_without_starting_on
     assert_eq!(said.len(), 1);
     assert_eq!(said[0].payload["steps"], serde_json::json!(["s1", "s2"]));
     assert_eq!(f.store().events_of(&a, "prepared_only").unwrap().len(), 1);
+    // The parent collects it like any result: it reads the log of the first
+    // declared command to its end, and that log is empty and complete.
+    for stream in [LogStream::Stdout, LogStream::Stderr] {
+        let Response::ReadLog(log) = call(
+            &c,
+            Request::ReadLog(ReadLogRequest {
+                schema_version: SchemaVersion::CURRENT,
+                request_id: RequestId::generate(),
+                attempt_id: a.clone(),
+                node_id: NodeId::parse("install").unwrap(),
+                stream,
+                offset: 0,
+                max_bytes: 1024,
+            }),
+        )
+        .await
+        .unwrap() else {
+            panic!()
+        };
+        assert!(log.eof && log.data.0.is_empty());
+    }
+    assert!(result.result_digest.to_string().starts_with("sha256:"));
     assert!(f
         .store()
         .events_of(&a, "agent_prepare_failed")
