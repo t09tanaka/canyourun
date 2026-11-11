@@ -1414,10 +1414,44 @@ pub fn run(spec: &SuperviseSpec) -> Result<Report> {
     account_for_reader(&store, attempt, &ctl.beat, ctl.pump_failure())?;
     // Every command that was started has ended and is confirmed stopped.
     // With none started (a cancel got in first) there is nothing to keep.
-    if !store.launches(attempt)?.is_empty() {
-        keep_artifacts(spec, &store, &masker)?;
-    }
-    let term = termination(end.reason, end.exit);
+    let term = if spec.nodes.is_empty() {
+        // `prepared_only`: no command, so nothing above looked for a cancel.
+        // One that is recorded wins. Otherwise the attempt succeeded by what
+        // the template put into its workspace: it has no exit status (no
+        // command ended), an empty log, and the artifacts it declared, which
+        // are taken from the workspace as after any command.
+        let cancelled = store
+            .get(attempt)?
+            .is_none_or(|r| r.cancel_requested_at_ms.is_some() || r.retired);
+        if cancelled {
+            move_to(&store, attempt, AttemptState::Cancelling)?;
+            termination(Some(StopReason::Cancel), None)
+        } else {
+            store.append_events_unseen(
+                Some(&rec.run_id),
+                attempt,
+                "prepared_only",
+                "what",
+                &[(
+                    "setup".to_string(),
+                    json!({
+                        "what": "setup",
+                        "message": "every command was a setup step a prepared template \
+                                    holds; none was started",
+                    }),
+                )],
+                platform::wall_ms(),
+            )?;
+            keep_artifacts(spec, &store, &masker)?;
+            Termination::new(crate::state::Outcome::Succeeded, None, None)
+                .expect("a success without an exit is valid")
+        }
+    } else {
+        if !store.launches(attempt)?.is_empty() {
+            keep_artifacts(spec, &store, &masker)?;
+        }
+        termination(end.reason, end.exit)
+    };
     let (termination, finalized_here) = settle(&store, &root, attempt, &spool, term)?;
     Ok(Report {
         termination: Some(termination),

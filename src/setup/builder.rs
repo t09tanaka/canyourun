@@ -833,6 +833,7 @@ impl Setups {
             // no secret reaches a builder; an explicit empty list says so
             mask: MaskValues(Vec::new()),
             artifacts: None,
+            prepared_only: false,
         };
         sup.validate().map_err(|e| e.to_string())?;
         let bytes = serde_json::to_vec(&sup).map_err(|e| e.to_string())?;

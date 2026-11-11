@@ -317,6 +317,7 @@ mod tests {
             workspace_warnings: vec![],
             mask: Default::default(),
             artifacts: None,
+            prepared_only: false,
         };
         Fx {
             _dir: dir,

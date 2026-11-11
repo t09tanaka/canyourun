@@ -3374,6 +3374,61 @@ async fn the_commands_of_a_prepared_setup_are_left_out_and_the_others_run() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_attempt_whose_commands_are_all_prepared_succeeds_without_starting_one() {
+    // An install-only task whose template is there: every command is left
+    // out. It is a success with no exit status and no log, its declared
+    // artifact is taken from the workspace, and the journal says why
+    // nothing ran.
+    let f = fx();
+    let agent = f.start("boot-a");
+    let c = f.connect(&agent).await;
+    f.host.setup_pending.store(true, Ordering::SeqCst);
+    *f.host.setup_skip.lock().unwrap() = ["s1".to_string(), "s2".to_string()].into();
+    *f.host.secret_paths.lock().unwrap() = Some(Vec::new());
+    let ran = f.path("ran");
+    let say = format!("echo x >> {}", ran.display());
+    let step = |c: CommandSpec, id: &str| CommandSpec {
+        setup_step: Some(id.into()),
+        ..c
+    };
+    let mut p = payload("true");
+    p.commands = vec![
+        step(command("install", &say, &[]), "s1"),
+        step(command("tools", &say, &["install"]), "s2"),
+    ];
+    p.artifacts = vec![decl("lock", "made/lock.txt", MissingPolicy::Required)];
+    let a = AttemptId::generate();
+    submit(&c, &a, &p).await;
+    wait_for("the setup to be asked about", || {
+        f.host.count(&format!("setup_poll {a}")) >= 1
+    });
+    // what the template puts into the workspace
+    let made = f.host.ws_dir(&a).join("made");
+    std::fs::create_dir_all(&made).unwrap();
+    std::fs::write(made.join("lock.txt"), "locked\n").unwrap();
+    f.host.setup_pending.store(false, Ordering::SeqCst);
+    assert_eq!(f.wait_terminal(&a), Outcome::Succeeded);
+    assert!(!ran.exists(), "a prepared step was run");
+    assert!(f.store().launches(&a).unwrap().is_empty());
+    let result = result_of(&c, &a).await;
+    assert_eq!(result.termination.outcome(), Outcome::Succeeded);
+    assert_eq!(result.termination.exit(), None);
+    assert!(result.nodes.is_empty());
+    let names: Vec<&str> = result.artifacts.iter().map(|r| r.name.as_str()).collect();
+    assert_eq!(names, ["lock"]);
+    assert!(result.artifacts_not_stored.is_empty());
+    let said = f.store().events_of(&a, "agent_setup_satisfied").unwrap();
+    assert_eq!(said.len(), 1);
+    assert_eq!(said[0].payload["steps"], serde_json::json!(["s1", "s2"]));
+    assert_eq!(f.store().events_of(&a, "prepared_only").unwrap().len(), 1);
+    assert!(f
+        .store()
+        .events_of(&a, "agent_prepare_failed")
+        .unwrap()
+        .is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_attempt_cancelled_while_it_waits_for_its_setup_lets_go_of_the_builder() {
     let f = fx();
     let agent = f.start("boot-a");

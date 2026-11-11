@@ -1116,6 +1116,17 @@ impl Agent {
             return Ok(());
         };
         let commands = crate::setup::policy::prune_commands(&payload.commands, &skip);
+        // Every command was a prepared setup step (an install-only task with
+        // its template there): the supervisor settles it as succeeded
+        // without a command. The journal says which steps were not run.
+        let prepared_only = commands.is_empty();
+        if prepared_only {
+            self.note_once(
+                attempt,
+                "agent_setup_satisfied",
+                json!({ "steps": skip.iter().collect::<Vec<_>>() }),
+            );
+        }
 
         // The secret bundle arrives by its own request once the workspace is
         // there; the commands do not start before the set is complete.
@@ -1246,6 +1257,7 @@ impl Agent {
             // removed with the workspace when the attempt has ended.
             mask: MaskValues(mask),
             artifacts,
+            prepared_only,
         };
         spec.validate().map_err(|e| invalid(e.to_string()))?;
         let bytes = serde_json::to_vec(&spec).map_err(|e| internal("supervisor spec", e))?;

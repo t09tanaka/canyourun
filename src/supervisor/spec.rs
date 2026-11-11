@@ -199,13 +199,24 @@ pub struct SuperviseSpec {
     /// The files to keep as artifacts; none when absent.
     #[serde(default)]
     pub artifacts: Option<ArtifactsSpec>,
+    /// Every command of the attempt was a setup step whose result is in the
+    /// workspace already (a prepared template, spec chapter 8): there is no
+    /// node, and the attempt is settled as succeeded without a command. Only
+    /// with this set may `nodes` be empty, so that a spec that lost its
+    /// nodes by mistake is still refused.
+    #[serde(default)]
+    pub prepared_only: bool,
 }
 
 impl SuperviseSpec {
     pub fn validate(&self) -> Result<()> {
         let bad = |m: &str| Err(SupervisorError::Spec(m.to_string()));
-        if self.nodes.is_empty() {
-            return bad("no nodes");
+        if self.nodes.is_empty() != self.prepared_only {
+            return bad(if self.prepared_only {
+                "prepared_only with nodes"
+            } else {
+                "no nodes"
+            });
         }
         if self.lease_ms == 0 || self.poll_ms == 0 {
             return bad("lease_ms and poll_ms must be positive");
@@ -363,6 +374,7 @@ mod tests {
             workspace_warnings: vec![],
             mask: MaskValues::default(),
             artifacts: None,
+            prepared_only: false,
         }
     }
 
@@ -513,6 +525,19 @@ mod tests {
         write_private(&p, &serde_json::to_string(&bad).unwrap());
         assert!(SuperviseSpec::from_file(&p).is_err());
         assert!(SuperviseSpec::from_file(&dir.path().join("none.json")).is_err());
+    }
+
+    #[test]
+    fn nodes_may_be_missing_only_for_a_prepared_attempt() {
+        let mut s = spec();
+        s.nodes.clear();
+        assert!(s.validate().unwrap_err().to_string().contains("no nodes"));
+        s.prepared_only = true;
+        s.validate().unwrap();
+        let mut s = spec();
+        s.prepared_only = true;
+        let e = s.validate().unwrap_err().to_string();
+        assert!(e.contains("prepared_only with nodes"), "{e}");
     }
 
     #[test]
