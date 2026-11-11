@@ -1541,7 +1541,9 @@ impl Agent {
             // supervisor's spec is written ([`Self::prepare`]): a
             // declaration that names a secret file never starts a command.
             if !r.payload.artifacts.is_empty() {
-                if let Some(secrets) = self.host.secret_paths(&r.payload)? {
+                // A source that cannot be read here is not this request's
+                // fault to answer for: the later check fails the attempt.
+                if let Ok(Some(secrets)) = self.host.secret_paths(&r.payload) {
                     check_artifacts_not_secret(&r.payload, &secrets)?;
                 }
             }

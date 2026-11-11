@@ -2832,6 +2832,48 @@ async fn the_real_host_runs_the_command_in_the_snapshot_of_the_run_and_removes_i
         assert!(f.store().launches(&b).unwrap().is_empty());
         assert!(!state.join("workspaces").join(b.as_str()).exists());
     }
+
+    // A run whose source has a secret file: the worker knows its path from
+    // the manifest in its store, and refuses to keep it as an artifact.
+    use local_ci::source::SecretSpec;
+    use remote_task_runner::secrets::capture::{capture_run, SecretInputs};
+    std::fs::write(plain.join("sub/.env"), "TOKEN=0123456789abcdef\n").unwrap();
+    let run = RunId::generate();
+    let key = remote_task_runner::secrets::key::ClusterKey::from_bytes(vec![5; 32]).unwrap();
+    let with_secret = capture_run(
+        &BTreeMap::new(),
+        &store,
+        &remote_task_runner::secrets::vault::Vault::open(&state).unwrap(),
+        &SecretInputs {
+            key: &key,
+            declared: &[SecretSpec {
+                glob: "sub/.env".into(),
+                required: true,
+            }],
+        },
+        &run,
+        &SourceRequest::Directory { dir: plain.clone() },
+        &CaptureParams::default(),
+    )
+    .unwrap();
+    assert_eq!(with_secret.manifest.secret_files.len(), 1);
+    let mut q = payload("true");
+    q.run_id = run;
+    q.source_id = with_secret.manifest.source_id.clone();
+    let digest = &with_secret.manifest.manifest_digest;
+    q.manifest_digest = Digest::parse(digest)
+        .or_else(|_| Digest::parse(&format!("sha256:{digest}")))
+        .unwrap();
+    q.artifacts = vec![decl("env", "Sub/.env", MissingPolicy::Optional)];
+    let b = AttemptId::generate();
+    let e = call(&c, submit_req(&b, &q)).await.unwrap_err();
+    assert_eq!(e.code, ErrorCode::InvalidInput, "{e:?}");
+    assert!(f.store().get(&b).unwrap().is_none());
+    // Another file of the same source is no secret: the declaration passes.
+    q.artifacts = vec![decl("x", "sub/x.txt", MissingPolicy::Optional)];
+    assert!(call(&c, submit_req(&b, &q)).await.is_ok());
+    call(&c, cancel_req(&b)).await.unwrap();
+    f.wait_terminal(&b);
 }
 
 /// The `forecast` operation is answered by the agent, with its own epoch and
