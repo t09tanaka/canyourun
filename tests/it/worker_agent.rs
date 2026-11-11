@@ -3374,6 +3374,48 @@ async fn the_commands_of_a_prepared_setup_are_left_out_and_the_others_run() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_submit_with_a_setup_that_is_not_valid_is_refused_before_it_is_stored() {
+    use remote_task_runner::wire::{ReuseScope, SetupSpec, SetupStep};
+    let f = fx();
+    let agent = f.start("boot-a");
+    let c = f.connect(&agent).await;
+    let step = |id: &str, dir: &str| SetupStep {
+        id: id.into(),
+        dir: dir.into(),
+        run: "true".into(),
+        shell: None,
+        env: BTreeMap::new(),
+        unresolved_env: vec![],
+    };
+    let setup = |steps: Vec<SetupStep>| SetupSpec {
+        steps,
+        toolchain: vec![],
+        scope: ReuseScope::Persistent,
+        freshness_secs: None,
+        secrets: vec![],
+        no_cache: false,
+        step_timeout_ms: None,
+    };
+    let a = AttemptId::generate();
+    for (what, steps) in [
+        ("the same id twice", vec![step("s", ""), step("s", "")]),
+        ("a dir out of the workspace", vec![step("s", "../x")]),
+    ] {
+        let mut p = payload("true");
+        p.setup = Some(setup(steps));
+        let e = call(&c, submit_req(&a, &p)).await.expect_err(what);
+        assert_eq!(e.code, ErrorCode::InvalidInput, "{what}: {e:?}");
+    }
+    assert!(f.store().get(&a).unwrap().is_none());
+    assert_eq!(f.host.count(&format!("prepare {a}")), 0);
+    // a valid one is accepted
+    let mut p = payload("true");
+    p.setup = Some(setup(vec![step("s", "web")]));
+    assert!(!submit(&c, &a, &p).await.duplicate);
+    f.wait_terminal(&a);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn an_attempt_whose_commands_are_all_prepared_succeeds_without_starting_one() {
     // An install-only task whose template is there: every command is left
     // out. It is a success with no exit status and no log, its declared

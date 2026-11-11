@@ -1622,6 +1622,11 @@ impl Agent {
             for c in &r.payload.commands {
                 check_cwd_relative(Path::new(&c.cwd))?;
             }
+            // A setup the builder would refuse is refused here, as bad
+            // input, not later as a preparation that failed.
+            if let Some(setup) = &r.payload.setup {
+                crate::setup::policy::validate(setup).map_err(invalid)?;
+            }
             // Against the secret files of its source, when that source is
             // already here. When it is not, the same check runs before the
             // supervisor's spec is written ([`Self::prepare`]): a
