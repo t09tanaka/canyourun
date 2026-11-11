@@ -38,6 +38,7 @@ want = {
     "src/supervisor/termination.rs",
     "src/worker/policy.rs",
     "src/worker/blob_policy.rs",
+    "src/forecast/plan.rs",
     "src/platform/process_read.rs",
 }
 seen = set()

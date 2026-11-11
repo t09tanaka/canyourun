@@ -2596,3 +2596,61 @@ async fn the_real_host_runs_the_command_in_the_snapshot_of_the_run_and_removes_i
         assert!(!state.join("workspaces").join(b.as_str()).exists());
     }
 }
+
+/// The `forecast` operation is answered by the agent, with its own epoch and
+/// boot id, and it writes nothing to the worker's store.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_agent_answers_a_forecast_and_writes_nothing() {
+    let f = fx();
+    let agent = f.start("boot-f");
+    let c = f.connect(&agent).await;
+    let a = AttemptId::generate();
+    let n = NodeId::parse("main").unwrap();
+    let before = (
+        f.store().list_attempts(None, true, 100).unwrap().len(),
+        f.store().events_after(0, 1000).unwrap().len(),
+    );
+    let req = |epoch: u64| {
+        Request::Forecast(ForecastRequest {
+            schema_version: SchemaVersion::CURRENT,
+            request_id: RequestId::generate(),
+            coordinator_epoch: CoordinatorEpoch(epoch),
+            workload: WorkloadPlan {
+                attempt_id: a.clone(),
+                plan_digest: Digest::of_bytes(b"plan"),
+                expansion_seq: 0,
+                nodes: vec![WorkloadNode {
+                    node_id: n.clone(),
+                    depends_on: vec![],
+                    priority: 0,
+                    weight: Some(1),
+                    predicted_rss_bytes: Some(1),
+                    predicted_runtime_ms: Some(5_000),
+                    external_delay_ms: None,
+                    ready_in_ms: Some(0),
+                    concurrency: ConcurrencyLimits::default(),
+                    correlation: Correlation {
+                        attempt_id: a.clone(),
+                        node_id: n.clone(),
+                        ledger_entry: None,
+                    },
+                    shared_builder: None,
+                }],
+            },
+            pending: vec![],
+        })
+    };
+    let Response::Forecast(r) = call(&c, req(0)).await.unwrap() else {
+        panic!("a forecast answer")
+    };
+    assert_eq!(r.agent_epoch, agent.agent_epoch());
+    assert_eq!(r.worker_boot_id.as_str(), "boot-f");
+    assert_eq!(r.ttl_ms, 2000);
+    assert_eq!(r.target.runtime_source, RuntimeSource::Measured);
+    assert!(r.coverage.iter().any(|c| c.node_ids.contains(&n)));
+    let after = (
+        f.store().list_attempts(None, true, 100).unwrap().len(),
+        f.store().events_after(0, 1000).unwrap().len(),
+    );
+    assert_eq!(before, after);
+}

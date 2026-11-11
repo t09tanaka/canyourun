@@ -1416,12 +1416,11 @@ impl Agent {
                 self.known(&r.attempt_id)?;
                 blobs::get(&self.store, &self.cfg.attempts_root(), &r).map(Response::BlobGet)
             }
-            Request::Forecast(_) | Request::EnvReport(_) | Request::EnvSync(_) => {
-                Err(ApiError::new(
-                    ErrorCode::NotImplemented,
-                    "this operation is not implemented by the worker agent yet",
-                ))
-            }
+            Request::Forecast(r) => self.forecast(r).map(Response::Forecast),
+            Request::EnvReport(_) | Request::EnvSync(_) => Err(ApiError::new(
+                ErrorCode::NotImplemented,
+                "this operation is not implemented by the worker agent yet",
+            )),
         }
     }
 
@@ -1884,6 +1883,25 @@ impl Agent {
             verified: true,
             placed,
         })
+    }
+
+    /// Read-only: nothing is written, whatever the request.
+    fn forecast(&self, r: ForecastRequest) -> Result<ForecastResponse, ApiError> {
+        let attempts = self.store.list_nonterminal().map_err(api)?;
+        let max_epoch = self.store.max_coordinator_epoch().map_err(api)?;
+        let ident = crate::forecast::plan::Ident {
+            worker_id: self.cfg.worker_id.clone(),
+            boot_id: self.cfg.boot_id.clone(),
+            agent_epoch: self.epoch,
+        };
+        crate::forecast::answer(
+            &self.cfg.traffic_state_dir,
+            self.cfg.traffic_config.as_deref(),
+            &ident,
+            &attempts,
+            max_epoch,
+            &r,
+        )
     }
 
     fn inspect(&self) -> Result<InspectResponse, ApiError> {
