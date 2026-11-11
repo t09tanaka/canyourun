@@ -53,7 +53,7 @@ use crate::platform::{free_bytes, open_beneath, wall_ms};
 use crate::protocol::chunk::clamp_chunk;
 use crate::source::classify::{ci_id_of, source_id_of_ci};
 use crate::source::diff::{is_blob_hash, BlobWant};
-use crate::source::store::{verify_manifest, ObjectsRepo};
+use crate::source::store::{verify_manifest, ImportRef, ObjectsRepo};
 use crate::source::SourceStore;
 use crate::storage::WorkerStore;
 use crate::supervisor::spool_plan::relative_path;
@@ -63,7 +63,7 @@ use crate::wire::{
 };
 use crate::workspace::plan::clone_dir_name;
 use crate::workspace::Workspaces;
-use local_ci::source::SourceManifest as CiManifest;
+use local_ci::source::{SourceError, SourceManifest as CiManifest};
 use sha2::{Digest as _, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, TryLockError};
@@ -104,6 +104,42 @@ fn internal(what: &str, e: impl std::fmt::Display) -> ApiError {
 
 fn io_err(e: io::Error) -> ApiError {
     internal("incoming blobs", e)
+}
+
+/// Is the error about what was sent? Only the errors that say so by their
+/// type are: a check of the manifests or of the bundle that did not hold
+/// ([`SourceError::Corrupt`], [`SourceError::UnsafePath`]). Everything else
+/// (Git could not be run, the disk is full, a ref is locked) is taken for a
+/// fault of this host: the sender must not throw away a good source for it.
+///
+/// The limit of this: Git says "the pack is broken" and "the disk is full"
+/// the same way (it exits with 128), and local-ci passes both on without a
+/// type. The text of an error is never read to tell them apart. So a bundle
+/// whose header is whole and whose pack does not unpack is answered
+/// `INTERNAL`, and stays staged until another bundle takes its place or the
+/// source is dropped.
+fn input_fault(e: &anyhow::Error) -> bool {
+    e.chain().any(|cause| {
+        matches!(
+            cause.downcast_ref::<SourceError>(),
+            Some(SourceError::Corrupt { .. } | SourceError::UnsafePath { .. })
+        )
+    })
+}
+
+fn is_object_id(s: &str) -> bool {
+    s.len() == 40 && s.bytes().all(|c| matches!(c, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// What unpacking a bundle left for [`Incoming::complete`]: the clone, the
+/// refs that were not in it before, whether the clone was made for this
+/// bundle, and the import lock of the clone, held until the source is
+/// published or refused.
+struct Unpacked {
+    repo: ObjectsRepo,
+    made: Vec<ImportRef>,
+    fresh: bool,
+    _importing: File,
 }
 
 fn private_dir(dir: &Path) -> io::Result<()> {
@@ -325,6 +361,20 @@ fn check_manifest(m: &CiManifest) -> Result<(), ApiError> {
     if subs.into_iter().any(|id| source_id_of_ci(id).is_none()) {
         return Err(invalid(
             "the manifest names a submodule capture by a malformed id",
+        ));
+    }
+    // (what is handed to Git later is an object id, and nothing else)
+    let mut ids = [
+        &m.execution_commit,
+        &m.merge_base,
+        &m.index_tree,
+        &m.worktree_tree,
+    ]
+    .into_iter()
+    .flatten();
+    if ids.any(|id| !is_object_id(id)) {
+        return Err(invalid(
+            "the manifest names a commit or a tree by something that is not an id",
         ));
     }
     Ok(())
@@ -937,18 +987,58 @@ impl Incoming {
     /// Does `repo` hold the commits the bundle of the source carries (those
     /// of the sources in `carried`), each below its snapshot ref and with
     /// the tree its manifest gives?
-    fn commits_here(&self, repo: &ObjectsRepo, st: &Staged, carried: &BTreeSet<String>) -> bool {
-        carried.iter().all(|id| match st.manifests.get(id) {
-            Some(info) => info.execution_commit.as_deref().is_none_or(|commit| {
-                repo.check_snapshot(id, commit, info.worktree_tree.as_deref())
-                    .is_ok()
-            }),
-            // published before, by another transfer: ask the store's copy
-            None => matches!(
-                self.store.manifest(id),
-                Ok(Some(m)) if repo.check_reachable(&m).is_ok()
-            ),
-        })
+    ///
+    /// `Ok(false)` is "no". A Git or a store that could not be asked is an
+    /// error (`INTERNAL`), never a "no": the commits may well be there.
+    fn commits_here(
+        &self,
+        repo: &ObjectsRepo,
+        st: &Staged,
+        carried: &BTreeSet<String>,
+    ) -> Result<bool, ApiError> {
+        let said = |checked: anyhow::Result<()>| match checked {
+            Ok(()) => Ok(true),
+            Err(e) if input_fault(&e) => Ok(false),
+            Err(e) => Err(internal("the clone", format!("{e:#}"))),
+        };
+        for id in carried {
+            let here = match st.manifests.get(id) {
+                Some(info) => match info.execution_commit.as_deref() {
+                    Some(commit) => {
+                        said(repo.check_snapshot(id, commit, info.worktree_tree.as_deref()))?
+                    }
+                    None => true,
+                },
+                // published before, by another transfer: ask the store's copy
+                None => match self
+                    .store
+                    .manifest(id)
+                    .map_err(|e| internal("source store", format!("{e:#}")))?
+                {
+                    Some(m) => said(repo.check_reachable(&m))?,
+                    None => false,
+                },
+            };
+            if !here {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    /// Remove from `repo` the refs of `made` that `keep` does not ask for,
+    /// each only while it is at the commit the import set it to. What does
+    /// not go stays: there is nobody to tell.
+    fn drop_refs(repo: &ObjectsRepo, made: &[ImportRef], keep: impl Fn(&ImportRef) -> bool) {
+        for r in made.iter().filter(|r| !keep(r)) {
+            let at = match &r.commit {
+                Some(commit) => Some(commit.clone()),
+                None => repo.ref_value(&r.name).ok().flatten(),
+            };
+            if let Some(at) = at {
+                let _ = repo.drop_ref(&r.name, &at);
+            }
+        }
     }
 
     /// What the clone of the source's repository holds, for the coordinator
@@ -1028,9 +1118,22 @@ impl Incoming {
                             invalid(format!("the capture {id} of a dirty submodule is not here"))
                         })?,
                 };
+                if m.execution_commit.is_none() || m.worktree_tree.is_none() {
+                    return Err(invalid(format!(
+                        "the capture {id} of a dirty submodule has no Git objects"
+                    )));
+                }
                 todo.push(m.submodules.clone());
                 out.push(m);
             }
+        }
+        // (every entry counts, also one that names a capture seen before)
+        let entries = std::iter::once(root)
+            .chain(&out)
+            .flat_map(|m| m.submodules.iter().filter(|s| s.dirty))
+            .count();
+        if entries > local_ci::source::MAX_DIRTY_SUBMODULES {
+            return Err(invalid("too many dirty submodules below the source"));
         }
         Ok(out)
     }
@@ -1042,12 +1145,18 @@ impl Incoming {
     /// none). It is dropped, nothing is made, and the answer (`CONFLICT`,
     /// `bundle_base_missing`) says what the clone does hold, so the next
     /// bundle fits. A bundle that is not one, or does not bring what the
-    /// manifest names, is `INVALID_INPUT`.
+    /// manifests name, is `INVALID_INPUT`, and is dropped.
     ///
     /// The bundle is unpacked into a scratch repository first (the refs of
     /// the clone, its objects borrowed), and what the manifests name is
     /// looked for there: a bundle that is refused has written nothing into
     /// the clone, and has not made one.
+    ///
+    /// What fails for another reason than the bundle and the manifests is
+    /// `INTERNAL`, and the bundle stays staged: sending anything of the
+    /// source again tries it once more. See [`input_fault`] for what can be
+    /// told apart; once the bundle unpacked in the scratch repository,
+    /// nothing that fails in the clone is laid on it.
     fn unpack(
         &self,
         limits: &BlobLimits,
@@ -1055,7 +1164,7 @@ impl Incoming {
         repository_id: &str,
         root_id: &str,
         st: &Staged,
-    ) -> Result<ObjectsRepo, ApiError> {
+    ) -> Result<Unpacked, ApiError> {
         let refuse = |why: String| {
             remove_staged(bundle);
             invalid(format!("the bundle is refused: {why}"))
@@ -1068,7 +1177,7 @@ impl Incoming {
         // round). Two sources of a repository share the snapshot refs of the
         // dirty submodules they share.
         let busy = format!("the clone of {repository_id} is busy");
-        let _importing =
+        let importing =
             Self::wait_lock(self.workspaces.import_lock(repository_id)?, limits, &busy)?;
         let existing = self.objects(repository_id);
         let fits = match &existing {
@@ -1103,44 +1212,84 @@ impl Incoming {
             })?;
         {
             let (_scratch, trial) = self.workspaces.rehearsal(repository_id)?;
-            trial
-                .receive_bundle(bundle, &body, &nested)
-                .map_err(|e| refuse(format!("{e:#}")))?;
-            if !self.commits_here(&trial, st, &carried) {
+            trial.receive_bundle(bundle, &body, &nested).map_err(|e| {
+                if input_fault(&e) {
+                    refuse(format!("{e:#}"))
+                } else {
+                    internal("unpacking the bundle", format!("{e:#}"))
+                }
+            })?;
+            if !self.commits_here(&trial, st, &carried)? {
                 return Err(refuse(
                     "it does not bring the commits the manifests name".into(),
                 ));
             }
         }
-        let made = existing.is_none();
+        let fresh = existing.is_none();
         let repo = match existing {
             Some(repo) => repo,
             None => self.workspaces.ensure_clone(repository_id, None)?,
         };
-        let taken = repo
-            .receive_bundle(bundle, &body, &nested)
-            .map_err(|e| format!("{e:#}"))
-            .and_then(|()| {
-                if self.commits_here(&repo, st, &carried) {
-                    Ok(())
-                } else {
-                    Err("it does not bring the commits the manifests name".to_string())
+        match self.import(&repo, bundle, &body, &nested, st, &carried) {
+            Ok(made) => Ok(Unpacked {
+                repo,
+                made,
+                fresh,
+                _importing: importing,
+            }),
+            Err(e) => {
+                // What unpacked beside the clone did not unpack into it. A
+                // clone made just now for this bundle, and still empty, does
+                // not stay.
+                if fresh {
+                    let _ = self.workspaces.remove_clone_if_empty(repository_id);
                 }
-            });
-        if let Err(why) = taken {
-            // What unpacked beside the clone did not unpack into it. A clone
-            // made just now for this bundle, and still empty, does not stay.
-            if made {
-                let _ = self.workspaces.remove_clone_if_empty(repository_id);
+                if e.code == ErrorCode::InvalidInput {
+                    remove_staged(bundle);
+                }
+                Err(e)
             }
-            return Err(refuse(why));
         }
-        Ok(repo)
+    }
+
+    /// The second half of [`Self::unpack`]: the bundle, which unpacked in
+    /// the scratch repository a moment ago under the same lock, into the
+    /// clone itself. Returns the refs that were not in the clone before.
+    ///
+    /// Git failing here is not laid on the bundle (`INTERNAL`). Should the
+    /// commits not be in the clone afterwards all the same, the source is
+    /// refused (`INVALID_INPUT`) and the refs this import made are removed:
+    /// a refused source leaves the clone as it was.
+    fn import(
+        &self,
+        repo: &ObjectsRepo,
+        bundle: &Path,
+        body: &CiManifest,
+        nested: &[CiManifest],
+        st: &Staged,
+        carried: &BTreeSet<String>,
+    ) -> Result<Vec<ImportRef>, ApiError> {
+        let failed = |e: anyhow::Error| internal("unpacking the bundle", format!("{e:#}"));
+        let mut made = vec![];
+        for r in ObjectsRepo::import_refs(body, nested) {
+            if repo.ref_value(&r.name).map_err(failed)?.is_none() {
+                made.push(r);
+            }
+        }
+        repo.receive_bundle(bundle, body, nested).map_err(failed)?;
+        if self.commits_here(repo, st, carried)? {
+            return Ok(made);
+        }
+        Self::drop_refs(repo, &made, |_| false);
+        Err(invalid(
+            "the bundle is refused: it does not bring the commits the manifests name",
+        ))
     }
 
     /// Publish the source when everything it needs is here. `Ok(false)`:
-    /// something is still missing. An error is about what was sent (a bundle
-    /// that does not fit, a manifest the store refuses).
+    /// something is still missing. `INVALID_INPUT` and `CONFLICT` are about
+    /// what was sent (a bundle that does not fit, a manifest the store
+    /// refuses); `INTERNAL` is about this host, and keeps what is staged.
     ///
     /// Everything that can refuse the source comes before anything of it is
     /// written outside its staging directory: that every file the store
@@ -1150,7 +1299,8 @@ impl Incoming {
     /// Only then is the bundle unpacked into the clone, are the files moved
     /// into the store and the manifests published, so a source that is
     /// refused or dropped leaves nothing in the store and nothing in the
-    /// clone.
+    /// clone. Should a source be refused after its bundle went into the
+    /// clone all the same, the refs that bundle made are removed again.
     fn complete(
         &self,
         limits: &BlobLimits,
@@ -1222,11 +1372,18 @@ impl Incoming {
         let root = &st.manifests[root_id];
         let carried = st.carried(root_id);
         let mut objects = None;
+        // (with what the bundle of this call put into the clone, if one did)
+        let mut unpacked = None;
         if let (Some(_), Some(repository_id)) = (&root.execution_commit, &root.repository_id) {
             let repo = match Self::bundle_done(&dir)? {
-                Some(bundle) => self.unpack(limits, &bundle, repository_id, root_id, st)?,
+                Some(bundle) => {
+                    let u = self.unpack(limits, &bundle, repository_id, root_id, st)?;
+                    let repo = u.repo.clone();
+                    unpacked = Some((u, repository_id.clone()));
+                    repo
+                }
                 None => match self.objects(repository_id) {
-                    Some(repo) if self.commits_here(&repo, st, &carried) => repo,
+                    Some(repo) if self.commits_here(&repo, st, &carried)? => repo,
                     _ => return Ok(false),
                 },
             };
@@ -1272,9 +1429,30 @@ impl Incoming {
             let info = &st.manifests[&id];
             let name = staged_name(SourceBlobKind::Manifest, &info.hex, info.size, true);
             let m = read_manifest(&dir.join(name), limits)?;
-            self.store
-                .publish_received_one(&m, carried.contains(&id), objects.as_ref())
-                .map_err(|e| invalid(format!("the source is refused: {e:#}")))?;
+            let Err(e) =
+                self.store
+                    .publish_received_one(&m, carried.contains(&id), objects.as_ref())
+            else {
+                continue;
+            };
+            if !input_fault(&e) {
+                // (the store could not be written, Git could not be asked:
+                // everything stays, and the next request tries again)
+                return Err(internal("source store", format!("{e:#}")));
+            }
+            // Refused after its bundle was unpacked: the refs the bundle
+            // made go again, but for the snapshots of the captures that are
+            // published by now (their manifests name those commits).
+            if let Some((u, repository_id)) = &unpacked {
+                Self::drop_refs(&u.repo, &u.made, |r| match &r.snapshot_of {
+                    Some(id) => self.published(id).unwrap_or(true),
+                    None => false,
+                });
+                if u.fresh {
+                    let _ = self.workspaces.remove_clone_if_empty(repository_id);
+                }
+            }
+            return Err(invalid(format!("the source is refused: {e:#}")));
         }
         self.discard(source.as_str());
         Ok(true)
@@ -1377,9 +1555,10 @@ impl Incoming {
         // Are the commits a bundle would bring missing?
         let commits_missing = match st.manifests.get(root_id) {
             Some(root) => match (&root.execution_commit, &root.repository_id) {
-                (Some(_), Some(repository_id)) => !self
-                    .objects(repository_id)
-                    .is_some_and(|repo| self.commits_here(&repo, st, &st.carried(root_id))),
+                (Some(_), Some(repository_id)) => match self.objects(repository_id) {
+                    Some(repo) => !self.commits_here(&repo, st, &st.carried(root_id))?,
+                    None => true,
+                },
                 _ => false,
             },
             None => false,

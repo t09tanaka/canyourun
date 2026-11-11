@@ -7,7 +7,7 @@
 use crate::proto_common::client_cfg;
 use local_ci::source::SourceManifest as CiManifest;
 use local_ci::ExecContext;
-use remote_task_runner::error::{ApiError, ConflictReason, ErrorCode};
+use remote_task_runner::error::{ApiError, BlockedReason, ConflictReason, ErrorCode};
 use remote_task_runner::ids::*;
 use remote_task_runner::protocol::transfer::put_blob_as;
 use remote_task_runner::protocol::transport::duplex_pair;
@@ -88,6 +88,9 @@ struct Fx {
     agents: Mutex<Vec<Arc<Agent>>>,
     /// Where `fast-worktree` is, when the worker of the test needs it.
     tools: Option<PathBuf>,
+    /// A directory that comes first on the worker's `PATH` (see
+    /// [`Fx::git_shim`]).
+    front: Option<PathBuf>,
 }
 
 /// The directory of the installed `fast-worktree` (a Git source is prepared
@@ -118,6 +121,7 @@ fn fx() -> Fx {
         cluster: ClusterId::generate(),
         agents: Mutex::default(),
         tools: None,
+        front: None,
     }
 }
 
@@ -153,6 +157,10 @@ impl Fx {
             Some(dir) => format!("{PATH}:{}", dir.display()),
             None => PATH.to_string(),
         };
+        let path = match &self.front {
+            Some(dir) => format!("{}:{path}", dir.display()),
+            None => path,
+        };
         [
             ("PATH", path.as_str()),
             ("HOME", self.path("home").to_str().unwrap()),
@@ -162,6 +170,61 @@ impl Fx {
         .into_iter()
         .map(|(k, v)| (k.to_string(), v.to_string()))
         .collect()
+    }
+    /// Put a `git` in front of the real one for everything that runs with
+    /// [`Self::env`] from now on. It is the real Git, except where
+    /// [`Self::git_fails`] says otherwise.
+    fn git_shim(&mut self) {
+        let real = std::env::split_paths(PATH)
+            .map(|d| d.join("git"))
+            .find(|p| p.is_file())
+            .expect("git is installed");
+        let dir = self.path("shim");
+        std::fs::create_dir_all(&dir).unwrap();
+        // The repository a command is for: what follows `-C`, or where it
+        // runs. The scratch repositories (`.clone.*`) are left alone.
+        let text = format!(
+            r#"#!/bin/sh
+dir=""; prev=""; sub=""
+for a in "$@"; do
+  if [ "$prev" = "-C" ]; then dir="$a"; fi
+  case "$a" in
+    fetch|merge-base) if [ -z "$sub" ]; then sub="$a"; fi ;;
+  esac
+  prev="$a"
+done
+if [ -z "$dir" ]; then dir="$(pwd)"; fi
+case "$dir" in
+  */.clone.*) exec "{real}" "$@" ;;
+esac
+flag="{flags}/fail-$sub"
+if [ -n "$sub" ] && [ -f "$flag" ]; then
+  read -r pass code < "$flag"
+  if [ "$pass" -le 0 ]; then
+    echo "fatal: no $sub today" >&2
+    exit "$code"
+  fi
+  echo "$((pass - 1)) $code" > "$flag"
+fi
+exec "{real}" "$@"
+"#,
+            real = real.display(),
+            flags = dir.display(),
+        );
+        crate::common::write_executable(&dir.join("git"), &text);
+        self.front = Some(dir);
+    }
+    /// From now on `git <subcommand>` in a clone of the worker (not in a
+    /// scratch repository beside it) exits with `code`, after `pass` calls
+    /// that go through. `None`: it works again.
+    fn git_fails(&self, subcommand: &str, how: Option<(u32, i32)>) {
+        let flag = self.path("shim").join(format!("fail-{subcommand}"));
+        match how {
+            Some((pass, code)) => std::fs::write(flag, format!("{pass} {code}\n")).unwrap(),
+            None => {
+                let _ = std::fs::remove_file(flag);
+            }
+        }
     }
     /// The store of the side that sends.
     fn parent(&self) -> SourceStore {
@@ -1738,15 +1801,17 @@ fn a_bundle_built_on_what_the_worker_lacks_is_answered_with_what_it_holds() {
         have
     );
 
-    // A bundle that is broken is another matter: it is not asked for again
-    // with another base.
+    // A bundle whose pack is cut short is another matter: it is not asked
+    // for again with another base. (Git fails on it as it does on a full
+    // disk, so it is not laid on the bundle either: it stays until the next
+    // one takes its place.)
     let whole = second.bundle.as_ref().unwrap();
     let mut broken = whole.clone();
     broken.truncate(whole.len() - 40);
     let e = put_all(sink, &l, &second.source, Bundle, &broken).unwrap_err();
-    assert_eq!(e.code, ErrorCode::InvalidInput);
+    assert_eq!(e.code, ErrorCode::Internal);
     assert_eq!(e.conflict_reason, None);
-    assert!(no_bundle(&f, &second));
+    assert!(!no_bundle(&f, &second));
     assert!(!verify(sink, &l, &second.source, vec![]).ready);
 
     // Built on what the worker said it holds, it fits.
@@ -2184,16 +2249,23 @@ fn a_bundle_that_is_refused_writes_nothing_into_the_clone_and_makes_none() {
         *b ^= 0x55;
     }
     assert_eq!(bundle_prerequisites(&broken), Ok(vec![]));
-    for wrong in [&broken, &broken, &foreign(&p.root)] {
+    // (Git fails on a broken pack as it does on a full disk, so the worker
+    // does not lay it on the bundle: `INTERNAL`, and the bundle stays until
+    // another takes its place)
+    let other_commits = foreign(&p.root);
+    for (wrong, code) in [
+        (&broken, ErrorCode::Internal),
+        (&broken, ErrorCode::Internal),
+        (&other_commits, ErrorCode::InvalidInput),
+    ] {
         let e = put_all(sink, &l, &p.source, Bundle, wrong).unwrap_err();
-        assert_eq!(e.code, ErrorCode::InvalidInput, "{e:?}");
+        assert_eq!(e.code, code, "{e:?}");
         assert!(e.message.contains("bundle"), "{}", e.message);
         assert!(f.clones().is_empty());
         assert!(clone_scratch(&f).is_empty(), "{:?}", clone_scratch(&f));
-        assert!(f
-            .staged(&p.source)
-            .iter()
-            .all(|n| !n.starts_with("bundle-")));
+        let staged = f.staged(&p.source);
+        let kept = staged.iter().filter(|n| n.starts_with("bundle-")).count();
+        assert_eq!(kept, usize::from(code == ErrorCode::Internal), "{staged:?}");
     }
     assert!(!verify(sink, &l, &p.source, p.refs()).ready);
     put_all(sink, &l, &p.source, Bundle, &bundle).unwrap();
@@ -2221,9 +2293,13 @@ fn a_bundle_that_is_refused_writes_nothing_into_the_clone_and_makes_none() {
         *b ^= 0x55;
     }
     let store_before = tree_of(&f.state().join("sources"));
-    for wrong in [&broken, &foreign(&q.root)] {
+    let other_commits = foreign(&q.root);
+    for (wrong, code) in [
+        (&broken, ErrorCode::Internal),
+        (&other_commits, ErrorCode::InvalidInput),
+    ] {
         let e = put_all(sink, &l, &q.source, Bundle, wrong).unwrap_err();
-        assert_eq!(e.code, ErrorCode::InvalidInput, "{e:?}");
+        assert_eq!(e.code, code, "{e:?}");
         assert_eq!(state(&clones[0]), before);
         assert!(clone_scratch(&f).is_empty());
         assert_eq!(f.clones(), clones);
@@ -2710,7 +2786,8 @@ fn a_bundle_waits_for_another_import_into_the_same_clone() {
     let bundle = p.bundle.as_ref().unwrap();
     let e = put_all(sink, &l, &p.source, Bundle, bundle).unwrap_err();
     assert_eq!(e.code, ErrorCode::Overloaded);
-    assert!(e.message.contains("busy"), "{}", e.message);
+    // (the lock of the clone, not the one of the source)
+    assert!(e.message.contains("the clone of"), "{}", e.message);
     // Nothing was unpacked, no clone was made, and the bundle is kept.
     assert!(f.clones().is_empty());
     assert!(f.staged(&p.source).iter().any(|n| n.starts_with("bundle-")));
@@ -2748,15 +2825,34 @@ fn a_source_keeps_a_few_bundle_files_in_the_parent_store_and_they_can_be_removed
     assert_eq!(files(&p.root.source_id).len(), 1);
     assert_eq!(files(&other.root.source_id).len(), 1);
     // Every set of commits a peer names is another file: a peer that names
-    // a new set each time does not fill the store.
+    // a new set each time does not fill the store. The oldest make room;
+    // each file is given its own time here, one second after the one
+    // before, so "oldest" does not hang on how fast the test runs.
+    let stamp = |p: &Path, n: usize| {
+        let at = std::time::UNIX_EPOCH + Duration::from_secs(1_700_000_000 + n as u64);
+        let f = std::fs::File::options().write(true).open(p).unwrap();
+        f.set_modified(at).unwrap();
+    };
+    stamp(&files(&p.root.source_id)[0], 0);
+    let mut written = vec![];
     let mut last = PathBuf::new();
     for i in 0..(MAX_BUNDLES_PER_SOURCE + 3) {
         let have = vec![format!("{:040x}", i + 1)];
         last = store.export_bundle(&ctx, &p.root, &have).unwrap();
         assert!(last.exists());
+        stamp(&last, i + 1);
+        written.push(last.clone());
         assert!(files(&p.root.source_id).len() <= MAX_BUNDLES_PER_SOURCE);
     }
-    assert_eq!(files(&p.root.source_id).len(), MAX_BUNDLES_PER_SOURCE);
+    // What stays is what was written last.
+    let sorted = |mut v: Vec<PathBuf>| {
+        v.sort();
+        v
+    };
+    assert_eq!(
+        sorted(files(&p.root.source_id)),
+        sorted(written[written.len() - MAX_BUNDLES_PER_SOURCE..].to_vec())
+    );
     // What is not a commit id, and what is named twice, is not a new set.
     let noisy = vec![
         format!("{:040x}", MAX_BUNDLES_PER_SOURCE + 3),
@@ -2773,4 +2869,309 @@ fn a_source_keeps_a_few_bundle_files_in_the_parent_store_and_they_can_be_removed
     assert!(files(&p.root.source_id).is_empty());
     assert_eq!(files(&other.root.source_id).len(), 1);
     assert_eq!(store.remove_bundles(&p.root.source_id).unwrap(), 0);
+}
+
+/// A repository with one commit and an edit on top, captured.
+fn small_project(f: &Fx) -> (PathBuf, Parcel) {
+    let repo = f.path("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    git(&repo, &["init", "-q", "-b", "main"]);
+    std::fs::write(repo.join("a.txt"), "committed\n").unwrap();
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-qm", "base"]);
+    std::fs::write(repo.join("a.txt"), "edited\n").unwrap();
+    let p = f.capture(&SourceRequest::Worktree { dir: repo.clone() });
+    (repo, p)
+}
+
+/// Everything of the parcel but its bundle.
+fn send_but_bundle(sink: &dyn BlobSink, l: &BlobLimits, p: &Parcel) {
+    for man in &p.manifests {
+        put_all(sink, l, &p.source, Manifest, man).unwrap();
+    }
+    for b in p.blobs.values() {
+        put_all(sink, l, &p.source, Content, b).unwrap();
+    }
+}
+
+fn bundles_staged(f: &Fx, source: &SourceId) -> usize {
+    let staged = f.staged(source);
+    staged.iter().filter(|n| n.starts_with("bundle-")).count()
+}
+
+#[test]
+fn a_git_that_fails_in_the_clone_is_not_laid_on_the_bundle() {
+    let mut f = fx();
+    f.git_shim();
+    let (repo, p) = small_project(&f);
+    let m = f.machine();
+    let (sink, l) = (m.blobs().unwrap(), limits());
+    send_but_bundle(sink, &l, &p);
+    let bundle = p.bundle.clone().unwrap();
+
+    // No clone yet. The bundle unpacks beside, and then the fetch into the
+    // clone fails (as it does when the disk is full): the worker's fault.
+    // The bundle is kept, and the clone made for it does not stay.
+    f.git_fails("fetch", Some((0, 128)));
+    for _ in 0..2 {
+        let e = put_all(sink, &l, &p.source, Bundle, &bundle).unwrap_err();
+        assert_eq!(e.code, ErrorCode::Internal, "{e:?}");
+        assert!(e.message.contains("no fetch today"), "{}", e.message);
+        assert!(f.clones().is_empty());
+        assert!(clone_scratch(&f).is_empty(), "{:?}", clone_scratch(&f));
+        assert_eq!(bundles_staged(&f, &p.source), 1);
+    }
+    // Git works again: sending anything of the source once more is enough.
+    f.git_fails("fetch", None);
+    assert!(!verify(sink, &l, &p.source, p.refs()).ready);
+    let again = put_all(sink, &l, &p.source, Manifest, &p.manifests[0]).unwrap();
+    assert!(again.complete);
+    assert!(verify(sink, &l, &p.source, p.refs()).ready);
+    let clones = f.clones();
+    assert_eq!(clones.len(), 1);
+
+    // The clone is there. For the next source of the repository, Git cannot
+    // say whether the commit is below its ref (it fails, which is not "no"):
+    // `INTERNAL` again, and the bundle is kept.
+    std::fs::write(repo.join("a.txt"), "edited once more\n").unwrap();
+    let q = f.capture(&SourceRequest::Worktree { dir: repo });
+    send_but_bundle(sink, &l, &q);
+    let whole = f.bundle(&q.root, &[]);
+    f.git_fails("merge-base", Some((0, 128)));
+    let e = put_all(sink, &l, &q.source, Bundle, &whole).unwrap_err();
+    assert_eq!(e.code, ErrorCode::Internal, "{e:?}");
+    assert!(e.message.contains("no merge-base today"), "{}", e.message);
+    assert_eq!(bundles_staged(&f, &q.source), 1);
+    // (asking fails the same way: it is not answered with "send a bundle")
+    let asked = sink.verify(
+        &l,
+        &BlobVerifyRequest {
+            schema_version: SchemaVersion::CURRENT,
+            request_id: RequestId::generate(),
+            source_id: q.source.clone(),
+            blobs: vec![],
+        },
+    );
+    assert_eq!(asked.unwrap_err().code, ErrorCode::Internal);
+    f.git_fails("merge-base", None);
+    let again = put_all(sink, &l, &q.source, Manifest, &q.manifests[0]).unwrap();
+    assert!(again.complete);
+    assert!(verify(sink, &l, &q.source, q.refs()).ready);
+    assert!(clone_scratch(&f).is_empty());
+}
+
+#[test]
+fn a_source_refused_after_its_bundle_unpacked_leaves_no_ref_in_the_clone() {
+    let mut f = fx();
+    f.git_shim();
+    let (repo, p) = small_project(&f);
+    let m = f.machine();
+    let (sink, l) = (m.blobs().unwrap(), limits());
+    let refs = |c: &Path| git(c, &["for-each-ref"]);
+
+    // No clone yet, and Git says "no" in the clone to what it said "yes" to
+    // beside it: the commit is not below its snapshot ref. Refused, and the
+    // clone that was made for the bundle is gone with the refs.
+    send_but_bundle(sink, &l, &p);
+    let bundle = p.bundle.clone().unwrap();
+    f.git_fails("merge-base", Some((0, 1)));
+    let e = put_all(sink, &l, &p.source, Bundle, &bundle).unwrap_err();
+    assert_eq!(e.code, ErrorCode::InvalidInput, "{e:?}");
+    assert!(e.message.contains("bundle is refused"), "{}", e.message);
+    assert!(f.clones().is_empty());
+    assert_eq!(bundles_staged(&f, &p.source), 0);
+    f.git_fails("merge-base", None);
+    put_all(sink, &l, &p.source, Bundle, &bundle).unwrap();
+    assert!(verify(sink, &l, &p.source, p.refs()).ready);
+    let clones = f.clones();
+    assert_eq!(clones.len(), 1);
+    let before = refs(&clones[0]);
+    assert_eq!(before.lines().count(), 2, "{before}");
+
+    // The clone is there, with the refs of the first source. The same for
+    // the next one: its two refs (snapshot and index) are not left behind.
+    std::fs::write(repo.join("a.txt"), "edited once more\n").unwrap();
+    let q = f.capture(&SourceRequest::Worktree { dir: repo.clone() });
+    send_but_bundle(sink, &l, &q);
+    let whole = f.bundle(&q.root, &[]);
+    f.git_fails("merge-base", Some((0, 1)));
+    let e = put_all(sink, &l, &q.source, Bundle, &whole).unwrap_err();
+    assert_eq!(e.code, ErrorCode::InvalidInput, "{e:?}");
+    assert_eq!(refs(&clones[0]), before);
+    assert_eq!(bundles_staged(&f, &q.source), 0);
+
+    // And when the "no" comes one question later, as the manifest is about
+    // to be published: refused as well, with nothing left in the clone and
+    // no manifest in the store.
+    f.git_fails("merge-base", Some((1, 1)));
+    let e = put_all(sink, &l, &q.source, Bundle, &whole).unwrap_err();
+    assert_eq!(e.code, ErrorCode::InvalidInput, "{e:?}");
+    assert!(e.message.contains("source is refused"), "{}", e.message);
+    assert_eq!(refs(&clones[0]), before);
+    assert!(f
+        .worker_store()
+        .manifest(&q.root.source_id)
+        .unwrap()
+        .is_none());
+    f.git_fails("merge-base", None);
+    assert!(!verify(sink, &l, &q.source, q.refs()).ready);
+    let again = put_all(sink, &l, &q.source, Bundle, &whole).unwrap();
+    assert!(again.complete);
+    assert!(verify(sink, &l, &q.source, q.refs()).ready);
+    assert_eq!(refs(&clones[0]).lines().count(), 4);
+}
+
+#[test]
+fn a_worker_does_not_start_with_a_git_that_is_too_old_or_not_there() {
+    let f = fx();
+    let open = |path: &Path| {
+        let mut env = f.env();
+        env.insert("PATH".into(), path.display().to_string());
+        match Machine::open(&f.state(), env, f.state().join("cluster.key")) {
+            Ok(_) => panic!("the worker started"),
+            Err(e) => e,
+        }
+    };
+    let bin = f.path("old");
+    std::fs::create_dir_all(&bin).unwrap();
+    let says = |text: &str| {
+        let script = format!("#!/bin/sh\necho '{text}'\n");
+        crate::common::write_executable(&bin.join("git"), &script);
+    };
+    // (2.31 brought `git fetch --atomic`)
+    says("git version 2.30.9");
+    let e = open(&bin);
+    assert_eq!(e.code, ErrorCode::Blocked, "{e:?}");
+    assert_eq!(e.blocked_reason, Some(BlockedReason::EnvironmentMismatch));
+    assert!(e.message.contains("2.30"), "{}", e.message);
+    assert!(e.message.contains("2.31"), "{}", e.message);
+    says("something else");
+    let e = open(&bin);
+    assert_eq!(e.blocked_reason, Some(BlockedReason::EnvironmentMismatch));
+    assert!(e.message.contains("something else"), "{}", e.message);
+    crate::common::write_executable(&bin.join("git"), "#!/bin/sh\nexit 3\n");
+    let e = open(&bin);
+    assert_eq!(e.blocked_reason, Some(BlockedReason::EnvironmentMismatch));
+    let empty = f.path("empty");
+    std::fs::create_dir_all(&empty).unwrap();
+    let e = open(&empty);
+    assert_eq!(e.blocked_reason, Some(BlockedReason::EnvironmentMismatch));
+    assert!(e.message.contains("cannot run git"), "{}", e.message);
+    says("git version 2.31.0");
+    let env: BTreeMap<String, String> = [("PATH".to_string(), bin.display().to_string())].into();
+    assert!(Machine::open(&f.state(), env, f.state().join("cluster.key")).is_ok());
+}
+
+#[test]
+fn the_manifests_of_dirty_submodules_published_before_are_read_from_the_store() {
+    let f = fx();
+    let repo = nested_project(&f);
+    let first = f.capture(&SourceRequest::Worktree { dir: repo.clone() });
+    assert_eq!(first.manifests.len(), 3);
+    // The next source: one more edit at the top; both submodules stay.
+    std::fs::write(repo.join("a.txt"), "edited again\n").unwrap();
+    let second = f.capture(&SourceRequest::Worktree { dir: repo.clone() });
+    assert_eq!(
+        second.root.submodules[0].source_id,
+        first.root.submodules[0].source_id
+    );
+
+    let m = f.machine();
+    let (sink, l) = (m.blobs().unwrap(), limits());
+    send_all(sink, &l, &first);
+    assert!(verify(sink, &l, &first.source, first.refs()).ready);
+    let clones = f.clones();
+    assert_eq!(clones.len(), 1);
+
+    // Of the second source only its own manifest and its own files travel:
+    // the captures of the submodules are in the worker's store already.
+    put_all(sink, &l, &second.source, Manifest, &second.manifests[0]).unwrap();
+    for e in &second.root.object_manifest.entries {
+        put_all(sink, &l, &second.source, Content, &second.blobs[&e.hash]).unwrap();
+    }
+    let staged = f.staged(&second.source);
+    let manifests = staged.iter().filter(|n| n.starts_with("manifest-")).count();
+    assert_eq!(manifests, 1, "{staged:?}");
+    let v = verify(sink, &l, &second.source, vec![]);
+    assert!(!v.ready && v.bundle_needed, "{v:?}");
+    let thin = f.bundle(&second.root, &v.have[0].commits);
+    assert!(!bundle_prerequisites(&thin).unwrap().is_empty());
+    assert!(
+        put_all(sink, &l, &second.source, Bundle, &thin)
+            .unwrap()
+            .complete
+    );
+    assert!(verify(sink, &l, &second.source, vec![]).ready);
+    // The bundle was checked against all three manifests: the snapshot of
+    // the source is in the clone, and its gitlink is the commit the stored
+    // manifest of the submodule names.
+    let lib = f
+        .worker_store()
+        .manifest(second.root.submodules[0].source_id.as_ref().unwrap())
+        .unwrap()
+        .unwrap();
+    let commit = second.root.execution_commit.clone().unwrap();
+    let r = format!("refs/local-ci/snapshots/{}", second.root.source_id);
+    assert_eq!(git(&clones[0], &["rev-parse", "--verify", &r]), commit);
+    assert_eq!(
+        Some(git(
+            &clones[0],
+            &["rev-parse", &format!("{commit}:vendor/lib")]
+        )),
+        lib.execution_commit
+    );
+}
+
+#[test]
+fn a_bundle_with_the_snapshot_of_a_submodule_at_another_commit_sets_no_ref() {
+    let f = fx();
+    let repo = nested_project(&f);
+    let first = f.capture(&SourceRequest::Worktree { dir: repo.clone() });
+    let m = f.machine();
+    let (sink, l) = (m.blobs().unwrap(), limits());
+    send_all(sink, &l, &first);
+    let clones = f.clones();
+    assert_eq!(clones.len(), 1);
+    let before = git(&clones[0], &["for-each-ref"]);
+
+    // The next source has another capture of the submodule (and of the
+    // source itself); the one inside the submodule stays.
+    std::fs::write(repo.join("a.txt"), "edited again\n").unwrap();
+    std::fs::write(repo.join("vendor/lib/lib.txt"), "edited lib again\n").unwrap();
+    let second = f.capture(&SourceRequest::Worktree { dir: repo.clone() });
+    let lib = second.root.submodules[0].source_id.clone().unwrap();
+    assert_ne!(Some(&lib), first.root.submodules[0].source_id.as_ref());
+    send_but_bundle(sink, &l, &second);
+
+    // Its bundle, with the snapshot ref of the submodule moved to another
+    // commit than the manifest of the submodule names. Every other ref is
+    // as it should be.
+    let whole = second.bundle.clone().unwrap();
+    let scratch = f.path("forge");
+    std::fs::create_dir_all(&scratch).unwrap();
+    git(&scratch, &["init", "-q", "-b", "main"]);
+    let genuine = f.path("genuine.bundle");
+    std::fs::write(&genuine, &whole).unwrap();
+    let from = genuine.to_str().unwrap();
+    git(&scratch, &["fetch", "-q", from, "refs/*:refs/*"]);
+    let lib_ref = format!("refs/local-ci/snapshots/{lib}");
+    let own = second.root.execution_commit.clone().unwrap();
+    assert_ne!(git(&scratch, &["rev-parse", &lib_ref]), own);
+    git(&scratch, &["update-ref", &lib_ref, &own]);
+    let forged = f.path("forged.bundle");
+    let to = forged.to_str().unwrap();
+    git(&scratch, &["bundle", "create", "-q", to, "--all"]);
+    let forged = std::fs::read(forged).unwrap();
+
+    let e = put_all(sink, &l, &second.source, Bundle, &forged).unwrap_err();
+    assert_eq!(e.code, ErrorCode::InvalidInput, "{e:?}");
+    assert!(e.message.contains(&lib_ref), "{}", e.message);
+    // Not one ref of it is in the clone: not the submodule's, and not the
+    // source's own, which the bundle had right.
+    assert_eq!(git(&clones[0], &["for-each-ref"]), before);
+    assert!(clone_scratch(&f).is_empty());
+    assert_eq!(bundles_staged(&f, &second.source), 0);
+    put_all(sink, &l, &second.source, Bundle, &whole).unwrap();
+    assert!(verify(sink, &l, &second.source, second.refs()).ready);
+    assert_ne!(git(&clones[0], &["for-each-ref"]), before);
 }

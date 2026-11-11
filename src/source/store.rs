@@ -3,7 +3,7 @@
 //! (the per-run record, difference planning, and verified receiving).
 
 use super::classify::source_id_of_ci;
-use super::commit::run as git_run;
+use super::commit::{run as git_run, says as git_says};
 use super::diff::{check_blob, is_blob_hash, missing_blobs, BlobWant};
 use super::safety::{check_entries, check_rel_path};
 use crate::ids::RunId;
@@ -72,6 +72,19 @@ impl Inventory for Peer<'_> {
 
 /// Where the commit of a source is kept (local-ci's names).
 const SNAPSHOTS: &str = "refs/local-ci/snapshots/";
+/// Where the commit around the index tree of a source is kept.
+const INDEXES: &str = "refs/local-ci/index/";
+
+/// A ref an import of a bundle sets.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImportRef {
+    pub name: String,
+    /// The source whose snapshot it is (`None`: the index ref).
+    pub snapshot_of: Option<String>,
+    /// The commit a manifest names for it (`None`: the index ref, which no
+    /// manifest names by its commit).
+    pub commit: Option<String>,
+}
 
 fn is_hex40(s: &str) -> bool {
     s.len() == 40 && s.bytes().all(|c| matches!(c, b'0'..=b'9' | b'a'..=b'f'))
@@ -149,6 +162,10 @@ impl ObjectsRepo {
     }
 
     /// [`Self::check_reachable`] from the three things it reads of a manifest.
+    ///
+    /// The error is a [`SourceError::Corrupt`] when the answer is "no" (the
+    /// commit or the ref is not here, the one is not below the other, the
+    /// tree is another). A Git that could not be asked is another error.
     pub fn check_snapshot(
         &self,
         ci_source_id: &str,
@@ -162,16 +179,27 @@ impl ObjectsRepo {
             return Err(corrupt(format!("not a source id: {ci_source_id:?}")));
         }
         let r = format!("{SNAPSHOTS}{ci_source_id}");
-        git_run(
+        let unreachable = || {
+            corrupt(format!(
+                "{ci_source_id}: the execution commit {commit} is not reachable in the receiving objects"
+            ))
+        };
+        // Is the commit here, is the ref here, is the one below the other:
+        // each a question Git answers with 0 or 1. Whatever else Git fails
+        // with says nothing about the source.
+        for rev in [commit, r.as_str()] {
+            if self.ref_value(&format!("{rev}^{{commit}}"))?.is_none() {
+                return Err(unreachable());
+            }
+        }
+        let below = git_says(
             &self.env,
             &self.dir,
             &["merge-base", "--is-ancestor", commit, &r],
-        )
-        .map_err(|e| {
-            corrupt(format!(
-                "{ci_source_id}: the execution commit {commit} is not reachable in the receiving objects ({e:#})"
-            ))
-        })?;
+        )?;
+        if below.is_none() {
+            return Err(unreachable());
+        }
         if let Some(tree) = tree {
             let got = git_run(
                 &self.env,
@@ -185,6 +213,48 @@ impl ObjectsRepo {
             }
         }
         Ok(())
+    }
+
+    /// The refs an import of the bundle of `m` sets (see
+    /// [`Self::receive_bundle`]): the snapshot of `m`, those of `nested`,
+    /// and the index ref when `m` has an index tree.
+    pub fn import_refs(m: &CiManifest, nested: &[CiManifest]) -> Vec<ImportRef> {
+        let mut out: Vec<ImportRef> = vec![];
+        for n in std::iter::once(m).chain(nested) {
+            if out
+                .iter()
+                .all(|r| r.snapshot_of.as_deref() != Some(&n.source_id))
+            {
+                out.push(ImportRef {
+                    name: format!("{SNAPSHOTS}{}", n.source_id),
+                    snapshot_of: Some(n.source_id.clone()),
+                    commit: n.execution_commit.clone(),
+                });
+            }
+        }
+        if m.index_tree.is_some() {
+            out.push(ImportRef {
+                name: format!("{INDEXES}{}", m.source_id),
+                snapshot_of: None,
+                commit: None,
+            });
+        }
+        out
+    }
+
+    /// The commit `rev` names, `None` when it names none here. A Git that
+    /// could not be asked is an error.
+    pub fn ref_value(&self, rev: &str) -> Result<Option<String>> {
+        git_says(
+            &self.env,
+            &self.dir,
+            &["rev-parse", "--verify", "--quiet", rev],
+        )
+    }
+
+    /// Remove the ref `name`, and only while it is at `commit`.
+    pub fn drop_ref(&self, name: &str, commit: &str) -> Result<()> {
+        git_run(&self.env, &self.dir, &["update-ref", "-d", name, commit]).map(|_| ())
     }
 
     /// The snapshots this repository holds: the source id of each snapshot
@@ -649,10 +719,19 @@ impl SourceStore {
                 (at, p)
             })
             .collect();
+        // Oldest first, by the time each was last written; two written in
+        // the same instant go by their names (which say nothing of their
+        // age: a file system that keeps whole seconds cannot tell them
+        // apart).
         others.sort();
         let excess = (others.len() + 1).saturating_sub(MAX_BUNDLES_PER_SOURCE);
         for (_, p) in others.into_iter().take(excess) {
-            remove_if_there(&p)?;
+            // The bundle that was asked for is written: an old one that
+            // does not go is said, and does not fail the export. The next
+            // export of the source tries it again.
+            if let Err(e) = remove_if_there(&p) {
+                eprintln!("cannot remove the old bundle {}: {e:#}", p.display());
+            }
         }
         Ok(dest)
     }
