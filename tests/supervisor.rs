@@ -159,6 +159,12 @@ impl Fx {
             if c.data.is_empty() {
                 return (out, c);
             }
+            // A read that returns bytes must move the offset forward, or this
+            // would loop forever instead of failing.
+            assert!(
+                c.next_offset > off,
+                "a read returned bytes but did not advance"
+            );
             off = c.next_offset;
         }
     }

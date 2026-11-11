@@ -118,10 +118,13 @@ pub fn warning_texts(
         .take(max)
         .map(|w| {
             let mut w = mask(w);
-            let mut cut = w.len().min(max_bytes);
-            while !w.is_char_boundary(cut) {
-                cut -= 1;
-            }
+            // The last character boundary at or before the limit. A bounded
+            // search, not a loop that must make progress.
+            let limit = w.len().min(max_bytes);
+            let cut = (0..=limit)
+                .rev()
+                .find(|&i| w.is_char_boundary(i))
+                .unwrap_or(0);
             w.truncate(cut);
             w
         })
