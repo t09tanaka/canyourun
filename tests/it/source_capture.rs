@@ -3,7 +3,7 @@
 //! incomplete source is ever visible; the same content is the same id), A14
 //! (unpushed commits, submodules, LFS), and the receiving side's refusals.
 
-mod common;
+use crate::common;
 
 use local_ci::source::{seal_manifest, SourceKind, Stage};
 use local_ci::ExecContext;

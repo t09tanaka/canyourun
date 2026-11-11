@@ -2,9 +2,8 @@
 //! captured from a throwaway repository, held by the parent, sent over an
 //! in-process connection, placed by a fake worker, and erased.
 
-mod common;
-#[path = "proto_common/mod.rs"]
-mod proto;
+use crate::common;
+use crate::proto_common as proto;
 
 use local_ci::source::SecretSpec;
 use proto::*;

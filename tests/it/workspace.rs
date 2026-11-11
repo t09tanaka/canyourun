@@ -6,7 +6,7 @@
 //! The real `fast-worktree` is used when it is on the PATH; set
 //! `RTR_REQUIRE_FAST_WORKTREE=1` (CI does) to make its absence a failure.
 
-mod common;
+use crate::common;
 
 use local_ci::source::SourceManifest as CiManifest;
 use local_ci::ExecContext;

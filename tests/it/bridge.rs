@@ -1,8 +1,7 @@
 //! `worker --stdio` as a real process: bytes pass through to the agent's Unix
 //! socket, stdout carries nothing else, and a missing agent is an explicit error.
 
-#[path = "proto_common/mod.rs"]
-mod common;
+use crate::proto_common as common;
 
 use common::*;
 use remote_task_runner::ids::*;

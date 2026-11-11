@@ -2,6 +2,7 @@
 
 #![allow(dead_code)]
 
+use remote_task_runner::platform::signal_pid;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
@@ -37,4 +38,14 @@ impl Drop for Tmp {
             }
         }
     }
+}
+
+/// Whether a process with this pid exists (signal 0 through the guarded helper).
+pub fn alive(pid: i32) -> bool {
+    u32::try_from(pid).is_ok_and(|p| signal_pid(p, 0))
+}
+
+/// The pid written in a file, if it holds one.
+pub fn read_pid(path: &Path) -> Option<i32> {
+    std::fs::read_to_string(path).ok()?.trim().parse().ok()
 }

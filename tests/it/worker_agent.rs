@@ -4,7 +4,8 @@
 //! boot ID, simulated), GC protection until `ack_collected`, and the order of
 //! the startup steps.
 
-mod proto_common;
+use crate::common::{alive, read_pid};
+use crate::proto_common;
 
 use proto_common::client_cfg;
 use remote_task_runner::error::{ApiError, ErrorCode};
@@ -233,10 +234,6 @@ fn pgrep(pattern: &str) -> Vec<i32> {
         .collect()
 }
 
-fn alive(pid: i32) -> bool {
-    u32::try_from(pid).is_ok_and(|p| signal_pid(p, 0))
-}
-
 fn wait_for(what: &str, f: impl Fn() -> bool) {
     let end = Instant::now() + T;
     while !f() {
@@ -397,10 +394,6 @@ fn stay(f: &Fx) -> (String, PathBuf, PathBuf) {
         pidfile.display()
     );
     (script, marker, pidfile)
-}
-
-fn read_pid(p: &Path) -> Option<i32> {
-    std::fs::read_to_string(p).ok()?.trim().parse().ok()
 }
 
 // ---------------------------------------------------------------- A18
