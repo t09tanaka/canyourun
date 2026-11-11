@@ -52,6 +52,8 @@ struct DirHost {
     overlap: AtomicBool,
     /// Called by `mask_values` once it has read the values.
     on_mask: Mutex<Option<MaskHook>>,
+    /// The secret files of every source; `None`: the source is not here.
+    secret_paths: Mutex<Option<Vec<String>>>,
 }
 
 type MaskHook = Box<dyn Fn(&AttemptId) + Send + Sync>;
@@ -115,6 +117,9 @@ impl Host for DirHost {
             index_reproduced: true,
             warnings: Vec::new(),
         })
+    }
+    fn secret_paths(&self, _: &AttemptPayload) -> Result<Option<Vec<String>>, ApiError> {
+        Ok(self.secret_paths.lock().unwrap().clone())
     }
     fn place_secrets(
         &self,
@@ -202,6 +207,7 @@ pub(crate) fn fx() -> Fx {
         cleaning: Mutex::default(),
         overlap: AtomicBool::new(false),
         on_mask: Mutex::default(),
+        secret_paths: Mutex::new(Some(Vec::new())),
     });
     Fx {
         dir,
@@ -372,6 +378,15 @@ fn payload(script: &str) -> AttemptPayload {
         deadline_ms: None,
         resource_wait_timeout_ms: None,
         has_secret_bundle: false,
+        artifacts: Vec::new(),
+    }
+}
+
+fn decl(name: &str, path: &str, if_missing: MissingPolicy) -> ArtifactDecl {
+    ArtifactDecl {
+        name: name.into(),
+        path: path.into(),
+        if_missing,
     }
 }
 
@@ -1640,6 +1655,210 @@ async fn a_submit_that_no_supervisor_could_honour_is_refused_before_it_is_stored
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_submit_with_a_refused_artifact_declaration_is_refused_before_it_is_stored() {
+    use MissingPolicy::{Optional, Required};
+    let f = fx();
+    let agent = f.start("boot-a");
+    let c = f.connect(&agent).await;
+    *f.host.secret_paths.lock().unwrap() =
+        Some(vec![".env".to_string(), "config/local.json".to_string()]);
+    let a = AttemptId::generate();
+    let refused = |artifacts: Vec<ArtifactDecl>| {
+        let mut p = payload("true");
+        p.artifacts = artifacts;
+        submit_req(&a, &p)
+    };
+    let cases: Vec<(&str, Vec<ArtifactDecl>)> = vec![
+        (
+            "too many",
+            (0..1025)
+                .map(|i| decl(&format!("n{i}"), &format!("p{i}"), Optional))
+                .collect(),
+        ),
+        ("no name", vec![decl("", "a", Required)]),
+        ("long name", vec![decl(&"n".repeat(256), "a", Required)]),
+        ("long path", vec![decl("a", &"p".repeat(1025), Required)]),
+        ("absolute", vec![decl("a", "/etc/hosts", Required)]),
+        ("dot dot", vec![decl("a", "out/../../a", Required)]),
+        ("name leaves the store", vec![decl("../a", "a", Required)]),
+        (
+            "same name",
+            vec![decl("a", "x", Required), decl("a", "y", Optional)],
+        ),
+        (
+            "same path",
+            vec![decl("a", "x", Required), decl("b", "x", Optional)],
+        ),
+        (
+            "a secret file",
+            vec![decl("a", "out/a", Required), decl("env", ".env", Optional)],
+        ),
+        (
+            "a file of .worktreeinclude",
+            vec![decl("a", "Config/Local.json", Required)],
+        ),
+    ];
+    for (what, artifacts) in cases {
+        let e = call(&c, refused(artifacts)).await.expect_err(what);
+        assert_eq!(e.code, ErrorCode::InvalidInput, "{what}: {e:?}");
+    }
+    assert!(f.store().get(&a).unwrap().is_none());
+    assert_eq!(f.host.count(&format!("prepare {a}")), 0);
+
+    // The same declarations without the fault are accepted, and the stored
+    // payload holds them.
+    let mut p = payload("true");
+    p.artifacts = vec![decl("a", "out/a", Required), decl("b", "out/b", Optional)];
+    assert!(!submit(&c, &a, &p).await.duplicate);
+    let stored: AttemptPayload = serde_json::from_value(f.rec(&a).spec).unwrap();
+    assert_eq!(stored.artifacts, p.artifacts);
+    // A resend is the same attempt; the same attempt declaring otherwise is
+    // another payload (the declarations are part of the hash).
+    assert!(submit(&c, &a, &p).await.duplicate);
+    p.artifacts[1].if_missing = Required;
+    let e = call(&c, submit_req(&a, &p)).await.unwrap_err();
+    assert_eq!(e.code, ErrorCode::Conflict);
+    f.wait_terminal(&a);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_secret_file_declared_as_an_artifact_starts_no_command_when_the_source_came_late() {
+    let f = fx();
+    let agent = f.start("boot-a");
+    let c = f.connect(&agent).await;
+    // The source is not on the worker at the acceptance, so nothing can be
+    // compared yet; it is there when the workspace has been made.
+    *f.host.secret_paths.lock().unwrap() = None;
+    f.host.block_prepare.store(true, Ordering::SeqCst);
+    let marker = f.path("ran");
+    let a = AttemptId::generate();
+    let mut p = payload(&format!("touch {}", marker.display()));
+    p.artifacts = vec![decl("env", ".env", MissingPolicy::Optional)];
+    submit(&c, &a, &p).await;
+    *f.host.secret_paths.lock().unwrap() = Some(vec![".env".to_string()]);
+    f.host.block_prepare.store(false, Ordering::SeqCst);
+    assert_eq!(f.wait_terminal(&a), Outcome::Failed);
+    assert!(!marker.exists());
+    assert!(f.store().launches(&a).unwrap().is_empty());
+    let failed = f.store().events_of(&a, "agent_prepare_failed").unwrap();
+    assert_eq!(failed.len(), 1);
+    assert_eq!(failed[0].payload["code"], "INVALID_INPUT");
+
+    // A source that never came: the declarations cannot be told from its
+    // secret files, and nothing is started either.
+    *f.host.secret_paths.lock().unwrap() = None;
+    let b = AttemptId::generate();
+    let mut p = payload(&format!("touch {}", marker.display()));
+    p.artifacts = vec![decl("out", "out.txt", MissingPolicy::Optional)];
+    submit(&c, &b, &p).await;
+    assert_eq!(f.wait_terminal(&b), Outcome::Failed);
+    assert!(!marker.exists());
+    assert!(f.store().launches(&b).unwrap().is_empty());
+    assert_eq!(events(&f, &b, "agent_prepare_failed"), 1);
+
+    // An attempt that declares nothing does not need the list.
+    let d = AttemptId::generate();
+    submit(&c, &d, &payload("true")).await;
+    assert_eq!(f.wait_terminal(&d), Outcome::Succeeded);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn declared_artifacts_reach_the_supervisor_and_the_result_tells_required_from_optional() {
+    use MissingPolicy::{Optional, Required};
+    let f = fx();
+    let mut cfg = f.cfg("boot-a");
+    cfg.profile_fingerprint = Digest::of_bytes(b"the profile of this worker");
+    let agent = f.start_with(cfg.clone());
+    let c = f.connect(&agent).await;
+    let a = AttemptId::generate();
+    let mut p = payload("mkdir out && printf abc > out/report.txt && printf x > note.txt");
+    p.source_id = SourceId::generate();
+    p.plan_digest = Digest::of_bytes(b"the plan");
+    p.artifacts = vec![
+        decl("reports/unit.txt", "out/report.txt", Required),
+        decl("note", "note.txt", Optional),
+        decl("needed", "out/never.txt", Required),
+        decl("nice", "nowhere/nice.txt", Optional),
+        decl("dir", "out", Required),
+    ];
+    submit(&c, &a, &p).await;
+    assert_eq!(f.wait_terminal(&a), Outcome::Succeeded);
+
+    let Response::GetResult(result) = call(
+        &c,
+        Request::GetResult(GetResultRequest {
+            schema_version: SchemaVersion::CURRENT,
+            request_id: RequestId::generate(),
+            attempt_id: a.clone(),
+            generation: Generation(1),
+        }),
+    )
+    .await
+    .unwrap() else {
+        panic!()
+    };
+    // Everything chapter 13 lists, per artifact.
+    let record = |name: &str, content: &[u8]| ArtifactRecord {
+        name: name.to_string(),
+        path: name.to_string(),
+        size: content.len() as u64,
+        digest: Digest::of_bytes(content),
+        source_id: p.source_id.clone(),
+        plan_digest: p.plan_digest.clone(),
+        attempt_id: a.clone(),
+        profile_fingerprint: cfg.profile_fingerprint.clone(),
+    };
+    assert_eq!(
+        result.artifacts,
+        vec![record("note", b"x"), record("reports/unit.txt", b"abc")]
+    );
+    let unstored = |name: &str, path: &str, if_missing, reason| ArtifactNotStored {
+        name: name.to_string(),
+        path: path.to_string(),
+        if_missing,
+        reason,
+    };
+    assert_eq!(
+        result.artifacts_not_stored,
+        vec![
+            unstored("dir", "out", Required, NotStoredReason::Refused),
+            unstored(
+                "needed",
+                "out/never.txt",
+                Required,
+                NotStoredReason::Missing
+            ),
+            unstored(
+                "nice",
+                "nowhere/nice.txt",
+                Optional,
+                NotStoredReason::Missing
+            ),
+        ]
+    );
+    // The files are in the attempt's store, under their names, and the
+    // stored result (what the digest is over) holds both lists.
+    let kept = f
+        .state()
+        .join("attempts")
+        .join(a.as_str())
+        .join("artifacts");
+    assert_eq!(
+        std::fs::read(kept.join("reports/unit.txt")).unwrap(),
+        b"abc"
+    );
+    assert_eq!(std::fs::read(kept.join("note")).unwrap(), b"x");
+    assert!(!kept.join("needed").exists() && !kept.join("dir").exists());
+    let stored = f.store().get_result(&a).unwrap().unwrap();
+    assert_eq!(stored["artifacts"].as_array().unwrap().len(), 2);
+    assert_eq!(stored["artifacts_not_stored"].as_array().unwrap().len(), 3);
+    assert_eq!(
+        result.result_digest,
+        remote_task_runner::wire::payload_hash(&stored).unwrap()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn workspaces_are_prepared_no_more_than_the_limit_at_once() {
     let f = fx();
     let mut cfg = f.cfg("boot-a");
@@ -2512,6 +2731,9 @@ impl Host for RealButCore {
     }
     fn prepare(&self, a: &AcceptedAttempt, p: &AttemptPayload) -> Result<Workspace, ApiError> {
         self.0.prepare(a, p)
+    }
+    fn secret_paths(&self, p: &AttemptPayload) -> Result<Option<Vec<String>>, ApiError> {
+        self.0.secret_paths(p)
     }
     fn place_secrets(
         &self,

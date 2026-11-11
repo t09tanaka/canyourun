@@ -4,8 +4,14 @@
 //! finds, how a retire and a cancel are answered, which journal entries are
 //! wire events, and the order of the startup steps.
 
+use crate::source::safety::fold_path;
 use crate::state::{AttemptState, Observation, Receipt};
-use crate::wire::{AttemptPayload, CancelPhase, CommandSpec, EventKind, RetireStatus};
+use crate::supervisor::spool_plan::{
+    check_artifact_names, relative_path, ArtifactSetError, MAX_ARTIFACTS,
+};
+use crate::wire::{
+    ArtifactDecl, AttemptPayload, CancelPhase, CommandSpec, EventKind, RetireStatus,
+};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -13,6 +19,11 @@ use std::collections::{BTreeMap, BTreeSet};
 pub const MAX_COMMANDS: usize = 256;
 /// Bytes of all argv, cwd and env strings of one attempt.
 pub const MAX_COMMAND_BYTES: usize = 1_048_576;
+/// Bytes of one declared artifact's name. The count of declarations is
+/// the supervisor's [`MAX_ARTIFACTS`] (1024).
+pub const MAX_ARTIFACT_NAME_BYTES: usize = 255;
+/// Bytes of one declared artifact's path in the workspace.
+pub const MAX_ARTIFACT_PATH_BYTES: usize = 1024;
 /// Attempts in one `list_attempts` answer.
 pub const MAX_LIST_ATTEMPTS: u32 = 500;
 /// Events in one `watch_events` answer.
@@ -109,7 +120,78 @@ pub fn check_payload(p: &AttemptPayload, poll_ms: u64) -> Result<(), &'static st
     if bytes > MAX_COMMAND_BYTES {
         return Err("the commands are too large");
     }
+    check_artifacts(&p.artifacts)?;
     execution_order(&p.commands).map(|_| ())
+}
+
+/// Whether every component of `path` is a name: none is empty (so the path
+/// is not empty and has no leading, trailing or doubled `/`), none is `.`,
+/// and there is no control character (NUL included). `..` is the caller's
+/// to refuse, with its own message.
+fn plain_components(path: &str) -> bool {
+    path.split('/').all(|c| !c.is_empty() && c != ".") && !path.chars().any(char::is_control)
+}
+
+/// Why the artifacts a payload declares are refused, from the declarations
+/// alone: how many, each name and each path, and that no two share a name
+/// or a path. Names are held to what the supervisor's store accepts
+/// ([`relative_path`], [`check_artifact_names`]), so what passes here is not
+/// refused later when the supervisor's spec is written. Names and paths are
+/// compared folded (NFC, lowercase): two that a case-folding file system
+/// would store as one are one.
+pub fn check_artifacts(decls: &[ArtifactDecl]) -> Result<(), &'static str> {
+    if decls.len() > MAX_ARTIFACTS {
+        return Err("the attempt declares too many artifacts");
+    }
+    let mut paths = BTreeSet::new();
+    for d in decls {
+        if d.name.is_empty() {
+            return Err("an artifact has no name");
+        }
+        if d.name.len() > MAX_ARTIFACT_NAME_BYTES {
+            return Err("an artifact name is too long");
+        }
+        if relative_path(&d.name).is_none() {
+            return Err("an artifact name is not a plain relative path");
+        }
+        if d.path.len() > MAX_ARTIFACT_PATH_BYTES {
+            return Err("an artifact path is too long");
+        }
+        if d.path.starts_with('/') {
+            return Err("an artifact path is absolute");
+        }
+        if d.path.split('/').any(|c| c == "..") {
+            return Err("an artifact path has a '..' component");
+        }
+        if !plain_components(&d.path) {
+            return Err("an artifact path is not a plain relative path");
+        }
+        if !paths.insert(fold_path(d.path.as_bytes())) {
+            return Err("an artifact path is declared twice");
+        }
+    }
+    let names: Vec<&str> = decls.iter().map(|d| d.name.as_str()).collect();
+    match check_artifact_names(&names) {
+        Ok(()) => Ok(()),
+        Err(ArtifactSetError::Duplicate(_)) => Err("an artifact name is declared twice"),
+        Err(ArtifactSetError::Nested(_)) => Err("an artifact name lies below another artifact"),
+    }
+}
+
+/// Whether a declared artifact is one of the attempt's secret files
+/// (`secret_paths`: the secret files of its source manifest, which hold the
+/// declared ones and what `.worktreeinclude` matched; relative to the
+/// workspace root like the declarations). Compared folded, like the
+/// declarations among themselves. Such a declaration is refused: the content
+/// of a secret file is never kept as an artifact.
+pub fn artifact_is_secret<S: AsRef<str>>(decls: &[ArtifactDecl], secret_paths: &[S]) -> bool {
+    let secrets: BTreeSet<Vec<u8>> = secret_paths
+        .iter()
+        .map(|s| fold_path(s.as_ref().as_bytes()))
+        .collect();
+    decls
+        .iter()
+        .any(|d| secrets.contains(&fold_path(d.path.as_bytes())))
 }
 
 /// The order the commands of an attempt run in, as positions in `commands`:
@@ -536,7 +618,144 @@ mod tests {
             deadline_ms: None,
             resource_wait_timeout_ms: None,
             has_secret_bundle: false,
+            artifacts: Vec::new(),
         }
+    }
+
+    fn decl(name: &str, path: &str) -> ArtifactDecl {
+        ArtifactDecl {
+            name: name.into(),
+            path: path.into(),
+            if_missing: crate::wire::MissingPolicy::Required,
+        }
+    }
+
+    #[test]
+    fn the_caps_on_declared_artifacts_have_their_documented_values() {
+        assert_eq!(MAX_ARTIFACTS, 1024);
+        assert_eq!(MAX_ARTIFACT_NAME_BYTES, 255);
+        assert_eq!(MAX_ARTIFACT_PATH_BYTES, 1024);
+    }
+
+    #[test]
+    fn declared_artifacts_are_counted_and_each_name_and_path_is_checked() {
+        assert_eq!(check_artifacts(&[]), Ok(()));
+        let ok = [
+            decl("report.xml", "out/report.xml"),
+            decl("logs/a.txt", "target/.tmp/deep/a.txt"),
+            decl("c", ".hidden"),
+        ];
+        assert_eq!(check_artifacts(&ok), Ok(()));
+        let one = |name: &str, path: &str| check_artifacts(&[decl(name, path)]);
+
+        // Count: exactly the cap passes, one more does not.
+        let many = |n: usize| -> Vec<ArtifactDecl> {
+            (0..n)
+                .map(|i| decl(&format!("n{i}"), &format!("p{i}")))
+                .collect()
+        };
+        assert_eq!(check_artifacts(&many(1024)), Ok(()));
+        assert_eq!(
+            check_artifacts(&many(1025)),
+            Err("the attempt declares too many artifacts")
+        );
+
+        // Names.
+        assert_eq!(one("", "a"), Err("an artifact has no name"));
+        assert_eq!(one(&"n".repeat(255), "a"), Ok(()));
+        assert_eq!(
+            one(&"n".repeat(256), "a"),
+            Err("an artifact name is too long")
+        );
+        for name in [
+            "/abs", "../up", "a/../b", "a//b", "a/", ".", "a\0b", ".tmpx", "a\\b",
+        ] {
+            assert_eq!(
+                one(name, "a"),
+                Err("an artifact name is not a plain relative path"),
+                "{name:?}"
+            );
+        }
+        // Paths: the length first, at exactly the cap and one over.
+        let long = |n: usize| format!("{}/{}", "d".repeat(n - 2), "f");
+        assert_eq!(long(1024).len(), 1024);
+        assert_eq!(one("a", &long(1024)), Ok(()));
+        assert_eq!(one("a", &long(1025)), Err("an artifact path is too long"));
+        assert_eq!(one("a", "/etc/passwd"), Err("an artifact path is absolute"));
+        assert_eq!(one("a", "/"), Err("an artifact path is absolute"));
+        for path in ["..", "../a", "a/..", "a/../b"] {
+            assert_eq!(
+                one("a", path),
+                Err("an artifact path has a '..' component"),
+                "{path:?}"
+            );
+        }
+        // Not a component: a name that only holds two dots.
+        assert_eq!(one("a", "a..b/..c"), Ok(()));
+        for path in ["", ".", "a/./b", "a//b", "a/", "a\0b", "a\nb"] {
+            assert_eq!(
+                one("a", path),
+                Err("an artifact path is not a plain relative path"),
+                "{path:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn two_declared_artifacts_share_neither_a_name_nor_a_path() {
+        let two =
+            |a: (&str, &str), b: (&str, &str)| check_artifacts(&[decl(a.0, a.1), decl(b.0, b.1)]);
+        assert_eq!(two(("a", "x"), ("b", "y")), Ok(()));
+        assert_eq!(
+            two(("a", "x"), ("a", "y")),
+            Err("an artifact name is declared twice")
+        );
+        // What a case-folding file system stores as one file is one name.
+        assert_eq!(
+            two(("Report", "x"), ("report", "y")),
+            Err("an artifact name is declared twice")
+        );
+        assert_eq!(
+            two(("a", "x"), ("a/b", "y")),
+            Err("an artifact name lies below another artifact")
+        );
+        assert_eq!(
+            two(("a", "out/x"), ("b", "out/x")),
+            Err("an artifact path is declared twice")
+        );
+        assert_eq!(
+            two(("a", "out/x"), ("b", "OUT/X")),
+            Err("an artifact path is declared twice")
+        );
+        // A name may equal another artifact's path: they are different things.
+        assert_eq!(two(("a", "b"), ("b", "a")), Ok(()));
+    }
+
+    #[test]
+    fn a_payload_with_a_refused_declaration_is_refused() {
+        let mut p = payload();
+        p.artifacts = vec![decl("a", "out/a")];
+        assert_eq!(check_payload(&p, 0), Ok(()));
+        p.artifacts = vec![decl("a", "../a")];
+        assert_eq!(
+            check_payload(&p, 0),
+            Err("an artifact path has a '..' component")
+        );
+    }
+
+    #[test]
+    fn a_declared_artifact_that_is_a_secret_file_is_found() {
+        let decls = [decl("a", "out/a"), decl("env", "config/.env")];
+        let none: [&str; 0] = [];
+        assert!(!artifact_is_secret(&decls, &none));
+        assert!(!artifact_is_secret(&decls, &[".env", "out/b"]));
+        assert!(artifact_is_secret(&decls, &["config/.env"]));
+        assert!(artifact_is_secret(&decls, &["other", "out/a"]));
+        // Folded: the same file on a case-folding file system.
+        assert!(artifact_is_secret(&decls, &["Config/.ENV".to_string()]));
+        assert!(!artifact_is_secret(&[], &["config/.env"]));
+        // The name is not a path in the workspace.
+        assert!(!artifact_is_secret(&[decl(".env", "out/a")], &[".env"]));
     }
 
     #[test]

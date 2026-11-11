@@ -30,8 +30,12 @@ use crate::supervisor::lease::LeaseSeed;
 use crate::supervisor::lock::SupervisorLock;
 use crate::supervisor::outcome::drain_pending_deletes;
 use crate::supervisor::process::spawn_detached;
-use crate::supervisor::spec::{MaskValues, NodeSpec, SuperviseSpec, DEFAULT_LOG_LIMIT_BYTES};
+use crate::supervisor::spec::{
+    ArtifactFile, ArtifactsSpec, MaskValues, NodeSpec, SuperviseSpec, DEFAULT_ARTIFACT_BYTES,
+    DEFAULT_LOG_LIMIT_BYTES,
+};
 use crate::supervisor::spool::{SpoolError, SpoolReader};
+use crate::supervisor::spool_plan::result_not_stored;
 use crate::supervisor::termination::{termination, StopReason};
 use crate::wire::*;
 use crate::workspace::plan::check_cwd_relative;
@@ -334,6 +338,20 @@ fn internal(what: &str, e: impl std::fmt::Display) -> ApiError {
 
 fn invalid(m: impl Into<String>) -> ApiError {
     ApiError::new(ErrorCode::InvalidInput, m)
+}
+
+/// Refuse a payload that declares one of the attempt's secret files (the
+/// declared ones and what `.worktreeinclude` matched) as an artifact.
+fn check_artifacts_not_secret(
+    payload: &AttemptPayload,
+    secrets: &[String],
+) -> Result<(), ApiError> {
+    if policy::artifact_is_secret(&payload.artifacts, secrets) {
+        return Err(invalid(
+            "a declared artifact is one of the attempt's secret files",
+        ));
+    }
+    Ok(())
 }
 
 /// The file is this user's alone (0600): the supervisor refuses a spec that
@@ -1127,6 +1145,42 @@ impl Agent {
             )
         })?;
 
+        // The declared artifacts, checked again against the secret files of
+        // the source (which is here now: the workspace was made from it). An
+        // acceptance that came before the source could not look.
+        let artifacts = if payload.artifacts.is_empty() {
+            None
+        } else {
+            let secrets = self.host.secret_paths(&payload)?.ok_or_else(|| {
+                ApiError::new(
+                    ErrorCode::NotFound,
+                    format!(
+                        "source {} is not in this worker's store: its secret files cannot be told from the declared artifacts",
+                        payload.source_id
+                    ),
+                )
+            })?;
+            check_artifacts_not_secret(&payload, &secrets)?;
+            Some(ArtifactsSpec {
+                // Declared paths are relative to the workspace root, like
+                // the paths of the secret files they are compared with.
+                workspace: ws.root.clone(),
+                source_id: payload.source_id.clone(),
+                plan_digest: payload.plan_digest.clone(),
+                profile_fingerprint: self.cfg.profile_fingerprint.clone(),
+                max_bytes: DEFAULT_ARTIFACT_BYTES,
+                files: payload
+                    .artifacts
+                    .iter()
+                    .map(|d| ArtifactFile {
+                        name: d.name.clone(),
+                        source: PathBuf::from(&d.path),
+                        if_missing: d.if_missing,
+                    })
+                    .collect(),
+            })
+        };
+
         // In the order they run: after what they depend on.
         let order = policy::execution_order(&payload.commands).map_err(invalid)?;
         let mut nodes = Vec::with_capacity(payload.commands.len());
@@ -1166,9 +1220,7 @@ impl Agent {
             // This file therefore holds secrets: it is written 0600 and
             // removed with the workspace when the attempt has ended.
             mask: MaskValues(mask),
-            // The payload names no artifacts yet (the coordinator's side of
-            // the declaration is not defined).
-            artifacts: None,
+            artifacts,
         };
         spec.validate().map_err(|e| invalid(e.to_string()))?;
         let bytes = serde_json::to_vec(&spec).map_err(|e| internal("supervisor spec", e))?;
@@ -1484,6 +1536,15 @@ impl Agent {
             for c in &r.payload.commands {
                 check_cwd_relative(Path::new(&c.cwd))?;
             }
+            // Against the secret files of its source, when that source is
+            // already here. When it is not, the same check runs before the
+            // supervisor's spec is written ([`Self::prepare`]): a
+            // declaration that names a secret file never starts a command.
+            if !r.payload.artifacts.is_empty() {
+                if let Some(secrets) = self.host.secret_paths(&r.payload)? {
+                    check_artifacts_not_secret(&r.payload, &secrets)?;
+                }
+            }
             let live = self.store.count_nonterminal().map_err(api)?;
             if policy::at_live_cap(live, self.cfg.max_live_attempts) {
                 return Err(ApiError::new(
@@ -1790,7 +1851,15 @@ impl Agent {
         &self,
         attempt: &AttemptId,
         generation: Generation,
-    ) -> Result<(Termination, Vec<ArtifactRecord>, Digest), ApiError> {
+    ) -> Result<
+        (
+            Termination,
+            Vec<ArtifactRecord>,
+            Vec<ArtifactNotStored>,
+            Digest,
+        ),
+        ApiError,
+    > {
         let rec = self.known(attempt)?;
         Self::generation(&rec, generation)?;
         let Some(t) = rec.termination else {
@@ -1805,13 +1874,21 @@ impl Agent {
                 .map_err(|e| internal("stored artifacts", e))?,
             None => Vec::new(),
         };
+        // Unreadable is never "all were stored".
+        let not_stored = match &stored {
+            Some(v) => result_not_stored(v).ok_or_else(|| {
+                internal("stored result", "its unstored artifacts cannot be read")
+            })?,
+            None => Vec::new(),
+        };
         let value = stored.unwrap_or_else(|| json!({ "termination": t, "artifacts": [] }));
         let digest = payload_hash(&value).map_err(|e| internal("result digest", e))?;
-        Ok((t, artifacts, digest))
+        Ok((t, artifacts, not_stored, digest))
     }
 
     fn result(&self, r: GetResultRequest) -> Result<GetResultResponse, ApiError> {
-        let (termination, artifacts, result_digest) = self.ended(&r.attempt_id, r.generation)?;
+        let (termination, artifacts, artifacts_not_stored, result_digest) =
+            self.ended(&r.attempt_id, r.generation)?;
         Ok(GetResultResponse {
             schema_version: SchemaVersion::CURRENT,
             attempt_id: r.attempt_id,
@@ -1819,6 +1896,7 @@ impl Agent {
             termination,
             nodes: Vec::new(),
             artifacts,
+            artifacts_not_stored,
             result_digest,
         })
     }
@@ -1828,7 +1906,7 @@ impl Agent {
         session: Session,
         r: AckCollectedRequest,
     ) -> Result<AckCollectedResponse, ApiError> {
-        let (_, _, digest) = self.ended(&r.attempt_id, r.generation)?;
+        let (_, _, _, digest) = self.ended(&r.attempt_id, r.generation)?;
         if digest != r.result_digest {
             // The parent stored something else than what is here: the
             // protection stays.

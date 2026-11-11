@@ -19,13 +19,13 @@
 use super::spool::{AttemptSpool, SpoolError, StreamStatus};
 use super::spool_plan::{
     artifact_locator, check_artifact_names, is_listed_artifact, is_tmp_name, logs_locator,
-    relative_path, resolve_locator, result_has_artifacts, result_json, sha256_digest, source_under,
-    ArtifactSetError, StreamSummary,
+    relative_path, resolve_locator, result_has_artifacts, result_has_not_stored, result_json,
+    sha256_digest, source_under, with_not_stored, ArtifactSetError, StreamSummary,
 };
 use crate::ids::{AttemptId, Digest, PlanDigest, SourceId};
 use crate::state::Termination;
 use crate::storage::{BlobKind, LogPosition, NewBlobRef, StorageError, WorkerStore};
-use crate::wire::ArtifactRecord;
+use crate::wire::{ArtifactNotStored, ArtifactRecord};
 use serde_json::{json, Value};
 use sha2::{Digest as _, Sha256};
 use std::fs::{self, File, OpenOptions};
@@ -498,9 +498,37 @@ pub fn finish_attempt<'a>(
     artifacts: &[ArtifactRecord],
     at_ms: u64,
 ) -> Result<Recorded> {
+    finish_attempt_with(
+        store,
+        root,
+        attempt,
+        spool,
+        termination,
+        artifacts,
+        &[],
+        at_ms,
+    )
+}
+
+/// [`finish_attempt`] for an attempt that declared artifacts which were not
+/// stored: `not_stored` goes into the result next to the stored ones, and is
+/// as immutable (a second call with another list is refused).
+#[allow(clippy::too_many_arguments)]
+pub fn finish_attempt_with<'a>(
+    store: &WorkerStore,
+    root: &Path,
+    attempt: &AttemptId,
+    spool: impl Into<SpoolEnd<'a>>,
+    termination: Termination,
+    artifacts: &[ArtifactRecord],
+    not_stored: &[ArtifactNotStored],
+    at_ms: u64,
+) -> Result<Recorded> {
     let spool = spool.into();
     if let Some(existing) = store.get_result(attempt)? {
-        if !result_has_artifacts(&existing, artifacts) {
+        if !result_has_artifacts(&existing, artifacts)
+            || !result_has_not_stored(&existing, not_stored)
+        {
             return Err(StorageError::Immutable(format!("artifacts of {attempt}")).into());
         }
         spool.close().map_err(OutcomeError::SpoolFailed)?;
@@ -535,7 +563,10 @@ pub fn finish_attempt<'a>(
     }
     let fin = store.finalize(attempt, termination, at_ms)?;
     let fixed = fin.termination();
-    let result = result_json(&fixed, artifacts, summary(out), summary(err));
+    let result = with_not_stored(
+        result_json(&fixed, artifacts, summary(out), summary(err)),
+        not_stored,
+    );
     let fresh = store.record_result(attempt, &result)?;
     // The stored result is the truth, whichever call stored it: a crash
     // between storing it and the events is repaired by the next call, which

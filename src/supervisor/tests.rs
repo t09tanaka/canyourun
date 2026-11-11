@@ -1765,7 +1765,7 @@ fn an_attempt_settled_without_its_spool_keeps_no_artifact_file() {
             Some(&run),
             Some(&a),
             "artifacts_stored",
-            &super::spool_plan::artifacts_event(std::slice::from_ref(&kept)),
+            &super::spool_plan::artifacts_event(std::slice::from_ref(&kept), &[]),
             5,
         )
         .unwrap();

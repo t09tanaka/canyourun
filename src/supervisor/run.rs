@@ -34,15 +34,15 @@ use super::error::{Result, SupervisorError};
 use super::identity::Leader;
 use super::members::ManagedMembers;
 use super::outcome::{
-    add_ref, finish_attempt, remove_unlisted, store_artifact, sweep_tmp, sync_log_position,
+    add_ref, finish_attempt_with, remove_unlisted, store_artifact, sweep_tmp, sync_log_position,
     ArtifactInput, OutcomeError, SpoolEnd,
 };
 use super::pump::{pump, Pipe};
 use super::spec::{command_id, spec_digest, NodeSpec, SuperviseSpec};
 use super::spool::{closed_status, AttemptSpool, SpoolError, SpoolReader, StreamStatus};
 use super::spool_plan::{
-    artifacts_event, attempt_limit, journaled_artifacts, logs_locator, warning_texts,
-    ARTIFACTS_EVENT_KEY, MAX_WARNINGS, MAX_WARNING_BYTES,
+    artifacts_event, attempt_limit, journaled_artifacts, journaled_not_stored, logs_locator,
+    warning_texts, ARTIFACTS_EVENT_KEY, MAX_WARNINGS, MAX_WARNING_BYTES,
 };
 use super::stop::{
     retries_for, stop_group_retrying_on, Os, StopResult, StopTarget, StopTimes, System,
@@ -58,7 +58,7 @@ use crate::state::{AttemptState, Exit, Receipt, Termination};
 use crate::storage::{
     BlobKind, Finalized, LaunchClaim, LogPosition, ProcessIdentity, StorageError, WorkerStore,
 };
-use crate::wire::{ArtifactRecord, LogStream};
+use crate::wire::{ArtifactNotStored, ArtifactRecord, LogStream, NotStoredReason};
 use serde_json::json;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -303,15 +303,16 @@ pub(crate) fn settle<'a>(
     // whoever settles: a supervisor that comes after a crash, when the
     // workspace may be gone, stores the same list. What was copied without
     // getting into that list is in no result, and is removed.
-    let artifacts = fixed_artifacts(store, attempt)?;
+    let (artifacts, not_stored) = fixed_artifacts(store, attempt)?;
     remove_unlisted(root, attempt, &artifacts).map_err(outcome_error)?;
-    match finish_attempt(
+    match finish_attempt_with(
         store,
         root,
         attempt,
         spool,
         term,
         &artifacts,
+        &not_stored,
         platform::wall_ms(),
     ) {
         Ok(recorded) => {
@@ -340,21 +341,36 @@ fn outcome_error(e: OutcomeError) -> SupervisorError {
     }
 }
 
-/// The artifacts the attempt's journal fixed; none when it fixed none.
+/// The artifacts the attempt's journal fixed, and the declared ones it fixed
+/// as not stored; none when it fixed none.
 pub(crate) fn fixed_artifacts(
     store: &WorkerStore,
     attempt: &AttemptId,
-) -> Result<Vec<ArtifactRecord>> {
+) -> Result<(Vec<ArtifactRecord>, Vec<ArtifactNotStored>)> {
     let events = store.events_of(attempt, ARTIFACTS_EVENT)?;
     let payloads: Vec<&serde_json::Value> = events.iter().map(|e| &e.payload).collect();
-    journaled_artifacts(&payloads).ok_or_else(|| {
-        SupervisorError::State(format!(
-            "the artifacts entry in the journal of attempt {attempt} cannot be read"
-        ))
-    })
+    journaled_artifacts(&payloads)
+        .zip(journaled_not_stored(&payloads))
+        .ok_or_else(|| {
+            SupervisorError::State(format!(
+                "the artifacts entry in the journal of attempt {attempt} cannot be read"
+            ))
+        })
 }
 
 const ARTIFACTS_EVENT: &str = "artifacts_stored";
+
+/// Why a declared artifact was not stored, for the result: `missing` only
+/// when nothing is at the declared path (the file, or a directory on the way
+/// to it, does not exist).
+fn not_stored_reason(e: &OutcomeError) -> NotStoredReason {
+    match e {
+        OutcomeError::Io(io) if io.kind() == std::io::ErrorKind::NotFound => {
+            NotStoredReason::Missing
+        }
+        _ => NotStoredReason::Refused,
+    }
+}
 
 /// Copy the declared artifacts out of the workspace and fix the list in the
 /// journal, before the attempt is settled. Call it once the commands have
@@ -388,6 +404,7 @@ pub(crate) fn keep_artifacts(
     let root = spec.spool_dir();
     sweep_tmp(&root, attempt).map_err(outcome_error)?;
     let mut kept = Vec::new();
+    let mut not_stored = Vec::new();
     let mut refused = Vec::new();
     for f in &plan.files {
         let input = ArtifactInput {
@@ -401,6 +418,12 @@ pub(crate) fn keep_artifacts(
             Ok(record) => kept.push(record),
             Err(OutcomeError::Storage(e)) => return Err(e.into()),
             Err(e) => {
+                not_stored.push(ArtifactNotStored {
+                    name: f.name.clone(),
+                    path: f.source.to_string_lossy().into_owned(),
+                    if_missing: f.if_missing,
+                    reason: not_stored_reason(&e),
+                });
                 let why =
                     String::from_utf8_lossy(&masker.mask(e.to_string().as_bytes())).into_owned();
                 refused.push((f.name.clone(), json!({ "name": f.name, "why": why })));
@@ -421,7 +444,10 @@ pub(crate) fn keep_artifacts(
         attempt,
         ARTIFACTS_EVENT,
         "set",
-        &[(ARTIFACTS_EVENT_KEY.to_string(), artifacts_event(&kept))],
+        &[(
+            ARTIFACTS_EVENT_KEY.to_string(),
+            artifacts_event(&kept, &not_stored),
+        )],
         at,
     )?;
     Ok(())

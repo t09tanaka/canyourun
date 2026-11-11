@@ -18,6 +18,7 @@ use remote_task_runner::supervisor::spec::{
 use remote_task_runner::supervisor::spool::{AttemptSpool, SpoolReader};
 use remote_task_runner::wire::LeaseKey;
 use remote_task_runner::wire::LogStream;
+use remote_task_runner::wire::MissingPolicy;
 use std::collections::BTreeMap;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
@@ -926,6 +927,7 @@ fn artifacts(f: &Fx, files: &[(&str, &str)]) -> ArtifactsSpec {
             .map(|(name, source)| ArtifactFile {
                 name: (*name).to_string(),
                 source: PathBuf::from(source),
+                if_missing: MissingPolicy::Required,
             })
             .collect(),
     }
@@ -983,6 +985,15 @@ fn artifacts_are_stored_before_the_attempt_is_settled_and_the_result_names_them(
         .collect();
     refused.sort();
     assert_eq!(refused, ["link.txt", "missing.txt"]);
+    // The result says which declared artifacts are not in it and why: a
+    // file that is not there is `missing`, anything else `refused`.
+    assert_eq!(
+        result["artifacts_not_stored"],
+        serde_json::json!([
+            {"name": "link.txt", "path": "out/link", "if_missing": "required", "reason": "refused"},
+            {"name": "missing.txt", "path": "out/never-written.txt", "if_missing": "required", "reason": "missing"},
+        ])
+    );
 
     // The list was fixed in the journal before the termination was.
     let all = f.store.events_of_attempt(f.attempt(), 1000).unwrap();
@@ -1021,6 +1032,60 @@ fn a_failed_command_keeps_what_it_left_and_a_cancel_before_the_start_keeps_nothi
     assert!(g.events(g.attempt(), "artifact_not_stored").is_empty());
     let result = g.store.get_result(g.attempt()).unwrap().unwrap();
     assert_eq!(result["artifacts"], serde_json::json!([]));
+}
+
+#[test]
+fn a_missing_required_artifact_and_a_missing_optional_one_differ_in_the_result() {
+    let mut f = fx(vec![]);
+    let mut plan = artifacts(
+        &f,
+        &[
+            ("kept.txt", "kept.txt"),
+            ("needed.txt", "needed.txt"),
+            ("nice.txt", "deep/er/nice.txt"),
+            ("big.bin", "big.bin"),
+        ],
+    );
+    plan.files[2].if_missing = MissingPolicy::Optional;
+    plan.files[3].if_missing = MissingPolicy::Optional;
+    plan.max_bytes = 4;
+    f.spec.nodes = vec![in_ws(&f, "printf abc > kept.txt; printf 12345 > big.bin")];
+    f.spec.artifacts = Some(plan);
+    // The policy travels in the spec file the supervisor reads.
+    let spec: serde_json::Value = serde_json::to_value(&f.spec).unwrap();
+    assert_eq!(spec["artifacts"]["files"][0]["if_missing"], "required");
+    assert_eq!(spec["artifacts"]["files"][2]["if_missing"], "optional");
+
+    // Neither changes how the attempt ended: judging it is the parent's.
+    let t = settled(&run(&f.spec).unwrap());
+    assert_eq!(t.outcome(), Outcome::Succeeded);
+    let result = f.store.get_result(f.attempt()).unwrap().unwrap();
+    assert_eq!(result["artifacts"].as_array().unwrap().len(), 1);
+    assert_eq!(result["artifacts"][0]["name"], "kept.txt");
+    assert_eq!(
+        result["artifacts_not_stored"],
+        serde_json::json!([
+            {"name": "big.bin", "path": "big.bin", "if_missing": "optional", "reason": "refused"},
+            {"name": "needed.txt", "path": "needed.txt", "if_missing": "required", "reason": "missing"},
+            {"name": "nice.txt", "path": "deep/er/nice.txt", "if_missing": "optional", "reason": "missing"},
+        ])
+    );
+    // The journal entry that fixed the stored ones fixed these too.
+    let fixed = f.events(f.attempt(), "artifacts_stored");
+    assert_eq!(fixed.len(), 1);
+    assert_eq!(fixed[0]["not_stored"], result["artifacts_not_stored"]);
+
+    // A second start stores nothing else.
+    run(&f.spec).unwrap();
+    assert_eq!(f.store.get_result(f.attempt()).unwrap(), Some(result));
+
+    // An attempt that stored everything has no such list in its result.
+    let mut g = fx(vec![]);
+    g.spec.nodes = vec![in_ws(&g, "printf abc > kept.txt")];
+    g.spec.artifacts = Some(artifacts(&g, &[("kept.txt", "kept.txt")]));
+    settled(&run(&g.spec).unwrap());
+    let result = g.store.get_result(g.attempt()).unwrap().unwrap();
+    assert!(result.get("artifacts_not_stored").is_none(), "{result}");
 }
 
 #[test]

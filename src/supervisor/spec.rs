@@ -7,6 +7,7 @@ use super::spool_plan::check_artifact_plan;
 use super::timeouts::TimeoutPolicy;
 use crate::ids::{AttemptId, NodeId, PlanDigest, SourceId, WorkerId};
 use crate::secrets::mask::Masker;
+use crate::wire::MissingPolicy;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
@@ -107,6 +108,10 @@ pub struct ArtifactFile {
     /// Where the commands leave it: below `workspace` (relative to it, or
     /// absolute and inside it).
     pub source: PathBuf,
+    /// What its declaration says about the file not being there. Only
+    /// recorded with an artifact that was not stored; never judged here.
+    #[serde(default)]
+    pub if_missing: MissingPolicy,
 }
 
 /// The artifacts of the attempt. The supervisor copies them out of the

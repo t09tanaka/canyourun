@@ -78,6 +78,10 @@ impl Machine {
     fn manifest(&self, attempt: &AcceptedAttempt) -> Result<CiManifest, ApiError> {
         let payload: AttemptPayload = serde_json::from_value(attempt.spec.clone())
             .map_err(|e| internal("stored payload", e))?;
+        self.manifest_of(&payload)
+    }
+
+    fn manifest_of(&self, payload: &AttemptPayload) -> Result<CiManifest, ApiError> {
         let missing = || {
             ApiError::new(
                 ErrorCode::NotFound,
@@ -170,6 +174,16 @@ impl Host for Machine {
         };
         self.workspaces
             .create(&attempt.attempt_id, &self.store, &m, repo.as_ref())
+    }
+
+    fn secret_paths(&self, payload: &AttemptPayload) -> Result<Option<Vec<String>>, ApiError> {
+        match self.manifest_of(payload) {
+            Ok(m) => Ok(Some(
+                m.secret_files.iter().map(|s| s.path.display()).collect(),
+            )),
+            Err(e) if e.code == ErrorCode::NotFound => Ok(None),
+            Err(e) => Err(e),
+        }
     }
 
     fn place_secrets(
