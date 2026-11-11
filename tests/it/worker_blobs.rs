@@ -1310,7 +1310,8 @@ fn blob_get_serves_the_artifacts_of_the_attempt_in_chunks_and_nothing_else() {
         if r.eof {
             break;
         }
-        assert!(!r.data.0.is_empty());
+        // Full chunks until the end: three answers for these 700 000 bytes.
+        assert_eq!(r.data.0.len(), 262_144);
     }
     assert_eq!(got, data);
     let r = get(&a, &digest, 699_990, 4).unwrap();
