@@ -713,6 +713,25 @@ pub struct PreparedArtifact {
     pub digest: String,
 }
 
+/// An entry the setup changed: a file or link that was there before, by the
+/// digest it had then (`base`) and the one it has now. It is put into a
+/// consumer's workspace only over an entry that still has the `base` digest.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PreparedChange {
+    pub path: String,
+    pub base: String,
+    pub digest: String,
+}
+
+/// An entry the setup removed: a file or link by the digest it had (`base`),
+/// or a directory (`base` absent), which goes only when it is empty.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PreparedRemoval {
+    pub path: String,
+    #[serde(default)]
+    pub base: Option<String>,
+}
+
 /// What a finished template holds. A consumer trusts the template only after
 /// its trees match these digests again.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -723,7 +742,15 @@ pub struct PreparedTemplateReceipt {
     pub builder_id: BuilderId,
     /// The ids of the steps that were prepared and passed, in order.
     pub steps: Vec<String>,
+    /// What the steps added: the topmost new entries, anywhere in the
+    /// workspace.
     pub artifacts: Vec<PreparedArtifact>,
+    /// What the steps changed of what was there.
+    #[serde(default)]
+    pub modified: Vec<PreparedChange>,
+    /// What the steps removed of what was there.
+    #[serde(default)]
+    pub removed: Vec<PreparedRemoval>,
     pub created_at_ms: u64,
     /// `sha256:` of this receipt's canonical JSON with this field empty.
     pub digest: String,

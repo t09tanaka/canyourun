@@ -21,9 +21,11 @@ use std::time::{Duration, Instant};
 const BIN: &str = env!("CARGO_BIN_EXE_remote-task-runner");
 const LIMIT: Duration = Duration::from_secs(90);
 
-/// Workspaces as plain directories with a file in them.
+/// Workspaces as plain directories with a file in them, and the files of
+/// `source` (path, content).
 struct DirWs {
     base: PathBuf,
+    source: std::sync::Mutex<Vec<(String, String)>>,
 }
 
 impl DirWs {
@@ -31,6 +33,11 @@ impl DirWs {
         let root = self.base.join("ws").join(attempt.as_str());
         std::fs::create_dir_all(&root).unwrap();
         std::fs::write(root.join("package.json"), "{}\n").unwrap();
+        for (path, text) in self.source.lock().unwrap().iter() {
+            let to = root.join(path);
+            std::fs::create_dir_all(to.parent().unwrap()).unwrap();
+            std::fs::write(to, text).unwrap();
+        }
         Workspace {
             cwd: root.clone(),
             root,
@@ -94,6 +101,7 @@ fn fx_with(change: impl FnOnce(&mut SetupConfig, &Path)) -> Fx {
         .unwrap();
     let ws = Arc::new(DirWs {
         base: dir.path().to_path_buf(),
+        source: Default::default(),
     });
     let mut c = cfg(dir.path());
     change(&mut c, dir.path());
@@ -232,11 +240,37 @@ impl Fx {
         }
     }
 
+    /// The templates in the store (not its scratch directories, nor the
+    /// notes it keeps beside a template).
     fn template_dirs(&self) -> Vec<PathBuf> {
         let Ok(rd) = std::fs::read_dir(self.templates()) else {
             return vec![];
         };
-        rd.flatten().map(|e| e.path()).collect()
+        rd.flatten()
+            .filter(|e| !e.file_name().to_string_lossy().starts_with(".tmp-"))
+            .map(|e| e.path())
+            .filter(|p| p.is_dir())
+            .collect()
+    }
+
+    /// Files every workspace made from now on holds.
+    fn source(&self, files: &[(&str, &str)]) {
+        *self.ws.source.lock().unwrap() = files
+            .iter()
+            .map(|(p, t)| (p.to_string(), t.to_string()))
+            .collect();
+    }
+
+    /// Nothing of a copy is left in the workspace or in the store.
+    fn no_scratch(&self, ws: &Workspace) {
+        let tmp = |dir: &Path| {
+            std::fs::read_dir(dir)
+                .unwrap()
+                .flatten()
+                .any(|e| e.file_name().to_string_lossy().starts_with(".tmp-"))
+        };
+        assert!(!tmp(&ws.root), "scratch left in the workspace");
+        assert!(!tmp(&self.templates()), "scratch left in the store");
     }
 
     fn builder_dirs(&self) -> usize {
@@ -835,16 +869,6 @@ fn a_builder_still_alive_at_the_start_is_stopped_and_its_workspace_kept_meanwhil
     let again = Setups::open(cfg(f.dir.path()), f.ws.clone()).unwrap();
     let left = again.unsettled();
     assert_eq!(left.len(), 1);
-    // the references of the builder are on disk
-    let bdir = std::fs::read_dir(f.builders())
-        .unwrap()
-        .next()
-        .unwrap()
-        .unwrap()
-        .path();
-    let refs: Vec<String> =
-        serde_json::from_slice(&std::fs::read(bdir.join("consumers.json")).unwrap()).unwrap();
-    assert_eq!(refs, [a.to_string()]);
     assert!(again.owns_workspace(&left[0]));
     // the supervisor was asked to stop; its builder (the first Setups) sees
     // it end and clears up
@@ -852,4 +876,463 @@ fn a_builder_still_alive_at_the_start_is_stopped_and_its_workspace_kept_meanwhil
     let (skip, note) = f.done(&a, &p, &wa);
     assert!(skip.is_empty() && note.is_some());
     wait_for("the builder to be removed", || f.builder_dirs() == 0);
+}
+
+// ------------------------------------------------- what a template holds
+
+fn read(ws: &Workspace, path: &str) -> String {
+    std::fs::read_to_string(ws.root.join(path)).unwrap()
+}
+
+#[test]
+fn what_a_step_adds_under_an_existing_directory_reaches_the_consumer() {
+    // The shapes of a workspace install and of an editable install: new
+    // entries below directories of the source, and a link between them.
+    let f = fx();
+    f.source(&[
+        ("packages/a/package.json", "{}\n"),
+        ("src/lib.py", "x = 1\n"),
+    ]);
+    let s = spec(vec![step(
+        "i1",
+        "mkdir -p packages/a/node_modules/dep node_modules src/pkg.egg-info \
+         && echo dep > packages/a/node_modules/dep/index.js \
+         && ln -s ../packages/a node_modules/a \
+         && echo meta > src/pkg.egg-info/PKG-INFO",
+    )]);
+    let p = f.payload(&s);
+    let (a, wa) = f.consumer();
+    assert_eq!(f.done(&a, &p, &wa), (vec!["i1".to_string()], None));
+    assert_eq!(read(&wa, "packages/a/node_modules/dep/index.js"), "dep\n");
+    assert_eq!(read(&wa, "src/pkg.egg-info/PKG-INFO"), "meta\n");
+    // the link is the relative one the step made, and leads to the
+    // consumer's own package
+    let link = wa.root.join("node_modules/a");
+    assert_eq!(
+        std::fs::read_link(&link).unwrap(),
+        Path::new("../packages/a")
+    );
+    assert_eq!(
+        std::fs::read_to_string(link.join("package.json")).unwrap(),
+        "{}\n"
+    );
+    // the receipt names the topmost new entries, wherever they are
+    let receipt: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(f.template_dirs()[0].join("receipt.json")).unwrap())
+            .unwrap();
+    let paths: Vec<&str> = receipt["artifacts"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|a| a["path"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        paths,
+        [
+            "node_modules",
+            "packages/a/node_modules",
+            "src/pkg.egg-info"
+        ]
+    );
+    f.no_scratch(&wa);
+}
+
+#[test]
+fn what_a_step_changes_or_removes_reaches_a_consumer_that_started_the_same() {
+    let f = fx();
+    f.source(&[("package-lock.json", "v1\n"), ("old/stale.txt", "s\n")]);
+    let ran = f.path("ran");
+    let s = spec(vec![step(
+        "i1",
+        &format!(
+            "echo x >> {}; echo v2 > package-lock.json; rm -r old; mkdir made",
+            ran.display()
+        ),
+    )]);
+    let p = f.payload(&s);
+    let (a, wa) = f.consumer();
+    assert_eq!(f.done(&a, &p, &wa), (vec!["i1".to_string()], None));
+    assert_eq!(read(&wa, "package-lock.json"), "v2\n");
+    assert!(!wa.root.join("old").exists());
+    assert!(wa.root.join("made").is_dir());
+    f.no_scratch(&wa);
+    // the same once more over a workspace that already is what the
+    // template makes (a copy a crash cut short and that is taken up again)
+    let again = Setups::open(cfg(f.dir.path()), f.ws.clone()).unwrap();
+    let (skip, note) = match again.poll(&a, &p, &wa).unwrap() {
+        SetupPoll::Done { skip, note } => (skip, note),
+        SetupPoll::Pending => panic!("a template that is there is not waited for"),
+    };
+    assert_eq!((skip.len(), note), (1, None));
+    assert_eq!(read(&wa, "package-lock.json"), "v2\n");
+    // a consumer whose file is not what the builder started from keeps
+    // it, gets nothing of the template, and runs the steps itself
+    let (b, wb) = f.consumer();
+    std::fs::write(wb.root.join("package-lock.json"), "mine\n").unwrap();
+    let (skip, note) = f.done(&b, &p, &wb);
+    assert!(skip.is_empty());
+    assert!(note.unwrap().contains("package-lock.json"));
+    assert_eq!(read(&wb, "package-lock.json"), "mine\n");
+    assert!(wb.root.join("old/stale.txt").exists());
+    assert!(!wb.root.join("made").exists());
+    // and so does one that holds a file the steps removed, changed
+    let (c, wc) = f.consumer();
+    std::fs::write(wc.root.join("old/stale.txt"), "kept\n").unwrap();
+    let (skip, note) = f.done(&c, &p, &wc);
+    assert!(skip.is_empty());
+    assert!(note.unwrap().contains("old/stale.txt"));
+    assert_eq!(read(&wc, "package-lock.json"), "v1\n");
+    // one that has more in a removed directory than the builder had keeps
+    // the directory, and everything else is put back
+    let (d, wd) = f.consumer();
+    std::fs::write(wd.root.join("old/extra.txt"), "e\n").unwrap();
+    let (skip, note) = f.done(&d, &p, &wd);
+    assert!(skip.is_empty());
+    assert!(note.unwrap().contains("could not be copied"));
+    assert_eq!(read(&wd, "package-lock.json"), "v1\n");
+    assert_eq!(read(&wd, "old/stale.txt"), "s\n");
+    assert!(!wd.root.join("made").exists());
+    f.no_scratch(&wd);
+    assert_eq!(lines(&ran), 1);
+}
+
+#[test]
+fn steps_that_change_nothing_are_proven_by_an_empty_template() {
+    let f = fx();
+    let ran = f.path("ran");
+    let s = spec(vec![step("i1", &format!("echo x >> {}", ran.display()))]);
+    let p = f.payload(&s);
+    let (a, wa) = f.consumer();
+    let (b, wb) = f.consumer();
+    assert_eq!(f.done(&a, &p, &wa), (vec!["i1".to_string()], None));
+    assert_eq!(f.done(&b, &p, &wb), (vec!["i1".to_string()], None));
+    assert_eq!((lines(&ran), f.setups.builds_started()), (1, 1));
+    assert_eq!(f.template_dirs().len(), 1);
+}
+
+#[test]
+fn a_submodule_link_or_a_link_out_of_the_workspace_keeps_no_template() {
+    for (run, why) in [
+        // what `git submodule update --init` leaves: a `.git` file that
+        // names a repository outside the directory
+        (
+            "mkdir -p sub && echo 'gitdir: ../.git/modules/sub' > sub/.git && echo c > sub/code",
+            "Git's own state",
+        ),
+        (
+            "mkdir node_modules && ln -s /etc/hosts node_modules/hosts",
+            "leads out of the workspace",
+        ),
+        (
+            "mkdir node_modules && ln -s ../../elsewhere node_modules/up",
+            "leads out of the workspace",
+        ),
+    ] {
+        let f = fx();
+        let ran = f.path("ran");
+        let s = spec(vec![step(
+            "i1",
+            &format!("echo x >> {}; {run}", ran.display()),
+        )]);
+        let p = f.payload(&s);
+        let (a, wa) = f.consumer();
+        let (skip, note) = f.done(&a, &p, &wa);
+        assert!(skip.is_empty(), "{run}");
+        let note = note.unwrap();
+        assert!(
+            note.contains("cannot be kept") && note.contains(why),
+            "{note}"
+        );
+        assert!(f.template_dirs().is_empty());
+        assert!(!wa.root.join("sub").exists() && !wa.root.join("node_modules").exists());
+        // the next consumer is told at once: no second builder
+        let (b, wb) = f.consumer();
+        let (skip, again) = f.done(&b, &p, &wb);
+        assert!(skip.is_empty());
+        assert_eq!(again.unwrap(), note);
+        assert_eq!((lines(&ran), f.setups.builds_started()), (1, 1));
+    }
+}
+
+#[test]
+fn a_link_into_the_builders_workspace_is_made_relative() {
+    let f = fx();
+    f.source(&[("tools/run.sh", "echo run\n")]);
+    let s = spec(vec![step(
+        "i1",
+        "mkdir -p node_modules/.bin node_modules/dep && echo b > node_modules/dep/bin.js \
+         && ln -s \"$PWD/node_modules/dep/bin.js\" node_modules/.bin/dep \
+         && ln -s \"$PWD/tools/run.sh\" node_modules/.bin/run",
+    )]);
+    let p = f.payload(&s);
+    let (a, wa) = f.consumer();
+    assert_eq!(f.done(&a, &p, &wa), (vec!["i1".to_string()], None));
+    let bin = wa.root.join("node_modules/.bin");
+    assert_eq!(
+        std::fs::read_link(bin.join("dep")).unwrap(),
+        Path::new("../../node_modules/dep/bin.js")
+    );
+    assert_eq!(
+        std::fs::read_link(bin.join("run")).unwrap(),
+        Path::new("../../tools/run.sh")
+    );
+    // the builder's workspace is gone; the links lead into the consumer's
+    wait_for("the builder to be removed", || f.builder_dirs() == 0);
+    assert_eq!(std::fs::read_to_string(bin.join("dep")).unwrap(), "b\n");
+    assert_eq!(
+        std::fs::read_to_string(bin.join("run")).unwrap(),
+        "echo run\n"
+    );
+}
+
+#[test]
+fn a_spec_that_names_secrets_is_not_prepared() {
+    let f = fx();
+    let mut s = spec(vec![install(&f, "count", "")]);
+    s.secrets = vec![remote_task_runner::wire::SecretVersion {
+        name: "NPM_TOKEN".into(),
+        digest: "v1".into(),
+    }];
+    let p = f.payload(&s);
+    let (a, wa) = f.consumer();
+    assert_eq!(f.done(&a, &p, &wa), (vec![], None));
+    assert_eq!(f.setups.builds_started(), 0);
+}
+
+// ------------------------------------------------ the store under races
+
+/// Change something inside a sealed template.
+fn unsealed<T>(template: &Path, f: impl FnOnce() -> T) -> T {
+    use std::os::unix::fs::PermissionsExt;
+    let open = |p: &Path| {
+        std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o755)).unwrap();
+    };
+    open(template);
+    open(&template.join("tree"));
+    f()
+}
+
+#[test]
+fn a_template_that_goes_while_it_is_copied_makes_the_consumer_run_the_steps() {
+    // The interleaving, made certain: the template passed its receipt and
+    // was handed out; what it holds is gone when the copy starts.
+    let f = fx();
+    let s = spec(vec![install(&f, "count", "mkdir other; echo o > other/o")]);
+    let p = f.payload(&s);
+    let (a, wa) = f.consumer();
+    assert_eq!(f.done(&a, &p, &wa), (vec!["i1".to_string()], None));
+    let t = f.template_dirs().remove(0);
+    unsealed(&t, || remove_tree(&t.join("tree/other")).unwrap());
+    let (b, wb) = f.consumer();
+    let (skip, note) = f.done(&b, &p, &wb);
+    assert!(skip.is_empty());
+    assert!(note.unwrap().contains("could not be copied"));
+    // nothing of the part that could be copied is left behind
+    assert!(!wb.root.join("node_modules").exists());
+    f.no_scratch(&wb);
+}
+
+#[test]
+fn a_copy_that_fails_halfway_is_taken_back() {
+    use std::os::unix::fs::PermissionsExt;
+    let f = fx();
+    f.source(&[("a/keep", "1\n"), ("b/keep", "2\n"), ("lock", "v1\n")]);
+    let s = spec(vec![step(
+        "i1",
+        "echo n > a/new && echo v2 > lock && echo n > b/new",
+    )]);
+    let p = f.payload(&s);
+    let (a, wa) = f.consumer();
+    assert_eq!(f.done(&a, &p, &wa), (vec!["i1".to_string()], None));
+    // this consumer's `b` cannot be written into: `a/new` is placed, then
+    // `b/new` fails, and `a/new` goes again
+    let (b, wb) = f.consumer();
+    let dir = wb.root.join("b");
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+    let (skip, note) = f.done(&b, &p, &wb);
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(skip.is_empty());
+    assert!(note.unwrap().contains("could not be copied"));
+    assert!(!wb.root.join("a/new").exists());
+    assert_eq!(read(&wb, "lock"), "v1\n");
+    f.no_scratch(&wb);
+}
+
+mod store {
+    use super::*;
+    use remote_task_runner::ids::BuilderId;
+    use remote_task_runner::setup::policy::{seal_receipt, Limits};
+    use remote_task_runner::setup::store::{digest_of, TemplateStore};
+    use remote_task_runner::wire::PreparedArtifact;
+
+    struct S {
+        dir: tempfile::TempDir,
+        store: TemplateStore,
+        spec: SetupSpec,
+    }
+
+    fn s() -> S {
+        let dir = tempfile::tempdir_in(env!("CARGO_TARGET_TMPDIR")).unwrap();
+        let store = TemplateStore::open(dir.path().join("templates")).unwrap();
+        S {
+            dir,
+            store,
+            spec: spec(vec![step("i1", "true")]),
+        }
+    }
+
+    impl S {
+        /// Publish a template of `key` that holds one file with `text`.
+        fn publish(&self, key: &str, text: &str, run: Option<&str>, now: u64) -> String {
+            let built = self.dir.path().join(format!("built-{}", ulid::Ulid::new()));
+            std::fs::create_dir_all(built.join("made")).unwrap();
+            std::fs::write(built.join("made/file"), text).unwrap();
+            let art = PreparedArtifact {
+                path: "made".into(),
+                digest: digest_of(&built.join("made")).unwrap(),
+            };
+            let r = seal_receipt(
+                key,
+                "src",
+                &BuilderId::generate(),
+                &self.spec,
+                vec![art],
+                vec![],
+                vec![],
+                now,
+            );
+            self.store.publish(key, &r, &built, run, now).unwrap();
+            r.digest
+        }
+
+        fn has(&self, key: &str) -> bool {
+            self.store.get(key, "src", &self.spec, 0).is_some()
+        }
+    }
+
+    impl Drop for S {
+        fn drop(&mut self) {
+            let _ = remove_tree(self.dir.path());
+        }
+    }
+
+    const NO_LIMIT: Limits = Limits {
+        max_bytes: u64::MAX,
+        max_age_ms: u64::MAX,
+        run_idle_ms: u64::MAX,
+    };
+
+    #[test]
+    fn a_discard_takes_only_the_template_that_was_judged() {
+        let s = s();
+        let first = s.publish("k", "one", None, 1);
+        // a consumer judged `first` corrupt; before its discard another
+        // consumer discarded it and a builder published the key again
+        s.store.discard("k", &first);
+        assert!(!s.has("k"));
+        let second = s.publish("k", "two", None, 2);
+        assert_ne!(first, second);
+        s.store.discard("k", &first);
+        assert!(
+            s.has("k"),
+            "the new template went with the old one's verdict"
+        );
+        s.store.discard("k", &second);
+        assert!(!s.has("k"));
+    }
+
+    #[test]
+    fn a_template_somebody_copies_out_of_is_not_evicted_nor_replaced() {
+        let s = s();
+        s.publish("k", "one", None, 1);
+        let held = s.store.get("k", "src", &s.spec, 5).unwrap();
+        let none = Limits {
+            max_bytes: 0,
+            ..NO_LIMIT
+        };
+        assert_eq!(s.store.evict(10, &none, &|_| false), 0);
+        // a builder that finishes meanwhile leaves it too
+        s.publish("k", "two", None, 6);
+        let ws = s.dir.path().join("ws");
+        std::fs::create_dir_all(&ws).unwrap();
+        s.store.materialize(&held, &ws).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(ws.join("made/file")).unwrap(),
+            "one"
+        );
+        drop(held);
+        assert_eq!(s.store.evict(10, &none, &|_| false), 1);
+        assert!(!s.has("k"));
+        // nothing is left of it, nor of the copy
+        let left: Vec<_> = std::fs::read_dir(s.dir.path().join("templates"))
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name())
+            .collect();
+        assert!(left.is_empty(), "{left:?}");
+    }
+
+    #[test]
+    fn templates_are_evicted_by_use_by_size_and_with_their_run() {
+        let s = s();
+        s.publish("old", "0123456789", None, 100);
+        s.publish("new", "0123456789", None, 200);
+        s.publish("run", "0123456789", Some("r1"), 300);
+        // nothing is over any limit
+        assert_eq!(s.store.evict(400, &NO_LIMIT, &|_| true), 0);
+        // the run is gone and its template was idle long enough
+        let idle = Limits {
+            run_idle_ms: 50,
+            ..NO_LIMIT
+        };
+        assert_eq!(s.store.evict(400, &idle, &|r| r != "r1"), 0);
+        assert_eq!(s.store.evict(400, &idle, &|r| r == "r1"), 1);
+        assert!(!s.has("run") && s.has("old") && s.has("new"));
+        // `has` was a use at time 0 of both; use `old` again, later
+        assert!(s.store.get("old", "src", &s.spec, 500).is_some());
+        // room for one template only: the one used least recently goes
+        let small = Limits {
+            max_bytes: 15,
+            ..NO_LIMIT
+        };
+        assert_eq!(s.store.evict(600, &small, &|_| false), 1);
+        assert!(s.store.get("old", "src", &s.spec, 600).is_some());
+        assert!(s.store.get("new", "src", &s.spec, 600).is_none());
+        // age
+        let aged = Limits {
+            max_age_ms: 99,
+            ..NO_LIMIT
+        };
+        assert_eq!(s.store.evict(699, &aged, &|_| false), 0);
+        assert_eq!(s.store.evict(700, &aged, &|_| false), 1);
+        // what a crash left of a template on its way out is swept
+        assert_eq!(s.store.sweep().unwrap(), 0);
+    }
+}
+
+#[test]
+fn a_run_scope_template_goes_when_its_run_has_left() {
+    let f = fx_with(|c, _| c.run_template_idle_ms = 0);
+    let mut s = spec(vec![install(&f, "count", "")]);
+    s.no_cache = true;
+    let p = f.payload(&s);
+    let (a, wa) = f.consumer();
+    assert_eq!(f.done(&a, &p, &wa), (vec!["i1".to_string()], None));
+    // kept while an attempt of the run is here
+    std::thread::sleep(Duration::from_millis(5));
+    f.setups.evict();
+    assert_eq!(f.template_dirs().len(), 1);
+    f.setups.release(&a);
+    std::thread::sleep(Duration::from_millis(5));
+    f.setups.evict();
+    assert!(f.template_dirs().is_empty());
+    // a persistent one is not a run's
+    let keep = spec(vec![install(&f, "count2", "")]);
+    let p = f.payload(&keep);
+    let (b, wb) = f.consumer();
+    assert_eq!(f.done(&b, &p, &wb), (vec!["i1".to_string()], None));
+    f.setups.release(&b);
+    std::thread::sleep(Duration::from_millis(5));
+    f.setups.evict();
+    assert_eq!(f.template_dirs().len(), 1);
 }

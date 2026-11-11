@@ -7,14 +7,18 @@
 use crate::ids::{BuilderId, Digest};
 use crate::state::{Exit, Outcome, Termination};
 use crate::wire::{
-    canonical_json, CommandSpec, PreparedArtifact, PreparedTemplateReceipt, ReuseScope,
-    SchemaVersion, SetupSpec, SetupStep,
+    canonical_json, CommandSpec, PreparedArtifact, PreparedChange, PreparedRemoval,
+    PreparedTemplateReceipt, ReuseScope, SchemaVersion, SetupSpec, SetupStep,
 };
 use serde_json::{json, Value};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// Bump when what a template holds, or how its key is made, changes.
-pub const CACHE_SCHEMA: u32 = 1;
+pub const CACHE_SCHEMA: u32 = 2;
+/// Changed and removed entries of one template, together.
+pub const MAX_CHANGES: usize = 4096;
+/// How deep a tree of a workspace or a template may be.
+pub const MAX_DEPTH: usize = 128;
 pub const MAX_STEPS: usize = 64;
 pub const MAX_ID_BYTES: usize = 128;
 pub const MAX_RUN_BYTES: usize = 65_536;
@@ -96,8 +100,13 @@ pub fn validate(spec: &SetupSpec) -> Result<(), String> {
 
 /// The steps a builder prepares: the leading ones whose environment is all
 /// known and whose shell this worker runs. Any other step stays with its
-/// consumer, and so does every step after it (it may depend on it).
+/// consumer, and so does every step after it (it may depend on it). A spec
+/// that names secrets is not prepared at all: a builder is given no secret,
+/// so its steps would not run as the consumer's do.
 pub fn hoisted(spec: &SetupSpec) -> &[SetupStep] {
+    if !spec.secrets.is_empty() {
+        return &[];
+    }
     let n = spec
         .steps
         .iter()
@@ -132,6 +141,12 @@ pub struct KeyContext {
     pub arch: String,
     pub profile: String,
     pub run_id: String,
+    /// The environment every step of this worker starts from (`PATH`,
+    /// `HOME`, ...); a step's own `env` is laid over it.
+    pub env: BTreeMap<String, String>,
+    /// What the declared tools are on this worker, by name: a fingerprint
+    /// of the binary the name resolves to (or that there is none).
+    pub tools: Vec<(String, String)>,
 }
 
 /// The identity of the template the spec asks for. It holds the steps the
@@ -153,6 +168,13 @@ pub fn template_key(spec: &SetupSpec, ctx: &KeyContext) -> String {
         .map(|s| json!([s.name, s.digest]))
         .collect();
     secrets.sort_by_key(|v| v.to_string());
+    let mut tools: Vec<_> = ctx.tools.iter().map(|(n, f)| json!([n, f])).collect();
+    tools.sort_by_key(|v| v.to_string());
+    let effective = |s: &SetupStep| {
+        let mut env = ctx.env.clone();
+        env.extend(s.env.clone());
+        env
+    };
     let inputs = json!({
         "cache_schema": CACHE_SCHEMA,
         "source": ctx.source_digest,
@@ -161,9 +183,10 @@ pub fn template_key(spec: &SetupSpec, ctx: &KeyContext) -> String {
             "dir": s.dir,
             "run": s.run,
             "shell": s.shell.as_deref().unwrap_or("bash"),
-            "env": s.env,
+            "env": effective(s),
         })).collect::<Vec<_>>(),
         "toolchain": toolchain,
+        "tools": tools,
         "os": ctx.os,
         "arch": ctx.arch,
         "profile": ctx.profile,
@@ -193,12 +216,15 @@ pub fn receipt_digest(r: &PreparedTemplateReceipt) -> String {
 }
 
 /// The receipt for a template just built, with its digest set.
+#[allow(clippy::too_many_arguments)]
 pub fn seal_receipt(
     key: &str,
     source: &str,
     builder: &BuilderId,
     spec: &SetupSpec,
     artifacts: Vec<PreparedArtifact>,
+    modified: Vec<PreparedChange>,
+    removed: Vec<PreparedRemoval>,
     created_at_ms: u64,
 ) -> PreparedTemplateReceipt {
     let mut r = PreparedTemplateReceipt {
@@ -208,6 +234,8 @@ pub fn seal_receipt(
         builder_id: builder.clone(),
         steps: hoisted(spec).iter().map(|s| s.id.clone()).collect(),
         artifacts,
+        modified,
+        removed,
         created_at_ms,
         digest: String::new(),
     };
@@ -265,20 +293,36 @@ pub fn check_receipt(
     if !r.steps.iter().eq(hoisted(spec).iter().map(|s| &s.id)) {
         return Err(Reject::Steps);
     }
-    if r.artifacts.len() > MAX_ARTIFACTS {
+    if r.artifacts.len() > MAX_ARTIFACTS || r.modified.len() + r.removed.len() > MAX_CHANGES {
         return Err(Reject::Artifacts("too many".into()));
     }
+    let digest = |d: &str| d.starts_with(Digest::PREFIX);
+    let added = r.artifacts.iter().map(|a| (&a.path, digest(&a.digest)));
+    let modified = r
+        .modified
+        .iter()
+        .map(|m| (&m.path, digest(&m.base) && digest(&m.digest)));
+    let removed = r
+        .removed
+        .iter()
+        .map(|x| (&x.path, x.base.as_deref().is_none_or(digest)));
     let mut seen = BTreeSet::new();
-    for a in &r.artifacts {
-        let bad = a.path.is_empty()
-            || !safe_relative(&a.path)
-            || a.path.split('/').any(|c| c == ".git")
-            || !a.digest.starts_with(Digest::PREFIX);
+    for (path, digests_ok) in added.chain(modified).chain(removed) {
+        let bad = path.is_empty() || !safe_relative(path) || in_git(path) || !digests_ok;
         if bad {
-            return Err(Reject::Artifacts(format!("`{}`", a.path)));
+            return Err(Reject::Artifacts(format!("`{path}`")));
         }
-        if !seen.insert(a.path.as_str()) {
-            return Err(Reject::Artifacts(format!("`{}` is there twice", a.path)));
+        if !seen.insert(path.as_str()) {
+            return Err(Reject::Artifacts(format!("`{path}` is there twice")));
+        }
+    }
+    // What is put whole (an added tree, a changed file) holds no other entry.
+    let whole = r.artifacts.iter().map(|a| &a.path);
+    for path in whole.chain(r.modified.iter().map(|m| &m.path)) {
+        let under = format!("{path}/");
+        let next = seen.range(under.as_str()..).next();
+        if next.is_some_and(|p| p.starts_with(&under)) {
+            return Err(Reject::Artifacts(format!("`{path}` holds another entry")));
         }
     }
     if !fresh(r.created_at_ms, now_ms, spec.freshness_secs) {
@@ -312,14 +356,183 @@ pub fn prune_commands(commands: &[CommandSpec], skip: &BTreeSet<String>) -> Vec<
         .collect()
 }
 
-/// The entries `after` has that `before` did not, in order, leaving out
-/// everything of Git's.
-pub fn added_entries(before: &BTreeSet<String>, after: &BTreeSet<String>) -> Vec<String> {
-    after
-        .difference(before)
-        .filter(|p| !p.split('/').any(|c| c == ".git"))
-        .cloned()
-        .collect()
+/// A path at or under an entry named `.git`.
+pub fn in_git(path: &str) -> bool {
+    path.split('/').any(|c| c == ".git")
+}
+
+fn parent_of(path: &str) -> &str {
+    path.rsplit_once('/').map_or("", |(parent, _)| parent)
+}
+
+/// What one entry of a workspace is: a directory, or a file or link by the
+/// digest of what it holds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Sig {
+    Dir,
+    File(String),
+    Link(String),
+}
+
+impl Sig {
+    fn digest(&self) -> Option<&str> {
+        match self {
+            Sig::Dir => None,
+            Sig::File(d) | Sig::Link(d) => Some(d),
+        }
+    }
+}
+
+/// Why what a builder's steps did is not kept as a template. The steps
+/// passed; the consumers run them themselves.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Unkept {
+    /// A directory became a file or a file a directory.
+    TypeChange(String),
+    /// Something of Git's own changed (a repository's state, a submodule's
+    /// link to it): it lives outside what a template can hold.
+    Git(String),
+    /// A link that leads out of the workspace.
+    Link {
+        path: String,
+        target: String,
+    },
+    TooMany,
+    /// The workspace could not be read whole.
+    Unreadable(String),
+}
+
+impl std::fmt::Display for Unkept {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Unkept::TypeChange(p) => {
+                write!(f, "`{p}` changed between a directory and a file")
+            }
+            Unkept::Git(p) => write!(f, "`{p}` is Git's own state"),
+            Unkept::Link { path, target } => {
+                write!(
+                    f,
+                    "the link `{path}` leads out of the workspace, to `{target}`"
+                )
+            }
+            Unkept::TooMany => f.write_str("too many entries were added, changed or removed"),
+            Unkept::Unreadable(why) => write!(f, "the workspace could not be read: {why}"),
+        }
+    }
+}
+
+/// What the steps of a builder did to its workspace.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Changes {
+    /// The topmost new entries, at any depth.
+    pub added: Vec<String>,
+    /// Files and links that hold something else now: the path and the
+    /// digest it had before.
+    pub modified: Vec<(String, String)>,
+    pub removed: Vec<PreparedRemoval>,
+}
+
+/// Compare the workspace before the steps with the one after them. `after`
+/// lists a new directory without what is in it (it is kept whole). Nothing
+/// depends on where a step wrote: every entry of the workspace is compared.
+pub fn change_set(
+    before: &BTreeMap<String, Sig>,
+    after: &BTreeMap<String, Sig>,
+) -> Result<Changes, Unkept> {
+    let mut c = Changes::default();
+    let git = |p: &String| Err(Unkept::Git(p.clone()));
+    for (path, now) in after {
+        match before.get(path) {
+            None => {
+                let parent = parent_of(path);
+                if !parent.is_empty() && !before.contains_key(parent) {
+                    // inside something new, which is kept whole
+                    continue;
+                }
+                if in_git(path) {
+                    return git(path);
+                }
+                c.added.push(path.clone());
+            }
+            Some(was) if was == now => {}
+            Some(was) => match (was.digest(), now.digest()) {
+                (Some(base), Some(_)) => {
+                    if in_git(path) {
+                        return git(path);
+                    }
+                    c.modified.push((path.clone(), base.to_string()));
+                }
+                _ => return Err(Unkept::TypeChange(path.clone())),
+            },
+        }
+    }
+    for (path, was) in before {
+        if !after.contains_key(path) {
+            if in_git(path) {
+                return git(path);
+            }
+            c.removed.push(PreparedRemoval {
+                path: path.clone(),
+                base: was.digest().map(str::to_string),
+            });
+        }
+    }
+    if c.added.len() > MAX_ARTIFACTS || c.modified.len() + c.removed.len() > MAX_CHANGES {
+        return Err(Unkept::TooMany);
+    }
+    Ok(c)
+}
+
+/// What to do with a link the steps made.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LinkPlan {
+    /// A relative link that stays in the workspace.
+    Keep,
+    /// An absolute link into the builder's workspace: the same place, said
+    /// relative to the link, so that it holds in a consumer's workspace.
+    Rewrite(String),
+    /// It leads out of the workspace.
+    Refuse,
+}
+
+/// `path` walked from `at` by its text alone; `None` when it leaves the top.
+fn walk<'a>(mut at: Vec<&'a str>, path: &'a str) -> Option<Vec<&'a str>> {
+    for c in path.split('/') {
+        match c {
+            "" | "." => {}
+            ".." => {
+                at.pop()?;
+            }
+            c => at.push(c),
+        }
+    }
+    Some(at)
+}
+
+/// Judge the link at `link` (relative to the workspace) with `target`.
+/// `roots` are the spellings of the builder's workspace root (as given and
+/// resolved), without a trailing slash.
+pub fn link_plan(link: &str, target: &str, roots: &[String]) -> LinkPlan {
+    let dir = walk(Vec::new(), parent_of(link)).unwrap_or_default();
+    if !target.starts_with('/') {
+        return match walk(dir, target) {
+            Some(_) => LinkPlan::Keep,
+            None => LinkPlan::Refuse,
+        };
+    }
+    let inside = roots.iter().find_map(|root| {
+        let rest = target.strip_prefix(root.as_str())?;
+        (rest.is_empty() || rest.starts_with('/')).then_some(rest)
+    });
+    let Some(to) = inside.and_then(|rest| walk(Vec::new(), rest)) else {
+        return LinkPlan::Refuse;
+    };
+    let mut rel = vec![".."; dir.len()];
+    rel.extend(to);
+    if rel.is_empty() {
+        rel.push(".");
+    }
+    LinkPlan::Rewrite(rel.join("/"))
 }
 
 /// What to do with one artifact of a template in a consumer's workspace.
@@ -343,6 +556,95 @@ pub fn place(dest_exists: bool, dest_digest: Option<&str>, want: &str) -> Place 
     }
 }
 
+/// What to do with a changed entry: `dest` is the digest of what the
+/// consumer's workspace holds at its path (none when nothing readable is
+/// there). Only an entry that is still what the builder started from is
+/// replaced.
+pub fn place_modified(dest: Option<&str>, base: &str, want: &str) -> Place {
+    match dest {
+        Some(d) if d == want => Place::AlreadyThere,
+        Some(d) if d == base => Place::Copy,
+        _ => Place::Conflict,
+    }
+}
+
+/// What to do with an entry the steps removed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Gone {
+    /// Nothing is there.
+    Already,
+    Remove,
+    /// Something else is there than the builder started from.
+    Conflict,
+}
+
+pub fn place_removed(exists: bool, is_dir: bool, dest: Option<&str>, base: Option<&str>) -> Gone {
+    if !exists {
+        return Gone::Already;
+    }
+    let same = match base {
+        None => is_dir,
+        Some(b) => !is_dir && dest == Some(b),
+    };
+    if same {
+        Gone::Remove
+    } else {
+        Gone::Conflict
+    }
+}
+
+/// A template in the store, as the eviction sees it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Kept {
+    pub name: String,
+    pub bytes: u64,
+    pub last_used_ms: u64,
+    /// A run-scope template whose run has no attempt on this worker.
+    pub run_gone: bool,
+    /// Somebody copies out of it.
+    pub pinned: bool,
+}
+
+/// How much the store of templates may hold.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Limits {
+    /// All templates together.
+    pub max_bytes: u64,
+    /// A template nobody used for this long goes.
+    pub max_age_ms: u64,
+    /// A template of a run that is gone goes after this long without use.
+    pub run_idle_ms: u64,
+}
+
+/// The names of the templates to take out: those not used for too long and
+/// those of runs that are gone, then, while the rest is over the size, the
+/// ones used least recently. A pinned template always stays.
+pub fn evictions(kept: &[Kept], now_ms: u64, limits: &Limits) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut rest: Vec<&Kept> = Vec::new();
+    for k in kept {
+        let idle = now_ms.saturating_sub(k.last_used_ms);
+        let old = idle > limits.max_age_ms || (k.run_gone && idle > limits.run_idle_ms);
+        if old && !k.pinned {
+            out.push(k.name.clone());
+        } else {
+            rest.push(k);
+        }
+    }
+    let mut total = rest.iter().fold(0u64, |n, k| n.saturating_add(k.bytes));
+    rest.sort_by(|a, b| (a.last_used_ms, &a.name).cmp(&(b.last_used_ms, &b.name)));
+    for k in rest {
+        if total <= limits.max_bytes {
+            break;
+        }
+        if !k.pinned {
+            total = total.saturating_sub(k.bytes);
+            out.push(k.name.clone());
+        }
+    }
+    out
+}
+
 /// How a builder ended, as the consumers that waited for it are told.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BuildEnd {
@@ -355,6 +657,8 @@ pub enum BuildEnd {
     /// It could not be seen to end properly: the supervisor died, the
     /// lease ran out, the result is missing.
     Crashed(String),
+    /// The steps passed, but what they did cannot be kept as a template.
+    NotKept(String),
 }
 
 impl BuildEnd {
@@ -373,6 +677,9 @@ impl BuildEnd {
             BuildEnd::TimedOut => "the setup builder timed out".into(),
             BuildEnd::Cancelled => "the setup builder was cancelled".into(),
             BuildEnd::Crashed(why) => format!("the setup builder was lost: {why}"),
+            BuildEnd::NotKept(why) => {
+                format!("what the setup steps did cannot be kept as a template: {why}")
+            }
         }
     }
 }
@@ -543,6 +850,8 @@ mod tests {
             arch: "x86_64".into(),
             profile: "p1".into(),
             run_id: RunId::generate().to_string(),
+            env: BTreeMap::from([("PATH".to_string(), "/bin".to_string())]),
+            tools: vec![("node".to_string(), "/bin/node 1 2".to_string())],
         }
     }
 
@@ -689,6 +998,13 @@ mod tests {
         s.steps[0].unresolved_env = vec!["X".into()];
         assert!(ids(&s).is_empty());
         assert!(hoisted(&spec(&[])).is_empty());
+        // a builder gets no secret: steps that need one are not prepared
+        let mut u = spec(&["a", "b"]);
+        u.secrets = vec![SecretVersion {
+            name: "TOKEN".into(),
+            digest: "v1".into(),
+        }];
+        assert!(ids(&u).is_empty());
         // a shell this worker does not run: that step and the ones after it
         let mut t = spec(&["a", "b", "c"]);
         t.steps[1].shell = Some("pwsh".into());
@@ -746,6 +1062,32 @@ mod tests {
             &c,
         );
         differs(&with(&|s| s.steps[0].id = "z".into()), &c);
+        // M7: the environment the worker gives every step, and its tools
+        let with_ctx = |f: &dyn Fn(&mut KeyContext)| {
+            let mut x = c.clone();
+            f(&mut x);
+            x
+        };
+        differs(
+            &base,
+            &with_ctx(&|x| {
+                x.env.insert("PATH".into(), "/opt/bin".into());
+            }),
+        );
+        differs(&base, &with_ctx(&|x| x.tools[0].1 = "/bin/node 1 3".into()));
+        differs(&base, &with_ctx(&|x| x.tools.clear()));
+        // what counts is the environment a step ends up with
+        let over = with(&|s| {
+            for st in &mut s.steps {
+                st.env.insert("PATH".into(), "/bin".into());
+            }
+        });
+        assert_eq!(k, template_key(&over, &c));
+        assert_eq!(k, template_key(&over, &with_ctx(&|x| x.env.clear())));
+        let two = with_ctx(&|x| x.tools.push(("go".into(), "absent".into())));
+        let mut swapped = two.clone();
+        swapped.tools.reverse();
+        assert_eq!(template_key(&base, &two), template_key(&base, &swapped));
         differs(
             &with(&|s| {
                 s.toolchain.push(ToolRequirement {
@@ -841,6 +1183,8 @@ mod tests {
                 path: "node_modules".into(),
                 digest: format!("sha256:{}", "a".repeat(64)),
             }],
+            vec![],
+            vec![],
             1000,
         )
     }
@@ -970,6 +1314,99 @@ mod tests {
     }
 
     #[test]
+    fn the_changed_and_removed_entries_of_a_receipt_are_checked() {
+        let s = spec(&["a"]);
+        let with = |f: &dyn Fn(&mut PreparedTemplateReceipt)| {
+            let mut r = receipt(&s, "k");
+            r.artifacts.clear();
+            f(&mut r);
+            r.digest = receipt_digest(&r);
+            check_receipt(&r, "k", "sha256:src", &s, 2000)
+        };
+        let good = format!("sha256:{}", "b".repeat(64));
+        let art = |p: &str| PreparedArtifact {
+            path: p.into(),
+            digest: good.clone(),
+        };
+        let ch = |p: &str, base: &str, d: &str| PreparedChange {
+            path: p.into(),
+            base: base.into(),
+            digest: d.into(),
+        };
+        let rm = |p: &str, base: Option<&str>| PreparedRemoval {
+            path: p.into(),
+            base: base.map(str::to_string),
+        };
+        let bad = |r: Result<(), Reject>| matches!(r, Err(Reject::Artifacts(_)));
+        assert_eq!(
+            with(&|r| {
+                r.artifacts = vec![art("src/pkg.egg-info")];
+                r.modified = vec![ch("package-lock.json", &good, &good)];
+                r.removed = vec![rm("old", None), rm("old/a.txt", Some(&good))];
+            }),
+            Ok(())
+        );
+        // each digest of a changed entry, and the one of a removed file
+        assert!(bad(with(&|r| r.modified = vec![ch("x", "md5:z", &good)])));
+        assert!(bad(with(&|r| r.modified = vec![ch("x", &good, "md5:z")])));
+        assert!(bad(with(&|r| r.removed = vec![rm("x", Some("md5:z"))])));
+        // their paths
+        assert!(bad(with(&|r| r.modified = vec![ch("../x", &good, &good)])));
+        assert!(bad(with(&|r| r.removed = vec![rm("", None)])));
+        assert!(bad(with(&|r| r.removed = vec![rm("a/.git/x", None)])));
+        // one path, one entry, whichever list it is in
+        assert!(bad(with(&|r| {
+            r.artifacts = vec![art("x")];
+            r.removed = vec![rm("x", None)];
+        })));
+        assert!(bad(with(&|r| {
+            r.modified = vec![ch("x", &good, &good)];
+            r.removed = vec![rm("x", None)];
+        })));
+        // L4: nothing lies inside an added tree or a changed file
+        let inside = with(&|r| r.artifacts = vec![art("foo"), art("foo/bar")]);
+        assert_eq!(
+            inside,
+            Err(Reject::Artifacts("`foo` holds another entry".into()))
+        );
+        assert!(bad(with(&|r| {
+            r.modified = vec![ch("foo", &good, &good)];
+            r.removed = vec![rm("foo/bar", None)];
+        })));
+        // a name that only begins the same is no entry inside
+        assert_eq!(
+            with(&|r| r.artifacts = vec![art("foo"), art("foo-bar"), art("foo.d/x")]),
+            Ok(())
+        );
+        // a removed directory does hold the removed entries under it
+        assert_eq!(
+            with(&|r| r.removed = vec![rm("foo", None), rm("foo/bar", Some(&good))]),
+            Ok(())
+        );
+        // the two lists share one limit
+        let changes = |n: usize| -> Vec<PreparedChange> {
+            (0..n).map(|i| ch(&format!("c{i}"), &good, &good)).collect()
+        };
+        assert_eq!(
+            with(&|r| {
+                r.modified = changes(MAX_CHANGES - 1);
+                r.removed = vec![rm("gone", None)];
+            }),
+            Ok(())
+        );
+        assert!(bad(with(&|r| {
+            r.modified = changes(MAX_CHANGES);
+            r.removed = vec![rm("gone", None)];
+        })));
+        assert!(bad(with(&|r| {
+            r.modified = changes(2);
+            r.removed = (0..MAX_CHANGES - 1)
+                .map(|i| rm(&format!("r{i}"), None))
+                .collect();
+        })));
+    }
+
+    #[test]
     fn a_rejection_says_why() {
         let all = [
             Reject::Schema,
@@ -1031,23 +1468,319 @@ mod tests {
         );
     }
 
+    fn tree(entries: &[(&str, &str)]) -> BTreeMap<String, Sig> {
+        entries
+            .iter()
+            .map(|(p, s)| {
+                let sig = match s.split_once(':') {
+                    None => Sig::Dir,
+                    Some(("l", d)) => Sig::Link(d.to_string()),
+                    Some((_, d)) => Sig::File(d.to_string()),
+                };
+                (p.to_string(), sig)
+            })
+            .collect()
+    }
+
+    const SOURCE: &[(&str, &str)] = &[
+        ("package.json", "f:1"),
+        ("package-lock.json", "f:2"),
+        ("packages", "d"),
+        ("packages/a", "d"),
+        ("packages/a/index.js", "f:3"),
+        ("src", "d"),
+        ("src/lib.py", "f:4"),
+        ("tool", "l:5"),
+    ];
+
+    fn after(more: &[(&str, &str)], without: &[&str]) -> BTreeMap<String, Sig> {
+        let mut t = tree(SOURCE);
+        for w in without {
+            t.remove(*w).unwrap();
+        }
+        t.extend(tree(more));
+        t
+    }
+
     #[test]
-    fn what_the_setup_added_is_what_was_not_there_before() {
-        let set = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<BTreeSet<_>>();
-        let before = set(&["src", "package.json"]);
-        let after = set(&[
-            "src",
-            "package.json",
-            "node_modules",
-            "web/node_modules",
-            ".git",
-        ]);
-        assert_eq!(
-            added_entries(&before, &after),
-            ["node_modules", "web/node_modules"]
+    fn what_the_steps_added_is_found_wherever_they_wrote() {
+        let before = tree(SOURCE);
+        assert_eq!(change_set(&before, &before), Ok(Changes::default()));
+        // at the top, under a directory that was there (a workspace
+        // package's node_modules, an egg-info beside the sources), and
+        // nothing of what lies inside a new directory
+        let now = after(
+            &[
+                ("node_modules", "d"),
+                ("packages/a/node_modules", "d"),
+                ("packages/a/node_modules/dep", "d"),
+                ("packages/a/node_modules/dep/x.js", "f:9"),
+                ("src/pkg.egg-info", "d"),
+                ("src/made.txt", "f:8"),
+                ("link", "l:7"),
+            ],
+            &[],
         );
-        assert!(added_entries(&after, &before).is_empty());
-        assert!(added_entries(&after, &set(&["x/.git/y"])).is_empty());
+        let c = change_set(&before, &now).unwrap();
+        assert_eq!(
+            c.added,
+            [
+                "link",
+                "node_modules",
+                "packages/a/node_modules",
+                "src/made.txt",
+                "src/pkg.egg-info"
+            ]
+        );
+        assert!(c.modified.is_empty() && c.removed.is_empty());
+    }
+
+    #[test]
+    fn what_the_steps_changed_or_removed_is_found_with_what_it_was() {
+        let before = tree(SOURCE);
+        // a lockfile written again, a link pointed elsewhere, a file that
+        // became a link
+        let now = after(
+            &[
+                ("package-lock.json", "f:20"),
+                ("tool", "l:50"),
+                ("src/lib.py", "l:4"),
+            ],
+            &["package.json", "packages/a/index.js", "packages/a"],
+        );
+        let c = change_set(&before, &now).unwrap();
+        assert!(c.added.is_empty());
+        assert_eq!(
+            c.modified,
+            [
+                ("package-lock.json".to_string(), "2".to_string()),
+                ("src/lib.py".to_string(), "4".to_string()),
+                ("tool".to_string(), "5".to_string()),
+            ]
+        );
+        let rm = |p: &str, base: Option<&str>| PreparedRemoval {
+            path: p.into(),
+            base: base.map(str::to_string),
+        };
+        assert_eq!(
+            c.removed,
+            [
+                rm("package.json", Some("1")),
+                rm("packages/a", None),
+                rm("packages/a/index.js", Some("3")),
+            ]
+        );
+    }
+
+    #[test]
+    fn what_cannot_be_kept_is_told_apart() {
+        let before = tree(SOURCE);
+        // a directory that became a file, and the other way round
+        assert_eq!(
+            change_set(&before, &after(&[("src", "f:1")], &["src/lib.py"])),
+            Err(Unkept::TypeChange("src".into()))
+        );
+        assert_eq!(
+            change_set(&before, &after(&[("package.json", "d")], &[])),
+            Err(Unkept::TypeChange("package.json".into()))
+        );
+        // Git's own: added, changed or removed, at any depth
+        let git = |r: Result<Changes, Unkept>, p: &str| assert_eq!(r, Err(Unkept::Git(p.into())));
+        git(
+            change_set(&before, &after(&[("src/.git", "f:1")], &[])),
+            "src/.git",
+        );
+        git(change_set(&before, &after(&[(".git", "d")], &[])), ".git");
+        let mut with_git = tree(SOURCE);
+        with_git.extend(tree(&[(".git", "f:1"), ("sub", "d"), ("sub/.git", "f:2")]));
+        let mut changed = with_git.clone();
+        changed.insert(".git".into(), Sig::File("9".into()));
+        git(change_set(&with_git, &changed), ".git");
+        let mut removed = with_git.clone();
+        removed.remove("sub/.git").unwrap();
+        git(change_set(&with_git, &removed), "sub/.git");
+        // an entry merely named like it is none of Git's
+        assert!(!in_git("a/.github/x") && !in_git(".gitignore") && !in_git(""));
+        assert!(in_git(".git") && in_git("a/.git") && in_git("a/.git/b"));
+    }
+
+    #[test]
+    fn the_limits_of_a_change_set_are_exact() {
+        let before = tree(SOURCE);
+        let add = |n: usize| {
+            let mut t = before.clone();
+            t.extend((0..n).map(|i| (format!("n{i}"), Sig::Dir)));
+            t
+        };
+        assert_eq!(
+            change_set(&before, &add(MAX_ARTIFACTS))
+                .unwrap()
+                .added
+                .len(),
+            MAX_ARTIFACTS
+        );
+        assert_eq!(
+            change_set(&before, &add(MAX_ARTIFACTS + 1)),
+            Err(Unkept::TooMany)
+        );
+        // changed and removed entries share a limit
+        let big = |n: usize| -> BTreeMap<String, Sig> {
+            (0..n)
+                .map(|i| (format!("f{i}"), Sig::File("1".into())))
+                .chain([("keep".to_string(), Sig::File("1".into()))])
+                .collect()
+        };
+        let changed_one = |n: usize| {
+            let mut t = BTreeMap::new();
+            t.insert("keep".to_string(), Sig::File("2".into()));
+            (big(n), t)
+        };
+        let (b, a) = changed_one(MAX_CHANGES - 1);
+        let c = change_set(&b, &a).unwrap();
+        assert_eq!((c.modified.len(), c.removed.len()), (1, MAX_CHANGES - 1));
+        let (b, a) = changed_one(MAX_CHANGES);
+        assert_eq!(change_set(&b, &a), Err(Unkept::TooMany));
+    }
+
+    #[test]
+    fn every_reason_not_to_keep_reads_differently() {
+        let all = [
+            Unkept::TypeChange("p1".into()),
+            Unkept::Git("p2".into()),
+            Unkept::Link {
+                path: "p3".into(),
+                target: "/t".into(),
+            },
+            Unkept::TooMany,
+            Unkept::Unreadable("why".into()),
+        ];
+        let texts: BTreeSet<String> = all.iter().map(|u| u.to_string()).collect();
+        assert_eq!(texts.len(), all.len());
+        assert!(all[0].to_string().contains("p1"));
+        assert!(all[1].to_string().contains("p2"));
+        assert!(all[2].to_string().contains("p3") && all[2].to_string().contains("/t"));
+        assert!(all[3].to_string().contains("too many"));
+        assert!(all[4].to_string().contains("why"));
+    }
+
+    #[test]
+    fn a_link_is_kept_only_while_it_stays_in_the_workspace() {
+        let roots = vec!["/w/b".to_string(), "/private/w/b".to_string()];
+        let plan = |link: &str, target: &str| link_plan(link, target, &roots);
+        // relative: the shape a workspace install makes, out of the added
+        // tree but inside the workspace
+        assert_eq!(plan("node_modules/a", "../packages/a"), LinkPlan::Keep);
+        assert_eq!(plan("node_modules/.bin/x", "../dep/bin.js"), LinkPlan::Keep);
+        assert_eq!(plan("a", "b"), LinkPlan::Keep);
+        assert_eq!(plan("a", "./b/../c"), LinkPlan::Keep);
+        assert_eq!(plan("a", ""), LinkPlan::Keep);
+        assert_eq!(plan("d/a", ".."), LinkPlan::Keep);
+        assert_eq!(plan("a", ".."), LinkPlan::Refuse);
+        assert_eq!(plan("d/a", "../../x"), LinkPlan::Refuse);
+        assert_eq!(plan("d/a", "x/../../../y"), LinkPlan::Refuse);
+        // absolute, into the builder's workspace: said relative to the link
+        let rewrite = |s: &str| LinkPlan::Rewrite(s.to_string());
+        assert_eq!(plan("a", "/w/b/x/y"), rewrite("x/y"));
+        assert_eq!(
+            plan("node_modules/.bin/x", "/w/b/node_modules/dep/bin.js"),
+            rewrite("../../node_modules/dep/bin.js")
+        );
+        assert_eq!(plan("d/a", "/private/w/b/x"), rewrite("../x"));
+        assert_eq!(plan("a", "/w/b"), rewrite("."));
+        assert_eq!(plan("a", "/w/b/"), rewrite("."));
+        assert_eq!(plan("d/a", "/w/b"), rewrite(".."));
+        assert_eq!(plan("a", "/w/b/x/./y/../z"), rewrite("x/z"));
+        // absolute, elsewhere: a path that only begins like the root too
+        assert_eq!(plan("a", "/etc/hosts"), LinkPlan::Refuse);
+        assert_eq!(plan("a", "/w/bb/x"), LinkPlan::Refuse);
+        assert_eq!(plan("a", "/w/b/../x"), LinkPlan::Refuse);
+        assert_eq!(link_plan("a", "/w/b/x", &[]), LinkPlan::Refuse);
+    }
+
+    #[test]
+    fn templates_go_by_age_by_their_run_and_then_least_recently_used() {
+        let k = |name: &str, bytes: u64, used: u64| Kept {
+            name: name.into(),
+            bytes,
+            last_used_ms: used,
+            run_gone: false,
+            pinned: false,
+        };
+        let l = Limits {
+            max_bytes: 100,
+            max_age_ms: 1_000,
+            run_idle_ms: 10,
+        };
+        let now = 5_000;
+        let none: [&str; 0] = [];
+        assert_eq!(evictions(&[], now, &l), none);
+        // age: the limit itself is still kept
+        let aged = [k("at", 1, 4_000), k("over", 1, 3_999), k("new", 1, 5_000)];
+        assert_eq!(evictions(&aged, now, &l), ["over"]);
+        // a clock that went back makes nothing old
+        assert_eq!(evictions(&[k("ahead", 1, 9_000)], now, &l), none);
+        // a run that is gone: after its own, shorter, time without use
+        let gone = |name: &str, used: u64| Kept {
+            run_gone: true,
+            ..k(name, 1, used)
+        };
+        let runs = [
+            gone("idle", 4_989),
+            gone("just", 4_990),
+            k("other", 1, 4_989),
+        ];
+        assert_eq!(evictions(&runs, now, &l), ["idle"]);
+        // size: the least recently used go until the rest fits; equal times
+        // go by name; a store exactly at its size keeps everything
+        let full = [
+            k("b", 40, 4_500),
+            k("a", 40, 4_500),
+            k("c", 40, 4_800),
+            k("d", 20, 4_900),
+        ];
+        assert_eq!(evictions(&full, now, &l), ["a"]);
+        let fits = [k("a", 60, 4_500), k("b", 40, 4_600)];
+        assert_eq!(evictions(&fits, now, &l), none);
+        let over = [k("a", 60, 4_500), k("b", 41, 4_600)];
+        assert_eq!(evictions(&over, now, &l), ["a"]);
+        // what an old template held does not count against the others
+        let mixed = [k("old", 90, 0), k("a", 60, 4_500), k("b", 40, 4_600)];
+        assert_eq!(evictions(&mixed, now, &l), ["old"]);
+        // a pinned template stays, whatever its age, and still counts
+        let pin = |x: Kept| Kept { pinned: true, ..x };
+        let pinned = [pin(k("old", 90, 0)), k("a", 30, 4_500), k("b", 5, 4_600)];
+        assert_eq!(evictions(&pinned, now, &l), ["a"]);
+        let all = [pin(k("p", 200, 4_000)), pin(gone("q", 0))];
+        assert_eq!(evictions(&all, now, &l), none);
+    }
+
+    #[test]
+    fn a_changed_entry_replaces_only_what_the_builder_started_from() {
+        assert_eq!(
+            place_modified(Some("new"), "base", "new"),
+            Place::AlreadyThere
+        );
+        assert_eq!(place_modified(Some("base"), "base", "new"), Place::Copy);
+        assert_eq!(place_modified(Some("else"), "base", "new"), Place::Conflict);
+        assert_eq!(place_modified(None, "base", "new"), Place::Conflict);
+        // a removed entry goes only when it is what was there
+        assert_eq!(place_removed(false, false, None, Some("b")), Gone::Already);
+        assert_eq!(place_removed(false, true, None, None), Gone::Already);
+        assert_eq!(
+            place_removed(true, false, Some("b"), Some("b")),
+            Gone::Remove
+        );
+        assert_eq!(
+            place_removed(true, false, Some("c"), Some("b")),
+            Gone::Conflict
+        );
+        assert_eq!(place_removed(true, false, None, Some("b")), Gone::Conflict);
+        assert_eq!(
+            place_removed(true, true, Some("b"), Some("b")),
+            Gone::Conflict
+        );
+        assert_eq!(place_removed(true, true, None, None), Gone::Remove);
+        assert_eq!(place_removed(true, false, Some("b"), None), Gone::Conflict);
     }
 
     #[test]
@@ -1105,6 +1838,7 @@ mod tests {
             BuildEnd::TimedOut,
             BuildEnd::Cancelled,
             BuildEnd::Crashed("why".into()),
+            BuildEnd::NotKept("because".into()),
         ];
         let texts: BTreeSet<String> = all.iter().map(BuildEnd::describe).collect();
         assert_eq!(texts.len(), all.len());
@@ -1115,6 +1849,10 @@ mod tests {
             .describe()
             .contains('9'));
         assert!(BuildEnd::Crashed("why".into()).describe().contains("why"));
+        assert!(BuildEnd::NotKept("because".into())
+            .describe()
+            .contains("because"));
+        assert!(!BuildEnd::NotKept("because".into()).is_built());
         assert!(BuildEnd::TimedOut.describe().contains("timed out"));
         assert!(BuildEnd::Cancelled.describe().contains("cancelled"));
     }
