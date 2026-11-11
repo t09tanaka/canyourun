@@ -10,7 +10,7 @@ use crate::proto_common;
 use proto_common::client_cfg;
 use remote_task_runner::error::{ApiError, ErrorCode};
 use remote_task_runner::ids::*;
-use remote_task_runner::platform::{signal_pid, signal_process_group};
+use remote_task_runner::platform::signal_pid;
 use remote_task_runner::protocol::transport::duplex_pair;
 use remote_task_runner::protocol::{connect, CallError, Client};
 use remote_task_runner::state::{AttemptState, Outcome};
@@ -218,10 +218,6 @@ fn kill_pid(pid: i32) {
     if let Ok(p) = u32::try_from(pid) {
         signal_pid(p, libc::SIGKILL);
     }
-}
-
-fn kill_group(pgid: i32) {
-    signal_process_group(pgid, libc::SIGKILL);
 }
 
 fn pgrep(pattern: &str) -> Vec<i32> {
@@ -673,6 +669,9 @@ async fn a24_a_changed_boot_id_interrupts_everything_and_a_retry_runs() {
     submit(&c, &running, &p_running).await;
     wait_for("the command", || read_pid(&pidfile).is_some());
     let pid = read_pid(&pidfile).unwrap();
+    // Read while the command runs: what the simulated restart kills is this
+    // process and its group, never whatever has the number later.
+    let pid_start = crate::common::identity_of(pid as u32).expect("the running command");
 
     // A second attempt is accepted but still waits for its secret bundle.
     f.host.secrets_ready.store(false, Ordering::SeqCst);
@@ -691,7 +690,7 @@ async fn a24_a_changed_boot_id_interrupts_everything_and_a_retry_runs() {
     for s in f.supervisors(&running) {
         kill_pid(s);
     }
-    kill_group(pid);
+    crate::common::kill_recorded_group(pid as u32, &pid_start);
     wait_for("the processes to die", || {
         f.supervisors(&running).is_empty() && !alive(pid)
     });

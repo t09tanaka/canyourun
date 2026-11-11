@@ -1325,10 +1325,10 @@ mod identity_tests {
 
     #[test]
     fn a_later_look_never_replaces_a_leader_that_ended_or_is_known() {
-        let ended = target(77, Leader::Ended);
-        let known = target(77, Leader::Known("linux:5".into()));
-        let unread = target(77, Leader::Unread);
-        let other = target(77, Leader::Known("linux:9".into()));
+        let ended = target(0x7fff_fff0, Leader::Ended);
+        let known = target(0x7fff_fff0, Leader::Known("linux:5".into()));
+        let unread = target(0x7fff_fff0, Leader::Unread);
+        let other = target(0x7fff_fff0, Leader::Known("linux:9".into()));
         // The PID was seen free (or with the command): what has it later is
         // not the command.
         for old in [&ended, &known] {
@@ -1349,7 +1349,7 @@ mod identity_tests {
         assert_eq!(refreshed(None, Some(known.clone())), Some(known.clone()));
         assert_eq!(refreshed(None, None), None);
         // Another child (another PID) is another target.
-        let next = target(78, Leader::Known("linux:9".into()));
+        let next = target(0x7fff_fff1, Leader::Known("linux:9".into()));
         assert_eq!(
             refreshed(Some(ended.clone()), Some(next.clone())),
             Some(next)
@@ -1358,22 +1358,22 @@ mod identity_tests {
 
     #[test]
     fn a_reaped_leader_keeps_only_the_identity_read_while_it_ran() {
-        let known = target(77, Leader::Known("linux:5".into()));
+        let known = target(0x7fff_fff0, Leader::Known("linux:5".into()));
         assert_eq!(
-            reaped_leader(Some(&known), 77),
+            reaped_leader(Some(&known), 0x7fff_fff0),
             Leader::Known("linux:5".into())
         );
         // Another PID, a leader that was never read, or nothing seen: all
         // that is known is that the command ended.
-        assert_eq!(reaped_leader(Some(&known), 78), Leader::Ended);
+        assert_eq!(reaped_leader(Some(&known), 0x7fff_fff1), Leader::Ended);
         assert_eq!(
-            reaped_leader(Some(&target(77, Leader::Unread)), 77),
+            reaped_leader(Some(&target(0x7fff_fff0, Leader::Unread)), 0x7fff_fff0),
             Leader::Ended
         );
         assert_eq!(
-            reaped_leader(Some(&target(77, Leader::Ended)), 77),
+            reaped_leader(Some(&target(0x7fff_fff0, Leader::Ended)), 0x7fff_fff0),
             Leader::Ended
         );
-        assert_eq!(reaped_leader(None, 77), Leader::Ended);
+        assert_eq!(reaped_leader(None, 0x7fff_fff0), Leader::Ended);
     }
 }
