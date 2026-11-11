@@ -11,9 +11,9 @@ use crate::ids::{
     WorkerBootId, WorkerId,
 };
 use crate::wire::{
-    AttemptPayload, Confidence, Coverage, ForecastField, ForecastRequest, ForecastResponse,
-    ForecastTarget, RuntimeSource, SchemaVersion, Uncertainty, WaitReason, WorkloadNode,
-    WorkloadPlan,
+    AttemptPayload, Confidence, Coverage, ForecastField, ForecastRanking, ForecastRequest,
+    ForecastResponse, ForecastTarget, RuntimeSource, SchemaVersion, Uncertainty, WaitReason,
+    WorkloadNode, WorkloadPlan,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use task_traffic_controller::admit::State;
@@ -543,6 +543,10 @@ pub fn to_wire(fc: &ttc::Forecast, w: &Wiring) -> Result<ForecastResponse, Conve
             wait_reason: waits,
             assumptions,
             null_reasons,
+            ranking: t.ranking.as_ref().map(|r| ForecastRanking {
+                start_in_ms: r.start_in_ms,
+                finish_in_ms: r.finish_in_ms,
+            }),
         },
     })
 }
@@ -1232,6 +1236,7 @@ mod tests {
                 wait_reason: None,
                 assumptions: vec![],
                 null_reasons: BTreeMap::new(),
+                ranking: None,
             },
         }
     }
@@ -1382,6 +1387,8 @@ mod tests {
             vec!["no new external load".to_string(), "extra".to_string()]
         );
         assert_eq!(r.ttl_ms, 2000);
+        // A measured answer carries no ranking.
+        assert_eq!(r.target.ranking, None);
         let plain = convert(
             &forecast_of(&Digest::of_bytes(b"l").to_string(), vec![]),
             &Notes::default(),
@@ -1397,6 +1404,41 @@ mod tests {
         )
         .unwrap();
         assert_eq!(r.target.assumptions.len(), 1);
+    }
+
+    #[test]
+    fn the_fallback_ranking_is_carried_as_it_is_and_never_as_a_time() {
+        let mut fc = forecast_of(&Digest::of_bytes(b"l").to_string(), vec![]);
+        let t = &mut fc.target.timing;
+        t.execution_ms = None;
+        t.finish_in_ms = None;
+        t.ranking = Some(ttc::Ranking {
+            start_in_ms: Some(7),
+            finish_in_ms: Some(67),
+            note: "fallback".into(),
+        });
+        let r = convert(&fc, &Notes::default()).unwrap();
+        assert_eq!(
+            r.target.ranking,
+            Some(ForecastRanking {
+                start_in_ms: Some(7),
+                finish_in_ms: Some(67),
+            })
+        );
+        assert_eq!(r.target.finish_in_ms, None);
+        fc.target.timing.ranking = Some(ttc::Ranking {
+            start_in_ms: None,
+            finish_in_ms: None,
+            note: String::new(),
+        });
+        let r = convert(&fc, &Notes::default()).unwrap();
+        assert_eq!(
+            r.target.ranking,
+            Some(ForecastRanking {
+                start_in_ms: None,
+                finish_in_ms: None,
+            })
+        );
     }
 
     #[test]
