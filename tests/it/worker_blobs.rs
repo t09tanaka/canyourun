@@ -3175,3 +3175,58 @@ fn a_bundle_with_the_snapshot_of_a_submodule_at_another_commit_sets_no_ref() {
     assert!(verify(sink, &l, &second.source, second.refs()).ready);
     assert_ne!(git(&clones[0], &["for-each-ref"]), before);
 }
+
+#[test]
+fn a_manifest_that_names_a_commit_or_a_tree_by_something_else_is_refused() {
+    use local_ci::source::seal_manifest;
+    use remote_task_runner::source::classify::source_id_of_ci;
+    let f = fx();
+    let (_, p) = small_project(&f);
+    let m = f.machine();
+    let (sink, l) = (m.blobs().unwrap(), limits());
+    let not_an_id = || Some("--upload-pack=x".to_string());
+    let edits: [fn(&mut CiManifest, Option<String>); 4] = [
+        |m, v| m.execution_commit = v,
+        |m, v| m.merge_base = v,
+        |m, v| m.index_tree = v,
+        |m, v| m.worktree_tree = v,
+    ];
+    for edit in edits {
+        let mut forged = p.root.clone();
+        edit(&mut forged, not_an_id());
+        let forged = seal_manifest(forged);
+        let source = source_id_of_ci(&forged.source_id).unwrap();
+        let bytes = serde_json::to_vec(&forged).unwrap();
+        let e = put_all(sink, &l, &source, Manifest, &bytes).unwrap_err();
+        assert_eq!(e.code, ErrorCode::InvalidInput, "{e:?}");
+        assert!(e.message.contains("not an id"), "{}", e.message);
+        assert!(f.staged(&source).is_empty());
+    }
+}
+
+#[test]
+fn an_old_bundle_file_that_cannot_be_removed_does_not_fail_the_export() {
+    use remote_task_runner::source::store::MAX_BUNDLES_PER_SOURCE;
+    let f = fx();
+    let (_, p) = small_project(&f);
+    let store = f.parent();
+    let ctx = ExecContext::new(f.env());
+    // Something under the name of a bundle of the source that is no file,
+    // and older than every bundle: the first to go, and it does not go.
+    let stuck = store.root().join("bundles").join(format!(
+        "{}-{}.bundle",
+        p.root.source_id,
+        "0".repeat(32)
+    ));
+    std::fs::create_dir(&stuck).unwrap();
+    std::fs::File::open(&stuck)
+        .unwrap()
+        .set_modified(std::time::UNIX_EPOCH + Duration::from_secs(1_000_000_000))
+        .unwrap();
+    for i in 0..MAX_BUNDLES_PER_SOURCE {
+        let have = vec![format!("{:040x}", i + 1)];
+        let dest = store.export_bundle(&ctx, &p.root, &have).unwrap();
+        assert!(dest.is_file());
+    }
+    assert!(stuck.is_dir());
+}
