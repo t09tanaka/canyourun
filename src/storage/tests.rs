@@ -3047,3 +3047,57 @@ fn a_step_1_coordinator_database_with_rows_is_read_as_it_is_and_upgraded_once() 
     assert_eq!(ro.task_cancel_requested(&queued_task).unwrap(), Some(11));
     assert!(queued(&ro).is_empty());
 }
+
+#[test]
+fn the_termination_and_the_result_are_one_commit() {
+    let w = wx();
+    let a = accepted(&w);
+    let id = &a.attempt_id;
+    drive(&w, id, &[AttemptState::Preparing, AttemptState::Finalizing]);
+    let of = |t: &Termination| json!({ "termination": t });
+    // A result that cannot be stored leaves the attempt as it was.
+    let e = w
+        .store
+        .finalize_with_result(id, done(Outcome::Succeeded), 9, |_| json!({"x": 1.5}))
+        .unwrap_err();
+    assert!(matches!(e, StorageError::Invalid(_)), "{e:?}");
+    let rec = w.store.get(id).unwrap().unwrap();
+    assert_eq!(
+        (rec.state, rec.termination),
+        (AttemptState::Finalizing, None)
+    );
+    assert_eq!(w.store.get_result(id).unwrap(), None);
+    // Both at once.
+    let (fin, result, fresh) = w
+        .store
+        .finalize_with_result(id, done(Outcome::Succeeded), 9, of)
+        .unwrap();
+    assert_eq!(
+        (fin, fresh),
+        (Finalized::Won(done(Outcome::Succeeded)), true)
+    );
+    assert_eq!(result, of(&done(Outcome::Succeeded)));
+    assert_eq!(w.store.get_result(id).unwrap(), Some(result.clone()));
+    // Again, with another termination: the first holds, and so does its result.
+    let (fin, again, fresh) = w
+        .store
+        .finalize_with_result(id, done(Outcome::Failed), 10, of)
+        .unwrap();
+    assert_eq!(
+        (fin, fresh),
+        (Finalized::AlreadyTerminal(done(Outcome::Succeeded)), false)
+    );
+    assert_eq!(again, result);
+    // An attempt whose termination was fixed alone gets its result built
+    // from that termination.
+    let b = accepted(&w);
+    let id = &b.attempt_id;
+    drive(&w, id, &[AttemptState::Preparing, AttemptState::Finalizing]);
+    w.store.finalize(id, done(Outcome::Failed), 9).unwrap();
+    let (fin, result, fresh) = w
+        .store
+        .finalize_with_result(id, done(Outcome::Succeeded), 10, of)
+        .unwrap();
+    assert_eq!((fin.won(), fresh), (false, true));
+    assert_eq!(result, of(&done(Outcome::Failed)));
+}

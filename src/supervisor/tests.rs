@@ -2164,3 +2164,63 @@ fn only_a_source_that_is_not_there_is_a_missing_artifact() {
     let e = store_artifact(&w.root, &a, &w.ws, &input("a", &w.ws), 100).unwrap_err();
     assert_eq!(not_stored_reason(&e), NotStoredReason::Refused);
 }
+
+/// The attempt is never terminal without its result: a reader that asks for
+/// the result the moment the attempt has ended (the agent does, for the
+/// coordinator) gets the stored one, with its artifacts, and never the
+/// bare termination of an attempt that has none. Here the write of the
+/// result is made to fail, which is the state every reader saw for an
+/// instant while the termination and the result were two commits.
+#[test]
+fn an_attempt_is_not_terminal_before_its_result_is_stored() {
+    let w = wk();
+    let a = accept(&w);
+    let s = AttemptSpool::open(&w.root, &a, BIG).unwrap();
+    let src = w.ws.join("f");
+    fs::write(&src, b"art").unwrap();
+    let art = store_artifact(&w.root, &a, &w.ws, &input("r.txt", &src), 10).unwrap();
+    let db = w._dir.path().join("state").join("worker.db");
+    let other = rusqlite::Connection::open(&db).unwrap();
+    other
+        .execute_batch(
+            "CREATE TRIGGER no_result BEFORE UPDATE OF result_json ON worker_attempt
+             WHEN NEW.result_json IS NOT NULL
+             BEGIN SELECT RAISE(ABORT, \x27the result cannot be written\x27); END;",
+        )
+        .unwrap();
+    let finish = || {
+        finish_attempt(
+            &w.store,
+            &w.root,
+            &a,
+            &s,
+            cancelled(),
+            std::slice::from_ref(&art),
+            50,
+        )
+    };
+    finish().unwrap_err();
+    let rec = w.store.get(&a).unwrap().unwrap();
+    assert_eq!(
+        (rec.state, rec.termination),
+        (AttemptState::Finalizing, None),
+        "terminal without a result: {:?}",
+        w.store.get_result(&a).unwrap()
+    );
+    assert!(w
+        .store
+        .events_of(&a, "attempt_terminal")
+        .unwrap()
+        .is_empty());
+    // Once the result can be written, both are there, in one step.
+    other.execute_batch("DROP TRIGGER no_result").unwrap();
+    let rec = finish().unwrap();
+    assert!(rec.fresh && rec.finalized);
+    assert_eq!(rec.result["artifacts"][0]["name"], "r.txt");
+    assert_eq!(w.store.get_result(&a).unwrap().unwrap(), rec.result);
+    assert_eq!(
+        w.store.get(&a).unwrap().unwrap().termination,
+        Some(cancelled())
+    );
+    assert_eq!(w.store.events_of(&a, "attempt_terminal").unwrap().len(), 1);
+}

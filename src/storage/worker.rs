@@ -994,42 +994,34 @@ impl WorkerStore {
     /// order or spacing it was built with. Returns whether this call stored it
     /// (`false` for the replay of an equal result).
     pub fn record_result(&self, attempt_id: &AttemptId, result: &Value) -> Result<bool> {
-        let text = canonical_json(result)
-            .map_err(|e| StorageError::Invalid(format!("result is not canonical JSON: {e}")))?;
+        let text = canonical_result(result)?;
+        let a = attempt_id.to_string();
+        self.db.write(move |tx| store_result(tx, a, text))
+    }
+
+    /// Fix the termination ([`Self::finalize`]) and store the result
+    /// ([`Self::record_result`]) in one commit: no reader finds the attempt
+    /// terminal without its result, and when the result cannot be stored the
+    /// attempt is not terminal either. `result` is built from the termination
+    /// that holds (an earlier one wins). Returns it with whether this call
+    /// stored it.
+    pub fn finalize_with_result<F>(
+        &self,
+        attempt_id: &AttemptId,
+        termination: Termination,
+        at_ms: u64,
+        result: F,
+    ) -> Result<(Finalized, Value, bool)>
+    where
+        F: FnOnce(&Termination) -> Value + Send + 'static,
+    {
         let a = attempt_id.to_string();
         self.db.write(move |tx| {
-            let rec = require(tx, &a)?;
-            if !rec.state.is_terminal() {
-                return Err(StorageError::IllegalState {
-                    attempt: a,
-                    state: rec.state,
-                    why: "a result is stored at terminal",
-                });
-            }
-            let existing: Option<String> = tx.query_row(
-                "SELECT result_json FROM worker_attempt WHERE attempt_id = ?1",
-                [&a],
-                |r| r.get(0),
-            )?;
-            match existing {
-                None => {
-                    tx.execute(
-                        "UPDATE worker_attempt SET result_json = ?1 WHERE attempt_id = ?2",
-                        params![text, a],
-                    )?;
-                    Ok(true)
-                }
-                Some(e) => {
-                    let stored: Value = from_json("result", &e)?;
-                    let stored = canonical_json(&stored)
-                        .map_err(|e| StorageError::Corrupt(format!("result: {e}")))?;
-                    if stored == text {
-                        Ok(false)
-                    } else {
-                        Err(StorageError::Immutable(format!("result of {a}")))
-                    }
-                }
-            }
+            let run = require(tx, &a)?.run_id;
+            let fin = common::finalize(tx, ATTEMPT, &a, termination, at_ms, Some(run.as_str()))?;
+            let value = result(&fin.termination());
+            let fresh = store_result(tx, a, canonical_result(&value)?)?;
+            Ok((fin, value, fresh))
         })
     }
 
@@ -1236,4 +1228,46 @@ fn read_log(conn: &Connection, attempt_id: &str, stream: &str) -> Result<LogPosi
             last_seq: to_u64(s)?,
         },
     })
+}
+
+fn canonical_result(result: &Value) -> Result<String> {
+    canonical_json(result)
+        .map_err(|e| StorageError::Invalid(format!("result is not canonical JSON: {e}")))
+}
+
+/// Store `text` as the result of the terminal attempt `a`, unless it has an
+/// equal one already (`false`); another one is refused.
+fn store_result(tx: &rusqlite::Transaction<'_>, a: String, text: String) -> Result<bool> {
+    let rec = require(tx, &a)?;
+    if !rec.state.is_terminal() {
+        return Err(StorageError::IllegalState {
+            attempt: a,
+            state: rec.state,
+            why: "a result is stored at terminal",
+        });
+    }
+    let existing: Option<String> = tx.query_row(
+        "SELECT result_json FROM worker_attempt WHERE attempt_id = ?1",
+        [&a],
+        |r| r.get(0),
+    )?;
+    match existing {
+        None => {
+            tx.execute(
+                "UPDATE worker_attempt SET result_json = ?1 WHERE attempt_id = ?2",
+                params![text, a],
+            )?;
+            Ok(true)
+        }
+        Some(e) => {
+            let stored: Value = from_json("result", &e)?;
+            let stored = canonical_json(&stored)
+                .map_err(|e| StorageError::Corrupt(format!("result: {e}")))?;
+            if stored == text {
+                Ok(false)
+            } else {
+                Err(StorageError::Immutable(format!("result of {a}")))
+            }
+        }
+    }
 }

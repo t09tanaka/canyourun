@@ -536,8 +536,10 @@ impl SpoolEnd<'_> {
     }
 }
 
-/// Close the attempt's spool, reference its files, fix its termination and
-/// store its result: in that order, so a crash at any point leaves a state
+/// Close the attempt's spool, reference its files, then fix its termination
+/// and store its result in one commit (an attempt is never terminal without
+/// its result, so nobody reads a result that lacks its artifacts): in that
+/// order, so a crash at any point leaves a state
 /// that calling this again completes, also from another process: that one
 /// finds the spool closed and passes [`SpoolEnd::Closed`]. The termination in the result is the
 /// one that won (a cancel may have fixed it first). `artifacts` are checked
@@ -625,13 +627,15 @@ pub fn finish_attempt_with<'a>(
             at_ms,
         )?;
     }
-    let fin = store.finalize(attempt, termination, at_ms)?;
-    let fixed = fin.termination();
-    let result = with_not_stored(
-        result_json(&fixed, artifacts, summary(out), summary(err)),
-        not_stored,
-    );
-    let fresh = store.record_result(attempt, &result)?;
+    // One commit: a reader that finds the attempt terminal finds its result.
+    let (artifacts, not_stored) = (artifacts.to_vec(), not_stored.to_vec());
+    let (fin, result, fresh) =
+        store.finalize_with_result(attempt, termination, at_ms, move |fixed| {
+            with_not_stored(
+                result_json(fixed, &artifacts, summary(out), summary(err)),
+                &not_stored,
+            )
+        })?;
     // The stored result is the truth, whichever call stored it: a crash
     // between storing it and the events is repaired by the next call, which
     // writes the events the result implies and the journal lacks.
