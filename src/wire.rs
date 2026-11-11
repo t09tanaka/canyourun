@@ -669,8 +669,10 @@ pub struct AttemptPayload {
     #[serde(default)]
     pub has_secret_bundle: bool,
     /// The files to keep as artifacts. Part of the hash like every other
-    /// field: the same attempt with another list is another payload.
-    #[serde(default)]
+    /// field: the same attempt with another list is another payload. An
+    /// empty list is not written, so a payload that declares none has the
+    /// canonical JSON, and the hash, it had before this field existed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub artifacts: Vec<ArtifactDecl>,
 }
 
@@ -2698,6 +2700,48 @@ mod tests {
         assert!(p.permit_id.is_none() && p.deadline_ms.is_none() && !p.has_secret_bundle);
         assert!(p.artifacts.is_empty());
         assert!(p.command_timeout_ms.is_none() && p.resource_wait_timeout_ms.is_none());
+    }
+
+    #[test]
+    fn a_payload_that_declares_no_artifact_hashes_as_it_did_before_the_field_existed() {
+        // The canonical JSON of a payload as it was written before
+        // `artifacts` existed, and its sha256 as `shasum -a 256` gives it for
+        // this text: neither is made by the code under test.
+        const BEFORE: &str = concat!(
+            r#"{"command_timeout_ms":900000,"commands":[{"argv":["cargo","test"],"cwd":".","#,
+            r#""depends_on":[],"env":{"A":"1"},"node_id":"test","timeout_ms":1000}],"#,
+            r#""deadline_ms":3600000,"generation":1,"has_secret_bundle":true,"lease_ms":60000,"#,
+            r#""manifest_digest":"sha256:05b3abf2579a5eb66403cd78be557fd860633a1fe2103c7642030defe32c657f","#,
+            r#""permit_id":"prm_01M7504XASTK1991EQX42PKD7Z","#,
+            r#""plan_digest":"sha256:64879f7d6b960a01909762d911a32d4582c20010c5641ee90278b644a9e3b525","#,
+            r#""resource_wait_timeout_ms":120000,"run_id":"run_01M7504XAQM2RZM2XYFW5CMF0K","#,
+            r#""source_id":"src_01M7504XARC37Y0Q3RZKMHWV1M","task_id":"task_01M7504XARCRQ0DSP7KFQH1VYM"}"#,
+        );
+        const HASH: &str =
+            "sha256:9b76c5e57787b5f8d9c047613dd4986ccafc47d3bc9b65b50be0fd84c80be3b0";
+        // Without the field, and with an empty list: the same payload.
+        let absent: AttemptPayload = serde_json::from_str(BEFORE).unwrap();
+        let mut with_empty: Value = serde_json::from_str(BEFORE).unwrap();
+        with_empty["artifacts"] = json!([]);
+        let empty: AttemptPayload = serde_json::from_value(with_empty).unwrap();
+        assert!(absent.artifacts.is_empty());
+        assert_eq!(absent, empty);
+        for p in [&absent, &empty] {
+            let v = serde_json::to_value(p).unwrap();
+            assert!(v.get("artifacts").is_none());
+            assert_eq!(canonical_json(&v).unwrap(), BEFORE);
+            assert_eq!(payload_hash(p).unwrap().to_string(), HASH);
+        }
+        // A declaration is written, and is another payload.
+        let mut declared = absent.clone();
+        declared.artifacts = payload().artifacts;
+        let v = serde_json::to_value(&declared).unwrap();
+        assert_eq!(v["artifacts"].as_array().unwrap().len(), 1);
+        assert_ne!(payload_hash(&declared).unwrap().to_string(), HASH);
+        assert_eq!(
+            serde_json::from_value::<AttemptPayload>(v).unwrap(),
+            declared
+        );
     }
 
     #[test]
