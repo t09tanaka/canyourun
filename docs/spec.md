@@ -634,14 +634,14 @@ spoolに関してsupervisorがevent journalへ書くeventは次のとおりで�
 
 artifactにはname、relative path、size、content digest、source ID、plan digest、attempt ID、profile fingerprintを記録する。親の受取後にhashを検証し、atomicに公開する。必須artifactが揃うまでrunをsuccessにしない。回収失敗で計算済みcommandをやり直さない。
 
-workerでは、supervisorがattemptを確定する前にartifactを保存する。resultは一度保存したら変えず、workspaceはterminalになった時点で消えるためである。supervisorのspecはartifactの一覧（name、workspace内のsource path、欠落時の扱い）と、記録に使うsource ID・plan digest・profile fingerprint、1ファイルの上限（既定1 GiB）を持つ。手順は次のとおりである。
+workerでは、supervisorがattemptを確定する前にartifactを保存する。resultは一度保存したら変えず、workspaceはterminalになった時点で消えるためである。supervisorのspecはartifactの一覧（name、workspace内のsource path、欠落時の扱い）と、記録に使うsource ID・plan digest・profile fingerprint、1ファイルの上限（既定1 GiB）、workspaceに置いたsecret fileの識別子の一覧（`secret_files`。fileごとのdevice番号とinode番号で、agentがmaskする値を読んだのと同じopen済みのfileから取る。省略できず、secret fileが無いattemptでは空の一覧を書く）を持つ。手順は次のとおりである。
 
 1. 開始したcommandがすべて終わり、停止を確認した後（未解決のまま残るattemptでは行わない）、一覧のファイルをworkspaceから `<attempt>/artifacts/<name>` へ写す。commandの成否は問わない（失敗したcommandのreportも残す）。commandを1つも開始しなかったattempt（開始前のcancelなど）では何も探さない。
 2. 保存できたartifactの一覧を、event journalの `artifacts_stored`（attemptに1件）として確定する。
 3. その後にterminationとresultを確定する。resultのartifactは、常に `artifacts_stored` の一覧である。同じentryは、宣言されたが保存できなかったartifactの一覧（`not_stored`）も持ち、resultの `artifacts_not_stored` はこの一覧である。確定の途中でsupervisorが落ちても、次に確定する者（workspaceが既に無くてもよい）が同じ一覧をresultに入れる。`artifacts_stored` が読めないときは「artifactなし」とは扱わず、確定を失敗させる。
 4. `artifacts_stored` に載らなかったファイル（一覧の確定前に落ちたsupervisorが写したもの）は、どのresultにも参照にも入らないので、確定の時点で `<attempt>/artifacts` から消す。spoolを使わずに確定するattempt（resultを持たない）では、保存済みのartifactもすべて消す。
 
-保存できなかったartifact（ファイルが無い、通常ファイルでない、symlinkを経由する、上限を超える、同名で内容が違う等）は一覧から外し、event `artifact_not_stored`（`name`、maskした理由 `why`。nameごとに1回）を書く。attemptのterminationは変えない。必須artifactの欠落でrunを失敗にするかどうかは、親が判定する。workerは判定の材料だけをresultに残す。保存できなかった宣言は、resultの `artifacts_not_stored` に `name`、宣言の `path`、`if_missing`（`required`／`optional`）、`reason` を持つ項目として載る。`reason` は、宣言のpathに何も無いとき（ファイル、または途中のdirectoryが無い）`missing`、それ以外（通常ファイルでない、symlinkを経由する、上限を超える、同名で内容が違う）は `refused` である。全部保存できたattemptのresultは `artifacts_not_stored` を持たない（`get_result` の応答では空の一覧）。commandを1つも開始しなかったattemptは何も探さないので、`artifacts` も `artifacts_not_stored` も空である。`artifacts_not_stored` はresultの一部としてresult digestに含まれ、resultと同じく一度保存したら変えない。一覧は1024件までとし、nameが管理領域の相対pathとして使えないもの、nameどうしが衝突するもの、sourceがworkspaceの外を指すものは、commandを開始する前にspecごと拒否する。
+保存できなかったartifact（ファイルが無い、通常ファイルでない、symlinkを経由する、上限を超える、同名で内容が違う、attemptのsecret fileそのものである、secretの値を含む等）は一覧から外し、event `artifact_not_stored`（`name`、maskした理由 `why`。nameごとに1回）を書く。attemptのterminationは変えない。必須artifactの欠落でrunを失敗にするかどうかは、親が判定する。workerは判定の材料だけをresultに残す。保存できなかった宣言は、resultの `artifacts_not_stored` に `name`、宣言の `path`、`if_missing`（`required`／`optional`）、`reason` を持つ項目として載る。`reason` は、宣言のpathに何も無いとき（ファイル、または途中のdirectoryが無い）`missing`、それ以外（通常ファイルでない、symlinkを経由する、上限を超える、同名で内容が違う、secret fileそのものである、secretの値を含む、保存先に書けない）は `refused` である。`missing` は宣言のpath側に何も無いときだけで、保存先のdirectoryが無いといった保存側の失敗は `refused` である。全部保存できたattemptのresultは `artifacts_not_stored` を持たない（`get_result` の応答では空の一覧）。commandを1つも開始しなかったattemptは何も探さないので、`artifacts` も `artifacts_not_stored` も空である。`artifacts_not_stored` はresultの一部としてresult digestに含まれ、resultと同じく一度保存したら変えない。一覧は1024件までとし、nameが管理領域の相対pathとして使えないもの、nameどうしが衝突するもの、sourceがworkspaceの外を指すものは、commandを開始する前にspecごと拒否する。
 
 **artifactの宣言の経路**: 親はattempt payloadの `artifacts` でartifactを宣言する。1件は `name`、`path`、`if_missing` を持つ。
 
@@ -651,7 +651,7 @@ workerでは、supervisorがattemptを確定する前にartifactを保存する�
 | `path` | commandがファイルを残す場所。workspace rootからの相対path（secret_filesのpathと同じ基準） |
 | `if_missing` | ファイルが無かったときの扱い。`required` または `optional`。省略できない |
 
-`artifacts` はpayloadの他の欄と同じく `payload_hash` に含まれる。同じattempt IDで宣言（name・path・`if_missing`・並び順のどれか）が違うsubmitは、別のpayloadとして `CONFLICT` になる。宣言が無いattemptでは、agentは一覧の無いspecを書く。
+`artifacts` はpayloadの他の欄と同じく `payload_hash` に含まれる。宣言が1件も無いpayloadは `artifacts` を書かない（空の一覧も書かない）ので、そのcanonical JSONと `payload_hash` は、この欄が無かったときのものと同じである。同じattempt IDで宣言（name・path・`if_missing`・並び順のどれか）が違うsubmitは、別のpayloadとして `CONFLICT` になる。宣言が無いattemptでは、agentは一覧の無いspecを書く。
 
 workerは受理の時点で宣言を検査し、次のものを `INVALID_INPUT` として何も保存しない。
 
@@ -664,7 +664,17 @@ workerは受理の時点で宣言を検査し、次のものを `INVALID_INPUT` 
 
 `name` どうし、`path` どうし、`path` とsecret fileのpathは、NFCと小文字にそろえた形で比べる（大文字小文字を区別しないfile systemで同じファイルになるものは同じとみなす）。
 
-secret fileとの照合には、attemptのsource manifestがworkerのstoreに要る。受理の時点でsourceがworkerに届いていれば受理の時点で照合する。届いていなければ、workspaceを作った後、supervisorのspecを書く前に同じ照合を行い、一致する宣言があればcommandを1つも開始せずattemptをfailedにする（event `agent_prepare_failed`、code `INVALID_INPUT`）。この時点でもsource manifestが読めないときは、照合できないまま開始せず、同じくfailedにする。どちらの場合も、secret fileを指す宣言のcommandは開始しない。
+secret fileとの照合には、attemptのsource manifestがworkerのstoreに要る。受理の時点でsourceがworkerに届いていれば受理の時点で照合する。届いていなければ、workspaceを作った後、supervisorのspecを書く前に同じ照合を行い、一致する宣言があればcommandを1つも開始せずattemptをfailedにする（event `agent_prepare_failed`、code `INVALID_INPUT`）。この時点でもsource manifestが読めないときは、照合できないまま開始せず、同じくfailedにする。このときのcodeは読めなかった理由による。sourceがworkerのstoreに無ければ `NOT_FOUND`、storeにあるmanifestがpayloadの `manifest_digest` と違えば `CONFLICT`、storeが読めなければ `INTERNAL` である。どの場合も、secret fileを指す宣言のcommandは開始しない。
+
+受理を後の照合へ回すのは、sourceがまだworkerのstoreに無い場合だけである。受理の時点でsourceはあるがmanifestがpayloadの `manifest_digest` と違う（`CONFLICT`）、またはstoreが読めない（`INTERNAL`）ときは、submitをそのcodeで拒否し、何も保存しない。artifactを宣言しないpayloadでは、受理の時点でsource manifestを読まない。
+
+**secretをartifactにしない保証の範囲**: workerが保証するのは次の3つで、これ以外は検出しない。
+
+1. 宣言の `path` がsecret fileのpathと同じ（上の比べ方で）なら、受理または開始前に拒否する。早く分かりやすく断るための検査で、これだけでは足りない（NFCと小文字化は、file systemの大文字小文字の畳み込みと同じではない。`ſ` と `s`、`ß` と `ss` などは別の名前として通る）。
+2. supervisorは、保存するために開いたfileそのもののdevice番号とinode番号を、specの `secret_files` と比べる。一致すれば保存しない（`refused`）。名前は問わないので、file systemが同じfileとして開く別の綴り、hard link、renameしたsecret fileはここで止まる。
+3. supervisorは、写しながら内容を調べ、logでmaskする値（secret fileの `KEY=VALUE` の値のうち、maskできる長さがあり、ありふれた語でないもの）のどれかを含むartifactを保存しない（`refused`。一時fileも残さない）。値が読み取りの区切りをまたいでも見つける。
+
+検出しないもの: maskする値を持たないsecret file（`KEY=VALUE` 形式でないもの、値が短いかありふれた語であるもの）の写し、変換した写し（encode、圧縮、分割、暗号化）、commandがsecret fileを同じ内容の別fileに置き換えた後の扱い（3の内容の検査だけが残る）。3の検査は、secretの値と同じbyte列をたまたま含むartifactも拒否する。event `artifact_not_stored` の `why` は、どの理由で保存しなかったかを言うが、値そのものは含まない。
 
 artifactの記録（`get_result` の `artifacts` の1件）は、name、相対path、size、content digest、source ID、plan digest、attempt ID、profile fingerprintを持つ。相対pathは宣言の `path` ではなく、保存先（`<attempt>/artifacts` からの相対path）で、`name` と同じである。source IDとplan digestはpayloadのもの、profile fingerprintはworkerが `hello` で名乗るものと同じ値である。
 
