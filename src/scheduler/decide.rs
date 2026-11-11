@@ -700,7 +700,7 @@ mod tests {
                 (later.1)(&mut b, &mut a);
             }
             let d = decide(vec![a, b], vec![], flat);
-            assert_eq!(d.winner, Some(w("w-b")), "{:?}", rules[at].0);
+            assert_eq!(d.winner, Some(w("w-b")));
             assert_eq!(d.why, Why::TieBreak(rules[at].0));
         }
         let d = pair(|_, _| {});
@@ -1064,9 +1064,9 @@ mod tests {
             (Blocked, Some(NoCompatibleWorker)),
         ];
         for (code, reason) in moves {
-            assert!(moves_elsewhere(code, reason, true), "{code:?} {reason:?}");
+            assert!(moves_elsewhere(code, reason, true));
             // The first such answer may pass.
-            assert!(!moves_elsewhere(code, reason, false), "{code:?} {reason:?}");
+            assert!(!moves_elsewhere(code, reason, false));
         }
         let stays = [
             (Blocked, Some(SecretUnavailable)),
@@ -1078,7 +1078,7 @@ mod tests {
             (Conflict, None),
         ];
         for (code, reason) in stays {
-            assert!(!moves_elsewhere(code, reason, true), "{code:?} {reason:?}");
+            assert!(!moves_elsewhere(code, reason, true));
         }
     }
 }
