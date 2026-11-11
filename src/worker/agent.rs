@@ -1924,6 +1924,25 @@ impl Agent {
                 "result_digest is not the digest of this attempt's result",
             ));
         }
+        // An attempt without a result can still get one while a supervisor
+        // of it lives, and a result that arrives after the acknowledgement
+        // is not protected. The supervisor holds its lock for as long as it
+        // may store one: the acknowledgement is recorded under that lock,
+        // or not now.
+        let _no_supervisor = if has_result {
+            None
+        } else {
+            match SupervisorLock::try_acquire(&self.cfg.state_dir, &r.attempt_id) {
+                Ok(Some(lock)) => Some(lock),
+                Ok(None) => {
+                    return Err(ApiError::new(
+                        ErrorCode::Overloaded,
+                        "a supervisor of the attempt may still store its result; acknowledge again later",
+                    ))
+                }
+                Err(e) => return Err(internal("supervisor lock", e)),
+            }
+        };
         // A result that is stored between that read and this write is
         // another result than the acknowledged one: refused like a digest
         // that does not match.

@@ -1275,7 +1275,8 @@ fn canonical_result(result: &Value) -> Result<String> {
 }
 
 /// Store `text` as the result of the terminal attempt `a`, unless it has an
-/// equal one already (`false`); another one is refused.
+/// equal one already (`false`); another one is refused, and so is a first
+/// one after the attempt was acknowledged without a result.
 fn store_result(tx: &rusqlite::Transaction<'_>, a: String, text: String) -> Result<bool> {
     let rec = require(tx, &a)?;
     if !rec.state.is_terminal() {
@@ -1291,6 +1292,14 @@ fn store_result(tx: &rusqlite::Transaction<'_>, a: String, text: String) -> Resu
         |r| r.get(0),
     )?;
     match existing {
+        // The parent closed its collection on "this attempt has no result"
+        // and nothing protects what would be stored now: refuse it, so that
+        // the caller fails instead of losing the result silently.
+        None if rec.acked_at_ms.is_some() => Err(StorageError::IllegalState {
+            attempt: a,
+            state: rec.state,
+            why: "the attempt was acknowledged without a result",
+        }),
         None => {
             tx.execute(
                 "UPDATE worker_attempt SET result_json = ?1 WHERE attempt_id = ?2",

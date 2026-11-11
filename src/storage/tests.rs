@@ -1335,6 +1335,14 @@ fn receipts_log_positions_and_results() {
     ));
     assert_eq!(w.store.get_result(id).unwrap(), Some(json!({"ok": 1})));
     assert_eq!(w.store.get_result(&AttemptId::generate()).unwrap(), None);
+    // The result that was acknowledged is stored again as often as it is
+    // asked for; only a first result after the acknowledgement is refused.
+    assert!(w
+        .store
+        .ack_collected_as_read(id, CoordinatorEpoch(1), 10, true)
+        .unwrap());
+    w.store.record_result(id, &json!({"ok": 1})).unwrap();
+    assert_eq!(w.store.get_result(id).unwrap(), Some(json!({"ok": 1})));
 }
 
 #[test]
@@ -1414,6 +1422,25 @@ fn worker_gc_waits_for_the_ack_and_the_retention_and_skips_pins() {
         .store
         .ack_collected(&running, CoordinatorEpoch(1), 1)
         .is_err());
+    // An attempt that was acknowledged without a result takes none any
+    // more: storing one fails, loudly, and nothing is stored.
+    assert_eq!(w.store.get_result(&ids[3]).unwrap(), None);
+    assert!(matches!(
+        w.store.finalize_with_result(
+            &ids[3],
+            done(Outcome::Succeeded),
+            2_005,
+            |t| serde_json::json!({ "termination": t, "artifacts": [] }),
+        ),
+        Err(StorageError::IllegalState { why, .. })
+            if why == "the attempt was acknowledged without a result"
+    ));
+    assert!(matches!(
+        w.store
+            .record_result(&ids[3], &serde_json::json!({"ok": 1})),
+        Err(StorageError::IllegalState { .. })
+    ));
+    assert_eq!(w.store.get_result(&ids[3]).unwrap(), None);
     w.store.pin_blob("r2").unwrap();
     let now = 1_000 + 7 * DAY;
     // r3 would be old enough too; make it recent by giving it a later terminal.
