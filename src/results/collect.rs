@@ -14,6 +14,18 @@
 //! from the same durable facts: the logs from the bytes that are here, an
 //! artifact from the bytes of its `.part` file.
 //!
+//! The acknowledgement is the last step and is never early: it releases the
+//! worker's copy for good. Right before it, everything the collection
+//! recorded is read back from the result store (the result is written
+//! again from its record, each log and each artifact is hashed against its
+//! recorded length and digest) and synced; what is not there as recorded is
+//! collected again instead.
+//!
+//! What goes wrong with one attempt stays with that attempt: the pass goes
+//! on with the others. Only what asking again cannot change counts toward
+//! giving up ([`plan::judge_fault`]); everything else waits, a little
+//! longer each time.
+//!
 //! The acknowledgement is by digest. A worker that holds another result
 //! than the one that was read (an attempt that was settled without a result
 //! can get one later) refuses it; the result is then read again and
@@ -21,17 +33,17 @@
 //! never acknowledged.
 
 use super::plan::{
-    self, ChunkFacts, ChunkVerdict, Fault, FaultVerdict, LogFacts, LogVerdict, LogWait, Progress,
-    RecordFacts, Reread, Standing, Step, Verdict,
+    self, AckRefusal, ChunkFacts, ChunkVerdict, Fault, FaultVerdict, LogFacts, LogVerdict, LogWait,
+    Mismatch, Progress, RecordFacts, Reread, Standing, Step, Verdict,
 };
 use super::store::{ArtifactState, Publish, ResultStore, StoreError};
 use crate::coordinator::{LinkError, WorkerLink};
-use crate::error::ErrorCode;
 use crate::ids::{AttemptId, Digest, NodeId, RequestId, WorkerId};
 use crate::platform::wall_ms;
 use crate::state::{Receipt, Termination};
 use crate::storage::{
-    ArtifactReceipt, AttemptRecord, BlobKind, Collectable, CoordinatorStore, StorageError,
+    ArtifactReceipt, AttemptRecord, BlobKind, Collectable, CoordinatorStore, ResultRef,
+    StorageError,
 };
 use crate::supervisor::spool_plan::relative_path;
 use crate::wire::{
@@ -40,8 +52,9 @@ use crate::wire::{
     Response, SchemaVersion,
 };
 use serde_json::{json, Value};
-use std::collections::BTreeSet;
-use std::sync::Arc;
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use thiserror::Error;
 use tokio::time::Instant;
 
@@ -57,6 +70,10 @@ pub struct CollectConfig {
     pub scan: u32,
     /// How long one pass may take per worker.
     pub budget_ms: u64,
+    /// How long a collection whose worker answered with an error (or whose
+    /// own files failed) waits before its next try; doubled with every wait
+    /// in a row, up to 64 times this.
+    pub backoff_ms: u64,
 }
 
 impl Default for CollectConfig {
@@ -67,6 +84,7 @@ impl Default for CollectConfig {
             max_log_bytes: 1_073_741_824,
             scan: 256,
             budget_ms: 10_000,
+            backoff_ms: 1_000,
         }
     }
 }
@@ -82,6 +100,11 @@ pub struct CollectReport {
     pub gave_up: Vec<AttemptId>,
     /// Still to be continued.
     pub pending: Vec<AttemptId>,
+    /// Of the pending ones: what the parent itself could not do (read the
+    /// payload it sent, write its files or its records). They wait, are
+    /// never acknowledged as they are, and keep nothing else from being
+    /// collected.
+    pub faults: Vec<(AttemptId, String)>,
 }
 
 impl CollectReport {
@@ -90,6 +113,7 @@ impl CollectReport {
         self.required_missing.extend(other.required_missing);
         self.gave_up.extend(other.gave_up);
         self.pending.extend(other.pending);
+        self.faults.extend(other.faults);
     }
 
     fn closed(&mut self, attempt: &AttemptId, verdict: Verdict) {
@@ -116,6 +140,15 @@ pub enum CollectError {
 
 type Result<T, E = CollectError> = std::result::Result<T, E>;
 
+/// Where one pass left a collection.
+enum End {
+    Closed(Verdict),
+    /// To be continued by the next pass.
+    Pending,
+    /// To be continued, after this went wrong.
+    Waits(Fault, String),
+}
+
 /// Where one step left the collection.
 enum Flow {
     /// A step was taken; look again.
@@ -130,24 +163,56 @@ enum Flow {
 struct Declared {
     artifacts: Vec<(String, bool)>,
     node: Option<NodeId>,
-    payload: Option<AttemptPayload>,
+    payload: AttemptPayload,
 }
 
-fn declared_of(payload: &Option<Value>) -> Declared {
-    let payload: Option<AttemptPayload> = payload
-        .as_ref()
-        .and_then(|p| serde_json::from_value(p.clone()).ok());
-    Declared {
+/// What the parent declared is what it sent. Without it nothing is known
+/// about what has to be fetched, and "nothing was declared" would release
+/// the worker's artifacts unfetched: a payload that is not recorded or
+/// cannot be read is a fault, never an empty declaration.
+fn declared_of(payload: &Option<Value>) -> std::result::Result<Declared, &'static str> {
+    let Some(payload) = payload else {
+        return Err("the payload that was sent is not recorded");
+    };
+    let Ok(payload) = serde_json::from_value::<AttemptPayload>(payload.clone()) else {
+        return Err("the payload that was sent cannot be read");
+    };
+    Ok(Declared {
         artifacts: payload
+            .artifacts
             .iter()
-            .flat_map(|p| p.artifacts.iter())
             .map(|d| (d.name.clone(), d.if_missing == MissingPolicy::Required))
             .collect(),
-        node: payload
-            .as_ref()
-            .and_then(|p| p.commands.first())
-            .map(|c| c.node_id.clone()),
+        node: payload.commands.first().map(|c| c.node_id.clone()),
         payload,
+    })
+}
+
+/// The collections that wait before their next try, and until when. In
+/// memory: a parent that starts again tries each once.
+#[derive(Debug, Default)]
+pub struct Waits(Mutex<BTreeMap<AttemptId, (u32, Instant)>>);
+
+impl Waits {
+    fn map(&self) -> std::sync::MutexGuard<'_, BTreeMap<AttemptId, (u32, Instant)>> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn waiting(&self, attempt: &AttemptId) -> bool {
+        self.map()
+            .get(attempt)
+            .is_some_and(|(_, until)| Instant::now() < *until)
+    }
+
+    fn put_off(&self, attempt: &AttemptId, base_ms: u64) {
+        let mut map = self.map();
+        let entry = map.entry(attempt.clone()).or_insert((0, Instant::now()));
+        entry.1 = Instant::now() + Duration::from_millis(plan::backoff_ms(base_ms, entry.0));
+        entry.0 = entry.0.saturating_add(1);
+    }
+
+    fn clear(&self, attempt: &AttemptId) {
+        self.map().remove(attempt);
     }
 }
 
@@ -198,6 +263,7 @@ pub struct Collector {
     store: Arc<CoordinatorStore>,
     files: Arc<ResultStore>,
     cfg: CollectConfig,
+    waits: Arc<Waits>,
 }
 
 impl Collector {
@@ -206,7 +272,18 @@ impl Collector {
         files: Arc<ResultStore>,
         cfg: CollectConfig,
     ) -> Collector {
-        Collector { store, files, cfg }
+        Collector {
+            store,
+            files,
+            cfg,
+            waits: Arc::default(),
+        }
+    }
+
+    /// Use the waits of the passes before this one.
+    pub fn with_waits(mut self, waits: Arc<Waits>) -> Collector {
+        self.waits = waits;
+        self
     }
 
     pub fn config(&self) -> CollectConfig {
@@ -239,7 +316,10 @@ impl Collector {
 
     /// Continue every open collection of `worker` until it is closed, has
     /// to wait, or `deadline` passed. `link` is `None` for a worker that is
-    /// not connected: only what needs no worker is closed then.
+    /// not connected: only what needs no worker is closed then. What fails
+    /// for one attempt is reported for it and the others are continued; the
+    /// pass itself fails only when a newer coordinator took over or the
+    /// open collections cannot be listed.
     pub async fn collect_worker(
         &self,
         worker: &WorkerId,
@@ -250,70 +330,102 @@ impl Collector {
         let open = self.db(move |s| s.collectable(Some(&w), scan)).await?;
         let mut report = CollectReport::default();
         for c in open {
-            self.one(link, c, deadline, &mut report).await?;
+            let a = c.record.attempt_id.clone();
+            if self.waits.waiting(&a) {
+                report.pending.push(a);
+                continue;
+            }
+            let (fault, why) = match self.one(link, &c, deadline).await {
+                Ok(End::Closed(verdict)) => {
+                    self.waits.clear(&a);
+                    report.closed(&a, verdict);
+                    continue;
+                }
+                Ok(End::Pending) => {
+                    report.pending.push(a);
+                    continue;
+                }
+                Ok(End::Waits(fault, why)) => (fault, why),
+                Err(e @ (CollectError::Fenced | CollectError::Aborted)) => return Err(e),
+                Err(e) => (Fault::Local, e.to_string()),
+            };
+            if plan::backs_off(fault) {
+                self.waits.put_off(&a, self.cfg.backoff_ms);
+            }
+            if fault == Fault::Local {
+                report.faults.push((a.clone(), why));
+            }
+            report.pending.push(a);
         }
         Ok(report)
     }
 
+    /// Work on one collection. An `Err` is about this attempt only, unless
+    /// it is `Fenced` or `Aborted`.
     async fn one(
         &self,
         link: Option<&dyn WorkerLink>,
-        c: Collectable,
+        c: &Collectable,
         deadline: Instant,
-        report: &mut CollectReport,
-    ) -> Result<()> {
+    ) -> Result<End> {
         let a = c.record.attempt_id.clone();
-        let declared = declared_of(&c.payload);
+        let declared = match declared_of(&c.payload) {
+            Ok(declared) => declared,
+            Err(why) => return Ok(End::Waits(Fault::Local, why.to_string())),
+        };
         if c.settled_here || !c.record.receipts.reached(Receipt::WorkerAccepted) {
             // No worker holds a result of this attempt: the one the parent
             // fixed is all there is.
             let verdict = self.close_local(&c.record, &declared).await?;
-            report.closed(&a, verdict);
-            return Ok(());
+            return Ok(End::Closed(verdict));
         }
         let Some(link) = link else {
-            report.pending.push(a);
-            return Ok(());
+            return Ok(End::Pending);
         };
         loop {
             if Instant::now() >= deadline {
-                report.pending.push(a);
-                return Ok(());
+                return Ok(End::Pending);
             }
             let (fault, why) = match self.step(link, &c.record, &declared, deadline).await? {
-                Flow::Again => continue,
+                Flow::Again => {
+                    self.waits.clear(&a);
+                    continue;
+                }
                 Flow::Closed(verdict) => {
-                    report.closed(&a, verdict);
-                    return Ok(());
+                    self.tidy(&a).await;
+                    return Ok(End::Closed(verdict));
                 }
-                Flow::Later => {
-                    report.pending.push(a);
-                    return Ok(());
-                }
+                Flow::Later => return Ok(End::Pending),
                 Flow::Fault(fault, why) => (fault, why),
             };
-            match plan::judge_fault(fault) {
-                FaultVerdict::Later => report.pending.push(a),
-                FaultVerdict::Fenced => return Err(CollectError::Fenced),
+            return match plan::judge_fault(fault) {
+                FaultVerdict::Later => Ok(End::Waits(fault, why)),
+                FaultVerdict::Fenced => Err(CollectError::Fenced),
                 FaultVerdict::Strike => {
-                    let (id, text) = (a.clone(), why);
+                    let (id, text) = (a.clone(), why.clone());
                     let strikes = self
                         .db(move |s| s.strike_collection(&id, &text, wall_ms()))
                         .await?;
-                    if plan::gives_up(strikes) {
-                        let id = a.clone();
-                        self.db(move |s| {
-                            s.close_collection(&id, None, Verdict::GaveUp, false, wall_ms())
-                        })
-                        .await?;
-                        report.closed(&a, Verdict::GaveUp);
-                    } else {
-                        report.pending.push(a);
+                    if !plan::gives_up(strikes) {
+                        return Ok(End::Waits(fault, why));
                     }
+                    let id = a.clone();
+                    self.db(move |s| {
+                        s.close_collection(&id, None, Verdict::GaveUp, false, wall_ms())
+                    })
+                    .await?;
+                    self.tidy(&a).await;
+                    Ok(End::Closed(Verdict::GaveUp))
                 }
-            }
-            return Ok(());
+            };
         }
+    }
+
+    /// Remove what unfinished transfers of a closed collection left. What
+    /// cannot be removed now goes with the files of the attempt.
+    async fn tidy(&self, attempt: &AttemptId) {
+        let a = attempt.clone();
+        let _ = self.fs(move |f| f.clear_tmp(&a)).await;
     }
 
     /// Close the collection of an attempt no worker has a result of.
@@ -337,7 +449,7 @@ impl Collector {
         let (a, names) = (rec.attempt_id.clone(), declared.artifacts.clone());
         self.db(move |s| {
             let at = wall_ms();
-            s.begin_collection(&a, &digest, &result, &names, at)?;
+            s.begin_collection(&a, &digest, &result, &names, &[], at)?;
             s.set_collection_logs(&a, &digest, &json!({}), at)?;
             s.close_collection(&a, Some(&digest), verdict, false, at)?;
             Ok(())
@@ -358,16 +470,33 @@ impl Collector {
             .db(move |s| Ok((s.collection(&a)?, s.persisted_artifacts(&a)?)))
             .await?;
         let closed = row.as_ref().and_then(|r| r.closed_at_ms.and(r.verdict));
-        let current: Option<(Digest, GetResultResponse)> = row.as_ref().and_then(|r| {
-            let result = serde_json::from_value(r.result.clone()?).ok()?;
-            Some((r.result_digest.clone()?, result))
-        });
-        let left: Vec<ArtifactRecord> = current
+        let recorded: Option<(Digest, Value)> = row
+            .as_ref()
+            .and_then(|r| Some((r.result_digest.clone()?, r.result.clone()?)));
+        let current: Option<(Digest, Value, GetResultResponse)> =
+            recorded.and_then(|(digest, value)| {
+                let result = serde_json::from_value(value.clone()).ok()?;
+                Some((digest, value, result))
+            });
+        let all: Vec<ArtifactRecord> = current
             .iter()
-            .flat_map(|(_, result)| wanted(&declared.artifacts, result))
-            .filter(|w| !published.contains(&w.name))
+            .flat_map(|(_, _, result)| wanted(&declared.artifacts, result))
             .cloned()
             .collect();
+        // Published is what has this name and this digest. A name that is
+        // published with other bytes than the result records now is not
+        // fetched over it: an artifact never changes.
+        let here = |w: &ArtifactRecord| {
+            published
+                .iter()
+                .any(|(n, d)| n == &w.name && d == &w.digest)
+        };
+        let changed = all.iter().any(|w| {
+            published
+                .iter()
+                .any(|(n, d)| n == &w.name && d != &w.digest)
+        });
+        let left: Vec<&ArtifactRecord> = all.iter().filter(|w| !here(w)).collect();
         let progress = Progress {
             has_result: current.is_some(),
             logs_done: row.as_ref().is_some_and(|r| r.logs.is_some()),
@@ -376,15 +505,22 @@ impl Collector {
         };
         match (plan::next_step(progress), current, closed) {
             (Step::Done, _, Some(verdict)) => Ok(Flow::Closed(verdict)),
-            (Step::FetchLogs, Some((digest, result)), _) => {
+            (Step::FetchLogs, Some((digest, _, result)), _) => {
                 self.logs(link, rec, declared, &digest, &result, deadline)
                     .await
+            }
+            (Step::FetchArtifact, Some(_), _) if changed => {
+                Ok(bad("an artifact that changed after it was published"))
             }
             (Step::FetchArtifact, Some(_), _) => match left.first() {
                 Some(artifact) => self.artifact(link, rec, artifact, deadline).await,
                 None => Ok(Flow::Again),
             },
-            (Step::Ack, Some((digest, result)), _) => {
+            (Step::Ack, Some((digest, value, result)), _) => {
+                let logs = row.and_then(|r| r.logs).unwrap_or(Value::Null);
+                if !self.sealed(rec, &value, &logs, &all).await? {
+                    return Ok(Flow::Again);
+                }
                 self.ack(link, rec, declared, &digest, &result).await
             }
             // Without a recorded result nothing else is known.
@@ -393,6 +529,67 @@ impl Collector {
                 Err(flow) => Ok(flow),
             },
         }
+    }
+
+    /// Whether everything the collection recorded is in the result store,
+    /// durable, as recorded: the last thing before the acknowledgement,
+    /// which is final. The result is written again from its record; each
+    /// log and each artifact is read back and compared with its recorded
+    /// length and digest. What is not as recorded is taken back from the
+    /// record (`false`), and the collection goes on from there.
+    async fn sealed(
+        &self,
+        rec: &AttemptRecord,
+        result: &Value,
+        logs: &Value,
+        artifacts: &[ArtifactRecord],
+    ) -> Result<bool> {
+        let a = rec.attempt_id.clone();
+        let streams: Vec<(LogStream, Option<(Digest, u64)>)> =
+            [(LogStream::Stdout, "stdout"), (LogStream::Stderr, "stderr")]
+                .into_iter()
+                .map(|(stream, name)| {
+                    let digest = logs[name]["sha256"]
+                        .as_str()
+                        .and_then(|d| Digest::parse(d).ok());
+                    (stream, digest.zip(logs[name]["bytes"].as_u64()))
+                })
+                .collect();
+        let (bytes, wanted) = (result.to_string().into_bytes(), artifacts.to_vec());
+        let id = a.clone();
+        let (logs_ok, lost) = self
+            .fs(move |f| {
+                f.write_result(&id, &bytes)?;
+                let mut logs_ok = true;
+                for (stream, recorded) in &streams {
+                    logs_ok &= match recorded {
+                        Some((digest, bytes)) => f.verify_log(&id, *stream, digest, *bytes)?,
+                        None => false,
+                    };
+                }
+                if !logs_ok {
+                    for (stream, _) in &streams {
+                        f.discard_log(&id, *stream)?;
+                    }
+                }
+                let mut lost = Vec::new();
+                for w in &wanted {
+                    if !f.verify_artifact(&id, &w.digest, w.size)? {
+                        lost.push(w.name.clone());
+                    }
+                }
+                if logs_ok && lost.is_empty() {
+                    f.seal(&id)?;
+                }
+                Ok((logs_ok, lost))
+            })
+            .await?;
+        if logs_ok && lost.is_empty() {
+            return Ok(true);
+        }
+        self.db(move |s| s.recollect(&a, !logs_ok, &lost, wall_ms()))
+            .await?;
+        Ok(false)
     }
 
     /// Read the result, check it and record it as the one that is
@@ -420,33 +617,33 @@ impl Collector {
         let Ok(value) = serde_json::to_value(&result) else {
             return Ok(Err(bad("a result that cannot be recorded")));
         };
+        // The file first, whole and durable; then the record and the GC
+        // references of the files in one commit. A parent that dies in
+        // between has a file without a record and reads the result again.
         let bytes = value.to_string().into_bytes();
+        let a = rec.attempt_id.clone();
+        self.fs(move |f| f.write_result(&a, &bytes)).await?;
         let (a, digest, names) = (
             rec.attempt_id.clone(),
             result.result_digest.clone(),
             declared.artifacts.clone(),
         );
         self.db(move |s| {
-            let at = wall_ms();
-            s.begin_collection(&a, &digest, &value, &names, at)?;
-            s.add_result_ref(
-                &a,
-                &format!("{a}:result"),
-                BlobKind::Result,
-                &ResultStore::result_locator(&a),
-                at,
-            )?;
-            s.add_result_ref(
-                &a,
-                &format!("{a}:logs"),
-                BlobKind::Log,
-                &ResultStore::logs_locator(&a),
-                at,
-            )
+            let refs = [
+                ResultRef {
+                    ref_id: format!("{a}:result"),
+                    kind: BlobKind::Result,
+                    locator: ResultStore::result_locator(&a),
+                },
+                ResultRef {
+                    ref_id: format!("{a}:logs"),
+                    kind: BlobKind::Log,
+                    locator: ResultStore::logs_locator(&a),
+                },
+            ];
+            s.begin_collection(&a, &digest, &value, &names, &refs, wall_ms())
         })
         .await?;
-        let a = rec.attempt_id.clone();
-        self.fs(move |f| f.write_result(&a, &bytes)).await?;
         Ok(Ok(result.result_digest))
     }
 
@@ -476,9 +673,8 @@ impl Collector {
             names.len(),
         )?;
         for artifact in &result.artifacts {
-            let of_payload = declared.payload.as_ref().is_none_or(|p| {
-                p.source_id == artifact.source_id && p.plan_digest == artifact.plan_digest
-            });
+            let of_payload = declared.payload.source_id == artifact.source_id
+                && declared.payload.plan_digest == artifact.plan_digest;
             plan::check_record(RecordFacts {
                 same_attempt: artifact.attempt_id == rec.attempt_id && of_payload,
                 path_is_name: artifact.path == artifact.name,
@@ -554,8 +750,21 @@ impl Collector {
                         true
                     }
                 };
+                // What is here now is what the acknowledgement vouches for:
+                // its length and digest are recorded and compared again
+                // before it is sent.
+                let a = rec.attempt_id.clone();
+                let (sha256, here) = self.fs(move |f| f.log_digest(&a, stream)).await?;
+                if here != offset {
+                    return Err(StoreError::Offset {
+                        want: offset,
+                        have: here,
+                    }
+                    .into());
+                }
                 break json!({
                     "bytes": offset,
+                    "sha256": sha256.as_str(),
                     "complete": complete,
                     "log_truncated": r.log_truncated,
                     "dropped_bytes": r.dropped_bytes,
@@ -583,44 +792,34 @@ impl Collector {
     ) -> Result<Flow> {
         let a = rec.attempt_id.clone();
         loop {
-            let (id, name, digest, size) = (
-                a.clone(),
-                artifact.name.clone(),
-                artifact.digest.clone(),
-                artifact.size,
-            );
+            let (id, digest, size) = (a.clone(), artifact.digest.clone(), artifact.size);
             let state = self
-                .fs(move |f| f.artifact_state(&id, &name, &digest, size))
-                .await;
+                .fs(move |f| f.artifact_state(&id, &digest, size))
+                .await?;
             let offset = match state {
-                Ok(ArtifactState::Published) => break,
-                Ok(ArtifactState::Partial(offset)) => offset,
-                Err(CollectError::Files(StoreError::Conflict(name))) => {
-                    return Ok(Flow::Fault(
-                        Fault::Corrupt,
-                        format!("artifact {name} is here with another content"),
-                    ))
-                }
-                Err(e) => return Err(e),
+                ArtifactState::Published => break,
+                ArtifactState::Partial(offset) => offset,
             };
             if offset == artifact.size {
-                let (id, name, digest, size) = (
-                    a.clone(),
-                    artifact.name.clone(),
-                    artifact.digest.clone(),
-                    artifact.size,
-                );
+                let (id, digest, size) = (a.clone(), artifact.digest.clone(), artifact.size);
                 let published = self
-                    .fs(move |f| f.publish_artifact(&id, &name, &digest, size))
+                    .fs(move |f| f.publish_artifact(&id, &digest, size))
                     .await?;
-                match published {
+                let whole = match published {
                     Publish::Published => break,
-                    Publish::Mismatch => {
+                    Publish::Mismatch { whole } => whole,
+                };
+                match plan::judge_mismatch(whole) {
+                    Mismatch::Strike => {
                         return Ok(Flow::Fault(
                             Fault::Corrupt,
                             format!("artifact {} does not have its digest", artifact.name),
                         ))
                     }
+                    // Bytes a parent before this one left, perhaps torn:
+                    // they are gone now, and the artifact is fetched from
+                    // its start.
+                    Mismatch::Refetch => continue,
                 }
             }
             if Instant::now() >= deadline {
@@ -669,15 +868,12 @@ impl Collector {
             profile_fingerprint: artifact.profile_fingerprint.to_string(),
         };
         self.db(move |s| {
-            let at = wall_ms();
-            s.add_result_ref(
-                &a,
-                &format!("{a}:artifact:{}", receipt.name),
-                BlobKind::Result,
-                &ResultStore::artifact_locator(&a, &receipt.name),
-                at,
-            )?;
-            s.record_artifact(&receipt, at)
+            let file = ResultRef {
+                ref_id: format!("{a}:artifact:{}", receipt.name),
+                kind: BlobKind::Result,
+                locator: ResultStore::artifact_locator(&a, &receipt.digest),
+            };
+            s.record_collected_artifact(&receipt, &file, wall_ms())
         })
         .await?;
         Ok(Flow::Again)
@@ -710,9 +906,9 @@ impl Collector {
                 Ok(Flow::Closed(verdict))
             }
             Ok(_) => Ok(bad("an acknowledgement that released nothing")),
-            // The worker holds another result than the one that was read.
-            Err(LinkError::Remote(e)) if e.code == ErrorCode::Conflict => {
-                match self.read_result(link, rec, declared).await? {
+            Err(LinkError::Remote(e)) => match plan::ack_refusal(e.code) {
+                // The worker holds another result than the one that was read.
+                AckRefusal::OtherResult => match self.read_result(link, rec, declared).await? {
                     Err(flow) => Ok(flow),
                     Ok(now) => match plan::judge_reread(&now == digest) {
                         Reread::Restart => Ok(Flow::Again),
@@ -720,8 +916,22 @@ impl Collector {
                             Ok(bad("an acknowledgement refused for the result it gave"))
                         }
                     },
+                },
+                // The worker has nothing of the attempt any more (an
+                // acknowledgement whose answer was lost, sent again after
+                // the worker deleted what it released). Everything is here,
+                // verified: the collection is closed, as not acknowledged.
+                AckRefusal::Gone => {
+                    let verdict = verdict_of(&declared.artifacts, result);
+                    let digest = digest.clone();
+                    self.db(move |s| {
+                        s.close_collection(&a, Some(&digest), verdict, false, wall_ms())
+                    })
+                    .await?;
+                    Ok(Flow::Closed(verdict))
                 }
-            }
+                AckRefusal::Fault => Ok(Flow::Fault(Fault::Remote(e.code), "ack_collected".into())),
+            },
             Err(e) => Ok(Flow::Fault(fault_of(e), "ack_collected".into())),
         }
     }

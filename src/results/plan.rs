@@ -8,7 +8,8 @@ use crate::error::ErrorCode;
 use crate::state::Outcome;
 use crate::wire::NotStoredReason;
 
-/// How many faults that are not a lost connection one collection survives.
+/// How many permanent faults in a row, with nothing verified in between,
+/// one collection survives.
 pub const MAX_STRIKES: u32 = 3;
 
 /// The most artifacts one result may list (the worker refuses longer lists).
@@ -74,8 +75,10 @@ pub enum Fault {
     Remote(ErrorCode),
     /// An answer that is not about what was asked, or contradicts itself.
     BadAnswer,
-    /// The bytes that arrived are not the recorded ones.
+    /// An object arrived whole and is not the recorded one.
     Corrupt,
+    /// The parent could not read or write its own files or records.
+    Local,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -88,19 +91,83 @@ pub enum FaultVerdict {
     Fenced,
 }
 
-/// A lost connection and a busy worker are never a reason to give up: the
-/// computed result stays where it is until it can be fetched.
+/// Only what asking again cannot change counts toward giving up: an answer
+/// that contradicts the request or itself, a whole object that is not the
+/// recorded one, and a worker that says the attempt or the blob is not
+/// there (`NOT_FOUND`, `RETIRED`: it deletes a result only when its own
+/// wait for the acknowledgement is over). Everything else waits, as often
+/// as it takes: a lost connection, a busy worker, an error inside the
+/// worker (`INTERNAL`), a code this version does not know, and a fault of
+/// the disk or the database of the parent. The computed result stays where
+/// it is until it can be fetched.
 pub fn judge_fault(fault: Fault) -> FaultVerdict {
     match fault {
-        Fault::Unreachable | Fault::Remote(ErrorCode::Overloaded) => FaultVerdict::Later,
         Fault::Remote(ErrorCode::StaleEpoch) => FaultVerdict::Fenced,
-        Fault::Remote(_) | Fault::BadAnswer | Fault::Corrupt => FaultVerdict::Strike,
+        Fault::BadAnswer
+        | Fault::Corrupt
+        | Fault::Remote(ErrorCode::NotFound | ErrorCode::Retired) => FaultVerdict::Strike,
+        Fault::Unreachable | Fault::Local | Fault::Remote(_) => FaultVerdict::Later,
     }
 }
 
 /// Whether a collection with this many strikes is given up.
 pub fn gives_up(strikes: u32) -> bool {
     strikes >= MAX_STRIKES
+}
+
+/// Whether the next try of a collection that has to wait is put off. A
+/// worker that did not answer is asked again as soon as it is back; one
+/// that answered with an error, and a parent whose own disk failed, are
+/// given time.
+pub fn backs_off(fault: Fault) -> bool {
+    !matches!(fault, Fault::Unreachable)
+}
+
+/// How long a collection that waited `waits` times in a row before waits
+/// now: `base_ms`, doubled with every wait, at most 64 times `base_ms`.
+pub fn backoff_ms(base_ms: u64, waits: u32) -> u64 {
+    base_ms.saturating_mul(1 << waits.min(6))
+}
+
+/// What a refused acknowledgement means.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AckRefusal {
+    /// The worker holds another result than the one that was read.
+    OtherResult,
+    /// The worker has nothing of the attempt any more (its own wait for the
+    /// acknowledgement ended and it deleted the result). Everything is
+    /// verified and durable in the parent at this point, so there is
+    /// nothing left to release.
+    Gone,
+    Fault,
+}
+
+pub fn ack_refusal(code: ErrorCode) -> AckRefusal {
+    match code {
+        ErrorCode::Conflict => AckRefusal::OtherResult,
+        ErrorCode::NotFound | ErrorCode::Retired => AckRefusal::Gone,
+        _ => AckRefusal::Fault,
+    }
+}
+
+/// What to make of arrived bytes that do not have the recorded digest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mismatch {
+    /// Every byte was written by this process since it started the file:
+    /// the worker served another object than it recorded.
+    Strike,
+    /// The file was begun by a parent that is gone, and its tail may be
+    /// torn: nothing of it is verified, so it is fetched again from the
+    /// start, and it is not a fault of the worker.
+    Refetch,
+}
+
+pub fn judge_mismatch(written_whole_by_this_process: bool) -> Mismatch {
+    if written_whole_by_this_process {
+        Mismatch::Strike
+    } else {
+        Mismatch::Refetch
+    }
 }
 
 // ------------------------------------------------------------- the result
@@ -464,20 +531,59 @@ mod tests {
     }
 
     #[test]
-    fn a_lost_connection_or_a_busy_worker_is_never_a_strike() {
+    fn only_what_asking_again_cannot_change_is_a_strike() {
         use ErrorCode::*;
         assert_eq!(judge_fault(Fault::Unreachable), FaultVerdict::Later);
-        assert_eq!(judge_fault(Fault::Remote(Overloaded)), FaultVerdict::Later);
+        assert_eq!(judge_fault(Fault::Local), FaultVerdict::Later);
         assert_eq!(judge_fault(Fault::Remote(StaleEpoch)), FaultVerdict::Fenced);
-        for code in [NotFound, Internal, Conflict, InvalidInput, Retired] {
-            assert_eq!(judge_fault(Fault::Remote(code)), FaultVerdict::Strike);
+        for code in [Overloaded, Internal, Conflict, InvalidInput] {
+            assert_eq!(judge_fault(Fault::Remote(code)), FaultVerdict::Later);
         }
+        assert_eq!(judge_fault(Fault::Remote(NotFound)), FaultVerdict::Strike);
+        assert_eq!(judge_fault(Fault::Remote(Retired)), FaultVerdict::Strike);
         assert_eq!(judge_fault(Fault::BadAnswer), FaultVerdict::Strike);
         assert_eq!(judge_fault(Fault::Corrupt), FaultVerdict::Strike);
         assert!(!gives_up(0));
         assert!(!gives_up(2));
         assert!(gives_up(3));
         assert!(gives_up(4));
+    }
+
+    #[test]
+    fn a_wait_is_put_off_longer_each_time_up_to_a_cap() {
+        assert!(!backs_off(Fault::Unreachable));
+        assert!(backs_off(Fault::Local));
+        assert!(backs_off(Fault::Remote(ErrorCode::Overloaded)));
+        assert!(backs_off(Fault::Remote(ErrorCode::Internal)));
+        assert!(backs_off(Fault::BadAnswer));
+        assert!(backs_off(Fault::Corrupt));
+        assert_eq!(backoff_ms(1_000, 0), 1_000);
+        assert_eq!(backoff_ms(1_000, 1), 2_000);
+        assert_eq!(backoff_ms(1_000, 2), 4_000);
+        assert_eq!(backoff_ms(1_000, 5), 32_000);
+        assert_eq!(backoff_ms(1_000, 6), 64_000);
+        assert_eq!(backoff_ms(1_000, 7), 64_000);
+        assert_eq!(backoff_ms(1_000, u32::MAX), 64_000);
+        assert_eq!(backoff_ms(0, 3), 0);
+        assert_eq!(backoff_ms(3, 3), 24);
+        assert_eq!(backoff_ms(u64::MAX, 1), u64::MAX);
+    }
+
+    #[test]
+    fn a_refused_acknowledgement_is_another_result_a_worker_without_it_or_a_fault() {
+        use ErrorCode::*;
+        assert_eq!(ack_refusal(Conflict), AckRefusal::OtherResult);
+        assert_eq!(ack_refusal(NotFound), AckRefusal::Gone);
+        assert_eq!(ack_refusal(Retired), AckRefusal::Gone);
+        for code in [Overloaded, Internal, InvalidInput, StaleEpoch] {
+            assert_eq!(ack_refusal(code), AckRefusal::Fault);
+        }
+    }
+
+    #[test]
+    fn a_mismatch_is_a_strike_only_for_bytes_this_process_wrote_from_the_start() {
+        assert_eq!(judge_mismatch(true), Mismatch::Strike);
+        assert_eq!(judge_mismatch(false), Mismatch::Refetch);
     }
 
     fn record() -> RecordFacts {

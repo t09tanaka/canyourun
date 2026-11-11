@@ -1882,7 +1882,7 @@ async fn a30_a_real_workers_outputs_are_collected_over_two_connections_and_the_w
     };
     let report = c.collect(&files, cfg).await.unwrap();
     assert_eq!(report.collected, vec![a.clone()]);
-    let out = files.artifact_path(&a, "report/out.txt").unwrap();
+    let out = files.artifact_path(&a, &Digest::of_bytes(b"0123456789"));
     assert_eq!(std::fs::read(out).unwrap(), b"0123456789");
     assert_eq!(files.read_log(&a, LogStream::Stdout).unwrap(), b"hello\n");
     let row = c.store().collection(&a).unwrap().unwrap();

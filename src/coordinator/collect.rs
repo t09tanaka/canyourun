@@ -30,7 +30,8 @@ impl Coordinator {
     ) -> Result<CollectReport> {
         let _one = self.collecting.lock().await;
         self.check_fenced()?;
-        let collector = Collector::new(Arc::clone(&self.store), Arc::clone(files), cfg);
+        let collector = Collector::new(Arc::clone(&self.store), Arc::clone(files), cfg)
+            .with_waits(Arc::clone(&self.collect_waits));
         let attached: Vec<(WorkerId, Arc<dyn WorkerLink>)> = {
             let workers = self.workers.lock().unwrap_or_else(|e| e.into_inner());
             workers

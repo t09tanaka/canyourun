@@ -81,6 +81,9 @@ struct State {
     /// What was left behind for an attempt that has no result yet is stored
     /// as its result the moment an acknowledgement arrives.
     result_appears_on_ack: bool,
+    /// Answer the next requests of a kind with an error: the kind, the
+    /// code, and how many times.
+    fail: Option<(&'static str, ErrorCode, u32)>,
     /// Every request that arrived: its kind and (for bytes) its offset.
     ops: Vec<(&'static str, u64)>,
 }
@@ -373,7 +376,22 @@ impl WorkerLink for Worker {
                     let _ = self.handle(request);
                     Err(LinkError::Unconfirmed)
                 }
-                None => self.handle(request).map_err(LinkError::Remote),
+                None => {
+                    let refused = {
+                        let mut s = self.state.lock().unwrap();
+                        match s.fail {
+                            Some((kind, code, left)) if kind == op.0 && left > 0 => {
+                                s.fail = Some((kind, code, left - 1));
+                                Some(code)
+                            }
+                            _ => None,
+                        }
+                    };
+                    match refused {
+                        Some(code) => Err(LinkError::Remote(err(code))),
+                        None => self.handle(request).map_err(LinkError::Remote),
+                    }
+                }
             }
         })
     }
@@ -398,6 +416,8 @@ fn cfg() -> CollectConfig {
     CollectConfig {
         chunk_bytes: 4,
         budget_ms: 10_000,
+        // The passes of a test follow each other at once.
+        backoff_ms: 0,
         ..CollectConfig::default()
     }
 }
@@ -554,8 +574,38 @@ fn is_collected(c: &Coordinator, a: &AttemptId) -> bool {
     rec.receipts.reached(Receipt::Collected)
 }
 
+/// The published bytes of the artifact `name`: the result that was collected
+/// says which digest the name has, and the file is stored under the digest.
 fn published(files: &ResultStore, a: &AttemptId, name: &str) -> Option<Vec<u8>> {
-    std::fs::read(files.artifact_path(a, name).unwrap()).ok()
+    let result: GetResultResponse =
+        serde_json::from_slice(&files.read_result(a).unwrap()?).unwrap();
+    let record = result.artifacts.iter().find(|r| r.name == name)?;
+    std::fs::read(files.artifact_path(a, &record.digest)).ok()
+}
+
+/// The names of the artifacts the parent recorded as verified and published.
+fn persisted(c: &Coordinator, a: &AttemptId) -> Vec<String> {
+    let all = c.store().persisted_artifacts(a).unwrap();
+    all.into_iter().map(|(name, _)| name).collect()
+}
+
+fn hex(bytes: &[u8]) -> String {
+    let digest = Digest::of_bytes(bytes);
+    digest
+        .as_str()
+        .trim_start_matches(Digest::PREFIX)
+        .to_string()
+}
+
+fn strikes(c: &Coordinator, a: &AttemptId) -> u32 {
+    c.store().collection(a).unwrap().map_or(0, |r| r.strikes)
+}
+
+/// Change the parent's database behind its back.
+fn sql(fx: &Fx, statement: &str) {
+    let conn = rusqlite::Connection::open(fx.dir.path().join("coordinator.db")).unwrap();
+    conn.busy_timeout(Duration::from_secs(5)).unwrap();
+    assert_eq!(conn.execute(statement, []).unwrap(), 1, "{statement}");
 }
 
 /// Everything of [`full`] is in the parent, verified, and the worker was
@@ -569,9 +619,15 @@ fn assert_all_here(fx: &Fx, c: &Coordinator, files: &ResultStore, a: &AttemptId)
     assert_eq!(files.read_log(a, LogStream::Stdout).unwrap(), LOG);
     assert!(files.read_result(a).unwrap().is_some());
     assert_eq!(
-        c.store().persisted_artifacts(a).unwrap(),
+        persisted(c, a),
         vec!["alpha.txt".to_string(), "reports/beta.bin".to_string()]
     );
+    // Durable as recorded: the logs with their length and digest.
+    let logs = c.store().collection(a).unwrap().unwrap().logs.unwrap();
+    assert_eq!(logs["stdout"]["sha256"], Digest::of_bytes(LOG).as_str());
+    assert_eq!(logs["stderr"]["sha256"], Digest::of_bytes(b"").as_str());
+    let dir = files.root().join(a.as_str()).join("artifacts");
+    assert_eq!(std::fs::read_dir(dir).unwrap().count(), 2);
     let row = c.store().collection(a).unwrap().unwrap();
     assert_eq!(row.verdict, Some(Verdict::Complete));
     assert!(row.acked_at_ms.is_some() && row.closed_at_ms.is_some());
@@ -720,7 +776,7 @@ async fn a_parent_that_crashes_at_any_boundary_continues_the_collection_and_runs
         assert_eq!(row.result_digest, Some(fx.w.digest(&a)), "{boundary:?}");
         assert_eq!(row.closed_at_ms, None, "{boundary:?}");
         assert!(!is_collected(&c, &a), "{boundary:?}");
-        let names = c.store().persisted_artifacts(&a).unwrap();
+        let names = persisted(&c, &a);
         let acks = fx.w.acks(&a).len();
         match boundary {
             ResultFetched => {
@@ -784,7 +840,7 @@ async fn a_corrupted_chunk_is_never_published_and_the_artifact_is_fetched_again(
     // The bytes did not have the recorded digest: nothing is visible, the
     // worker was not told anything, and the fault is counted.
     assert_eq!(published(&files, &a, "alpha.txt"), None);
-    assert!(c.store().persisted_artifacts(&a).unwrap().is_empty());
+    assert!(persisted(&c, &a).is_empty());
     assert!(fx.w.acks(&a).is_empty());
     assert_eq!(c.store().collection(&a).unwrap().unwrap().strikes, 1);
 
@@ -1210,8 +1266,8 @@ async fn collected_results_are_kept_for_the_retention_and_then_deleted() {
     assert_eq!(
         deleted,
         vec![
-            format!("results/{a}/artifacts/alpha.txt"),
-            format!("results/{a}/artifacts/reports/beta.bin"),
+            format!("results/{a}/artifacts/{}", hex(ALPHA)),
+            format!("results/{a}/artifacts/{}", hex(BETA)),
             format!("results/{a}/logs"),
             format!("results/{a}/result.json"),
         ]
@@ -1230,4 +1286,405 @@ async fn collected_results_are_kept_for_the_retention_and_then_deleted() {
     fx.w.set(|s| s.offline = false);
     assert_eq!(collect(&c, &files).await.collected, vec![b.clone()]);
     assert_all_here(&fx, &c, &files, &b);
+}
+
+// ------------------------------------------- nothing is acknowledged early
+
+#[tokio::test]
+async fn a_parent_that_dies_between_a_file_operation_and_its_record_continues_from_the_files() {
+    use remote_task_runner::results::store::Crash;
+    for point in [
+        Crash::ResultWritten,
+        Crash::LogAppended,
+        Crash::ChunkAppended,
+        Crash::ArtifactPublished,
+    ] {
+        let fx = fx();
+        let (c, files) = fx.open();
+        let (_, _, a) = placed(&fx, &c, two()).await;
+        end(&fx, &c, &a, Outcome::Succeeded, full(&fx, &a)).await;
+        files.crash_once_at(point);
+        let report = collect(&c, &files).await;
+        assert_eq!(report.pending, vec![a.clone()], "{point:?}");
+        assert_eq!(report.faults.len(), 1, "{point:?}");
+        assert_eq!(report.faults[0].0, a, "{point:?}");
+        // The file operation happened, its record did not, and the worker
+        // was told nothing.
+        assert!(fx.w.acks(&a).is_empty(), "{point:?}");
+        assert!(!is_collected(&c, &a), "{point:?}");
+        assert_eq!(strikes(&c, &a), 0, "{point:?}");
+        match point {
+            Crash::ResultWritten => {
+                assert!(files.read_result(&a).unwrap().is_some());
+                assert_eq!(c.store().collection(&a).unwrap(), None);
+            }
+            Crash::ArtifactPublished => {
+                assert_eq!(published(&files, &a, "alpha.txt").as_deref(), Some(ALPHA));
+                assert!(persisted(&c, &a).is_empty());
+            }
+            _ => assert!(persisted(&c, &a).is_empty()),
+        }
+
+        drop(c);
+        drop(files);
+        let (c, files) = fx.open();
+        assert_eq!(
+            collect(&c, &files).await.collected,
+            vec![a.clone()],
+            "{point:?}"
+        );
+        assert_all_here(&fx, &c, &files, &a);
+        assert_eq!(fx.w.acks(&a).len(), 1, "{point:?}");
+        assert_eq!(fx.w.count("submit"), 1, "{point:?}");
+        if point == Crash::ArtifactPublished {
+            // The file that was published is verified again, not fetched.
+            assert_eq!(fx.w.offsets("blob"), vec![0, 4, 8, 0, 4], "{point:?}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn what_is_not_on_disk_as_recorded_is_collected_again_before_the_acknowledgement() {
+    let fx = fx();
+    let (c, files) = fx.open();
+    let (_, _, a) = placed(&fx, &c, two()).await;
+    end(&fx, &c, &a, Outcome::Succeeded, full(&fx, &a)).await;
+    fx.w.set(|s| s.trip = Some(("ack", 1, Lost::Request)));
+    assert_eq!(collect(&c, &files).await.pending, vec![a.clone()]);
+    assert_eq!(persisted(&c, &a).len(), 2);
+
+    // Everything is recorded as collected; then the disk loses the result
+    // and one artifact, and damages the log and the other artifact.
+    let dir = files.root().join(a.as_str());
+    std::fs::remove_file(dir.join("result.json")).unwrap();
+    std::fs::write(dir.join("logs").join("stdout.log"), b"HELLO log\n").unwrap();
+    std::fs::remove_file(dir.join("artifacts").join(hex(ALPHA))).unwrap();
+    std::fs::write(dir.join("artifacts").join(hex(BETA)), b"abcdeX").unwrap();
+    fx.w.set(|s| s.offline = false);
+    let (blobs, logs) = (fx.w.count("blob"), fx.w.count("log"));
+
+    // The acknowledgement is not sent for what is not there: it is fetched
+    // again first.
+    assert_eq!(collect(&c, &files).await.collected, vec![a.clone()]);
+    assert_all_here(&fx, &c, &files, &a);
+    assert_eq!(fx.w.count("blob"), blobs + 5);
+    assert!(fx.w.count("log") > logs);
+    assert_eq!(fx.w.count("result"), 1);
+    assert_eq!(fx.w.acks(&a).len(), 1);
+    assert_eq!(strikes(&c, &a), 0);
+    let events = c.store().events_of(&a, "collection_recollect").unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].payload["logs"], true);
+    assert_eq!(
+        events[0].payload["artifacts"],
+        json!(["alpha.txt", "reports/beta.bin"])
+    );
+}
+
+#[tokio::test]
+async fn an_attempt_whose_payload_cannot_be_read_is_never_acknowledged_and_keeps_nothing_else_back()
+{
+    for broken in [
+        "json_remove(demand_json, '$.payload')",
+        "json_set(demand_json, '$.payload', 'junk')",
+    ] {
+        let fx = fx();
+        let (c, files) = fx.open();
+        // The older attempt is the broken one: it comes first in every pass.
+        let (_, _, a) = placed(&fx, &c, two()).await;
+        end(&fx, &c, &a, Outcome::Succeeded, full(&fx, &a)).await;
+        let (_, _, b) = placed(&fx, &c, two()).await;
+        end(&fx, &c, &b, Outcome::Succeeded, full(&fx, &b)).await;
+        sql(
+            &fx,
+            &format!("UPDATE placement SET demand_json = {broken} WHERE attempt_id = '{a}'"),
+        );
+        for pass in 0..4 {
+            let report = collect(&c, &files).await;
+            assert_eq!(report.pending, vec![a.clone()], "{broken}");
+            assert_eq!(report.faults.len(), 1, "{broken}");
+            assert!(report.faults[0].1.contains("payload"), "{report:?}");
+            let others = if pass == 0 { vec![b.clone()] } else { vec![] };
+            assert_eq!(report.collected, others, "{broken}");
+        }
+        assert_all_here(&fx, &c, &files, &b);
+        // "Nothing was declared" would have released the worker's
+        // artifacts unfetched: nothing was asked, nothing was told.
+        assert!(fx.w.acks(&a).is_empty(), "{broken}");
+        assert_eq!(c.store().collection(&a).unwrap(), None, "{broken}");
+        assert!(!files.root().join(a.as_str()).exists(), "{broken}");
+        assert!(!is_collected(&c, &a), "{broken}");
+    }
+}
+
+#[tokio::test]
+async fn an_error_inside_the_worker_is_waited_out_however_often_it_comes() {
+    let fx = fx();
+    let (c, files) = fx.open();
+    let (_, _, a) = placed(&fx, &c, two()).await;
+    end(&fx, &c, &a, Outcome::Succeeded, full(&fx, &a)).await;
+    for (kind, code) in [
+        ("result", ErrorCode::Internal),
+        ("log", ErrorCode::Internal),
+        ("blob", ErrorCode::Internal),
+        ("blob", ErrorCode::InvalidInput),
+        ("blob", ErrorCode::Conflict),
+        // A supervisor of a result-less attempt may still store its result.
+        ("ack", ErrorCode::Overloaded),
+        ("ack", ErrorCode::Internal),
+    ] {
+        fx.w.set(|s| s.fail = Some((kind, code, 4)));
+        for _ in 0..4 {
+            let report = collect(&c, &files).await;
+            assert_eq!(report.pending, vec![a.clone()], "{kind} {code:?}");
+            assert!(report.faults.is_empty(), "{kind} {code:?}");
+        }
+        assert_eq!(strikes(&c, &a), 0, "{kind} {code:?}");
+        assert!(fx.w.acks(&a).is_empty(), "{kind} {code:?}");
+        let row = c.store().collection(&a).unwrap();
+        assert!(row.is_none_or(|r| r.closed_at_ms.is_none()));
+    }
+    assert_eq!(collect(&c, &files).await.collected, vec![a.clone()]);
+    assert_all_here(&fx, &c, &files, &a);
+}
+
+#[tokio::test]
+async fn a_worker_that_answered_with_an_error_is_given_time_and_one_that_was_away_is_not() {
+    let fx = fx();
+    let (c, files) = fx.open();
+    let slow = CollectConfig {
+        backoff_ms: 60_000,
+        ..cfg()
+    };
+    let (_, _, a) = placed(&fx, &c, two()).await;
+    end(&fx, &c, &a, Outcome::Succeeded, full(&fx, &a)).await;
+    let ops = |fx: &Fx| fx.w.state.lock().unwrap().ops.len();
+    // Away: asked again by the very next pass.
+    fx.w.set(|s| s.trip = Some(("blob", 2, Lost::Request)));
+    assert_eq!(
+        c.collect(&files, slow).await.unwrap().pending,
+        vec![a.clone()]
+    );
+    fx.w.set(|s| {
+        s.offline = false;
+        s.fail = Some(("blob", ErrorCode::Internal, 1));
+    });
+    let before = ops(&fx);
+    assert_eq!(
+        c.collect(&files, slow).await.unwrap().pending,
+        vec![a.clone()]
+    );
+    assert!(ops(&fx) > before);
+    // It answered with an error: the next pass leaves it alone.
+    let before = ops(&fx);
+    assert_eq!(
+        c.collect(&files, slow).await.unwrap().pending,
+        vec![a.clone()]
+    );
+    assert_eq!(ops(&fx), before);
+    // The wait is not durable: a parent that starts again asks at once.
+    drop(c);
+    drop(files);
+    let (c, files) = fx.open();
+    assert_eq!(
+        c.collect(&files, slow).await.unwrap().collected,
+        vec![a.clone()]
+    );
+    assert_all_here(&fx, &c, &files, &a);
+}
+
+#[tokio::test]
+async fn strikes_start_over_with_verified_progress_and_a_worker_that_forgot_closes_the_collection()
+{
+    let fx = fx();
+    let (c, files) = fx.open();
+    let (_, _, a) = placed(&fx, &c, two()).await;
+    end(&fx, &c, &a, Outcome::Succeeded, full(&fx, &a)).await;
+    fx.w.set(|s| s.shift_chunk = true);
+    assert_eq!(collect(&c, &files).await.pending, vec![a.clone()]);
+    assert_eq!(strikes(&c, &a), 1);
+    // An artifact is verified and published: what went wrong before it is
+    // not held against the rest.
+    fx.w.set(|s| s.trip = Some(("ack", 1, Lost::Answer)));
+    assert_eq!(collect(&c, &files).await.pending, vec![a.clone()]);
+    assert_eq!(strikes(&c, &a), 0);
+    assert_eq!(fx.w.acks(&a).len(), 1);
+
+    // The worker took the acknowledgement, released, and has deleted the
+    // attempt by the time the acknowledgement is sent again.
+    for code in [ErrorCode::NotFound, ErrorCode::Retired] {
+        let (c, files, a) = if code == ErrorCode::NotFound {
+            (&c, &files, a.clone())
+        } else {
+            let (_, _, b) = placed(&fx, &c, two()).await;
+            end(&fx, &c, &b, Outcome::Succeeded, full(&fx, &b)).await;
+            (&c, &files, b)
+        };
+        fx.w.set(|s| {
+            s.offline = false;
+            s.fail = Some(("ack", code, 1));
+        });
+        assert_eq!(collect(c, files).await.collected, vec![a.clone()]);
+        let row = c.store().collection(&a).unwrap().unwrap();
+        assert_eq!(row.verdict, Some(Verdict::Complete), "{code:?}");
+        assert!(row.closed_at_ms.is_some() && row.acked_at_ms.is_none());
+        assert_eq!(row.strikes, 0, "{code:?}");
+        assert!(is_collected(c, &a), "{code:?}");
+        assert_eq!(published(files, &a, "alpha.txt").as_deref(), Some(ALPHA));
+        assert_eq!(collect(c, files).await, CollectReport::default());
+    }
+}
+
+#[tokio::test]
+async fn a_part_a_dead_parent_left_torn_is_fetched_again_and_is_no_strike() {
+    use remote_task_runner::results::store::Crash;
+    let fx = fx();
+    let (c, files) = fx.open();
+    let (_, _, a) = placed(&fx, &c, two()).await;
+    end(&fx, &c, &a, Outcome::Succeeded, full(&fx, &a)).await;
+    files.crash_once_at(Crash::ChunkAppended);
+    assert_eq!(collect(&c, &files).await.pending, vec![a.clone()]);
+    let part = files.root().join(a.as_str()).join("tmp");
+    let part = part.join(format!("{}.part", hex(ALPHA)));
+    assert_eq!(std::fs::read(&part).unwrap(), &ALPHA[..4]);
+    drop(c);
+    drop(files);
+    // The power went with the parent: the tail of the file is not what was
+    // written.
+    std::fs::write(&part, b"01\0\0").unwrap();
+
+    let (c, files) = fx.open();
+    assert_eq!(collect(&c, &files).await.collected, vec![a.clone()]);
+    assert_all_here(&fx, &c, &files, &a);
+    assert_eq!(strikes(&c, &a), 0);
+    assert!(c
+        .store()
+        .events_of(&a, "collection_fault")
+        .unwrap()
+        .is_empty());
+    // Continued at its length, found wrong when whole, fetched once more.
+    assert_eq!(fx.w.offsets("blob"), vec![0, 4, 8, 0, 4, 8, 0, 4]);
+}
+
+#[tokio::test]
+async fn a_collection_that_was_given_up_is_opened_again_while_the_worker_has_the_result() {
+    let fx = fx();
+    let (c, files) = fx.open();
+    let (run, _, a) = placed(&fx, &c, two()).await;
+    let mut out = full(&fx, &a);
+    out.artifacts[1].1 = b"ABCDEF".to_vec();
+    end(&fx, &c, &a, Outcome::Succeeded, out).await;
+    // An open collection is not one to reopen.
+    assert!(!c.store().reopen_collection(&a, 1).unwrap());
+    assert_eq!(collect(&c, &files).await.pending, vec![a.clone()]);
+    assert!(!c.store().reopen_collection(&a, 1).unwrap());
+    assert_eq!(collect(&c, &files).await.pending, vec![a.clone()]);
+    assert_eq!(collect(&c, &files).await.gave_up, vec![a.clone()]);
+    // Nothing of the transfers that never finished is left.
+    assert!(!files.root().join(a.as_str()).join("tmp").exists());
+    assert!(!c
+        .store()
+        .reopen_collection(&AttemptId::generate(), 1)
+        .unwrap());
+
+    // The worker was not acknowledged, so it still has the result (for its
+    // `ack_wait_ms`); now it serves the bytes it recorded.
+    fx.w.set(|s| s.jobs.get_mut(&a).unwrap().out.artifacts[1].1 = BETA.to_vec());
+    assert!(c.store().reopen_collection(&a, wall_ms()).unwrap());
+    assert!(!c.store().reopen_collection(&a, wall_ms()).unwrap());
+    let rec = c.store().get_attempt(&a).unwrap().unwrap();
+    assert_eq!(rec.collection_failed_at_ms, None);
+    let row = c.store().collection(&a).unwrap().unwrap();
+    assert_eq!(
+        (
+            row.closed_at_ms,
+            row.verdict,
+            row.strikes,
+            row.result_digest
+        ),
+        (None, None, 0, None)
+    );
+    assert!(persisted(&c, &a).is_empty());
+    assert_eq!(
+        c.store().run_standing(&run, None).unwrap().verdict,
+        RunVerdict::Collecting
+    );
+    // The retention of what is here does not run while it is open.
+    let report = sweep(c.store(), &files, wall_ms() + 30 * DAY, 7).unwrap();
+    assert!(report.deleted.is_empty());
+
+    assert_eq!(collect(&c, &files).await.collected, vec![a.clone()]);
+    assert_all_here(&fx, &c, &files, &a);
+    assert_eq!(fx.w.count("result"), 2);
+    assert_eq!(
+        c.store().run_standing(&run, None).unwrap().verdict,
+        RunVerdict::Passed
+    );
+    // What the worker acknowledged is closed for good.
+    assert!(!c.store().reopen_collection(&a, wall_ms()).unwrap());
+    assert_eq!(
+        c.store()
+            .events_of(&a, "collection_reopened")
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn names_that_are_one_path_on_the_parent_are_each_collected() {
+    let fx = fx();
+    let (c, files) = fx.open();
+    // The same name but for its case, a name that is a directory of
+    // another, and two names with the same bytes: fine on the worker.
+    let all: [(&str, &[u8]); 6] = [
+        ("Report.txt", b"upper"),
+        ("report.txt", b"lower"),
+        ("a", b"a file"),
+        ("a/b", b"below a"),
+        ("same-1", b"same"),
+        ("same-2", b"same"),
+    ];
+    let decls = all.iter().map(|(n, _)| decl(n, MissingPolicy::Required));
+    let (_, _, a) = placed(&fx, &c, decls.collect()).await;
+    let p = fx.w.payload(&a);
+    let out = Out {
+        has_result: true,
+        artifacts: all.iter().map(|(n, b)| stored(&a, &p, n, b)).collect(),
+        not_stored: vec![],
+        log: LOG.to_vec(),
+        log_closed: true,
+        dropped: 0,
+    };
+    end(&fx, &c, &a, Outcome::Succeeded, out).await;
+    assert_eq!(collect(&c, &files).await.collected, vec![a.clone()]);
+    for (name, bytes) in all {
+        assert_eq!(
+            published(&files, &a, name).as_deref(),
+            Some(bytes),
+            "{name}"
+        );
+    }
+    assert_eq!(persisted(&c, &a).len(), 6);
+    assert!(is_collected(&c, &a));
+    // One file per content, none under a name of the worker.
+    let dir = files.root().join(a.as_str()).join("artifacts");
+    let mut names: Vec<String> = std::fs::read_dir(dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    let mut want: Vec<String> = ["upper", "lower", "a file", "below a", "same"]
+        .iter()
+        .map(|b| hex(b.as_bytes()))
+        .collect();
+    want.sort();
+    assert_eq!(names, want);
+    // And all of it goes with the retention.
+    let closed = c.store().collection(&a).unwrap().unwrap();
+    let closed = closed.closed_at_ms.unwrap();
+    let report = sweep(c.store(), &files, closed + 7 * DAY, 7).unwrap();
+    assert_eq!(report.deleted.len(), 7);
+    assert!(!files.root().join(a.as_str()).exists());
+    assert!(c.store().pending_deletes().unwrap().is_empty());
 }

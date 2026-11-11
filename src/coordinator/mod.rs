@@ -226,6 +226,8 @@ pub struct Coordinator {
     actor: tokio::sync::Mutex<()>,
     /// One pass of result collection at a time.
     collecting: tokio::sync::Mutex<()>,
+    /// The collections that wait before they are tried again.
+    collect_waits: Arc<crate::results::collect::Waits>,
     lease_seq: AtomicU64,
     fenced: AtomicBool,
     /// The queued tasks no payload could be made for, as this process
@@ -257,6 +259,7 @@ impl Coordinator {
             workers: Mutex::default(),
             actor: tokio::sync::Mutex::new(()),
             collecting: tokio::sync::Mutex::new(()),
+            collect_waits: Arc::default(),
             lease_seq: AtomicU64::new(0),
             fenced: AtomicBool::new(false),
             unplaceable: Mutex::default(),

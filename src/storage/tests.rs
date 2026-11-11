@@ -3082,6 +3082,17 @@ fn a_step_1_coordinator_database_with_rows_is_read_as_it_is_and_upgraded_once() 
             ro.task_cancel_requested(&TaskId::generate()),
             Err(StorageError::NotFound { .. })
         ));
+        // It has no collections: none is open, none is closed, and the run
+        // stands as its attempts do.
+        assert_eq!(ro.collection(&attempt).unwrap(), None);
+        assert!(ro.collectable(None, 10).unwrap().is_empty());
+        assert!(ro.persisted_artifacts(&attempt).unwrap().is_empty());
+        let standing = ro.run_standing(&run, None).unwrap();
+        assert_eq!(
+            standing.verdict,
+            crate::results::plan::RunVerdict::Collecting
+        );
+        assert_eq!(standing.tasks.len(), 2);
     }
 
     // Opened for writing, it is migrated, and every row is still there.

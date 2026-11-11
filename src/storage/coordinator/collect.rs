@@ -9,8 +9,8 @@
 //! a complete collection, never before.
 
 use super::{
-    artifact_counts, attempt_from_row, id, load_attempt, not_found, run_of, AttemptRecord,
-    CoordinatorStore, ATTEMPT, ATTEMPT_COLS,
+    artifact_counts, attempt_from_row, id, load_attempt, not_found, run_of, ArtifactReceipt,
+    AttemptRecord, CoordinatorStore, ATTEMPT, ATTEMPT_COLS,
 };
 use crate::ids::{AttemptId, Digest, RunId, TaskId, WorkerId};
 use crate::results::plan::{run_verdict, task_standing, RunVerdict, TaskStanding, Verdict};
@@ -47,6 +47,51 @@ pub struct Collectable {
     /// worker holds, if anything, is not this attempt's result.
     pub settled_here: bool,
     pub row: Option<CollectionRow>,
+}
+
+/// A file of the parent's result store that an attempt references for GC.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResultRef {
+    pub ref_id: String,
+    pub kind: BlobKind,
+    pub locator: String,
+}
+
+/// Reference a file of the result store. The same reference again is a
+/// no-op; the same id for another file is refused.
+fn add_ref(tx: &rusqlite::Transaction<'_>, attempt: &str, r: &ResultRef, at_ms: u64) -> Result<()> {
+    let have: Option<String> = tx
+        .query_row(
+            "SELECT locator FROM blob_ref WHERE ref_id = ?1",
+            [&r.ref_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    match have {
+        Some(l) if l == r.locator => Ok(()),
+        Some(_) => Err(StorageError::Immutable(format!("reference {}", r.ref_id))),
+        None => common::add_blob_ref(
+            tx,
+            &common::NewBlobRef {
+                ref_id: r.ref_id.clone(),
+                attempt_id: attempt.to_string(),
+                kind: r.kind,
+                locator: r.locator.clone(),
+            },
+            at_ms,
+        ),
+    }
+}
+
+/// Something was verified and is durable: the faults before it are not held
+/// against what follows.
+fn clear_strikes(tx: &rusqlite::Transaction<'_>, attempt: &str) -> Result<()> {
+    tx.execute(
+        "UPDATE collection SET strikes = 0
+         WHERE attempt_id = ?1 AND closed_at_ms IS NULL AND strikes > 0",
+        [attempt],
+    )?;
+    Ok(())
 }
 
 /// Where a run stands, task by task.
@@ -151,12 +196,19 @@ impl CoordinatorStore {
         limit: u32,
     ) -> Result<Vec<Collectable>> {
         let worker = worker_id.map(ToString::to_string);
+        let collections = self.collections;
         self.db.call(move |c| {
+            // A file from before collections has none that is closed.
+            let open = if collections {
+                "AND NOT EXISTS (SELECT 1 FROM collection c
+                    WHERE c.attempt_id = attempt.attempt_id AND c.closed_at_ms IS NOT NULL)"
+            } else {
+                ""
+            };
             let mut s = c.prepare(&format!(
                 "SELECT {ATTEMPT_COLS} FROM attempt
                  WHERE state = 'terminal' AND retired = 0 AND (?1 IS NULL OR worker_id = ?1)
-                   AND NOT EXISTS (SELECT 1 FROM collection c
-                        WHERE c.attempt_id = attempt.attempt_id AND c.closed_at_ms IS NOT NULL)
+                   {open}
                  ORDER BY terminal_at_ms, rowid LIMIT ?2"
             ))?;
             let records: Vec<AttemptRecord> = s
@@ -181,7 +233,11 @@ impl CoordinatorStore {
                 out.push(Collectable {
                     payload,
                     settled_here: settled_here(c, &aid)?,
-                    row: load_row(c, &aid)?,
+                    row: if collections {
+                        load_row(c, &aid)?
+                    } else {
+                        None
+                    },
                     record,
                 });
             }
@@ -191,22 +247,34 @@ impl CoordinatorStore {
 
     pub fn collection(&self, attempt_id: &AttemptId) -> Result<Option<CollectionRow>> {
         let a = attempt_id.to_string();
+        if !self.collections {
+            return Ok(None);
+        }
         self.db.call(move |c| load_row(c, &a))
     }
 
-    /// The names of the artifacts of an attempt that are verified and
-    /// published here.
-    pub fn persisted_artifacts(&self, attempt_id: &AttemptId) -> Result<Vec<String>> {
+    /// The artifacts of an attempt that are verified and published here:
+    /// the declared name and the digest it was published with.
+    pub fn persisted_artifacts(&self, attempt_id: &AttemptId) -> Result<Vec<(String, Digest)>> {
         let a = attempt_id.to_string();
         self.db.call(move |c| {
             let mut s = c.prepare(
-                "SELECT name FROM artifact_receipt
+                "SELECT name, digest FROM artifact_receipt
                  WHERE attempt_id = ?1 AND persisted_at_ms IS NOT NULL ORDER BY name",
             )?;
-            let names = s
-                .query_map([&a], |r| r.get::<_, String>(0))?
+            let rows = s
+                .query_map([&a], |r| {
+                    Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?))
+                })?
                 .collect::<std::result::Result<Vec<_>, _>>()?;
-            Ok(names)
+            rows.into_iter()
+                .map(|(name, digest)| {
+                    let digest = digest.ok_or_else(|| {
+                        StorageError::Corrupt(format!("persisted artifact {name} has no digest"))
+                    })?;
+                    Ok((name, id("digest", Digest::parse(&digest))?))
+                })
+                .collect()
         })
     }
 
@@ -215,16 +283,20 @@ impl CoordinatorStore {
     /// again changes nothing. Another digest starts over: the logs are read
     /// again from where they are and the verdict is open; receipts of
     /// artifacts that were published stay (an artifact is immutable). A
-    /// closed collection is never opened again. Returns whether this call
-    /// recorded a (new) result.
+    /// closed collection is not touched. `refs` (the files of the result
+    /// store this collection writes) are referenced for GC in the same
+    /// commit: no result is recorded whose files GC does not know. Returns
+    /// whether this call recorded a (new) result.
     pub fn begin_collection(
         &self,
         attempt_id: &AttemptId,
         result_digest: &Digest,
         result: &Value,
         declared: &[(String, bool)],
+        refs: &[ResultRef],
         at_ms: u64,
     ) -> Result<bool> {
+        let refs = refs.to_vec();
         let (a, digest, text) = (
             attempt_id.to_string(),
             result_digest.clone(),
@@ -241,7 +313,13 @@ impl CoordinatorStore {
                 });
             }
             let row = ensure_row(tx, &a, at_ms)?;
-            if row.closed_at_ms.is_some() || row.result_digest.as_ref() == Some(&digest) {
+            if row.closed_at_ms.is_some() {
+                return Ok(false);
+            }
+            for r in &refs {
+                add_ref(tx, &a, r, at_ms)?;
+            }
+            if row.result_digest.as_ref() == Some(&digest) {
                 return Ok(false);
             }
             let restarted = row.result_digest.is_some();
@@ -294,35 +372,116 @@ impl CoordinatorStore {
         })
     }
 
-    /// Reference a file of the parent's result store for GC. The same
-    /// reference again is a no-op.
-    pub fn add_result_ref(
+    /// An artifact is verified and published in the result store: its
+    /// receipt and the GC reference of its file, in one commit. Verified
+    /// progress: the strikes of the open collection start over.
+    pub fn record_collected_artifact(
         &self,
-        attempt_id: &AttemptId,
-        ref_id: &str,
-        kind: BlobKind,
-        locator: &str,
+        receipt: &ArtifactReceipt,
+        file: &ResultRef,
         at_ms: u64,
     ) -> Result<()> {
-        let r = common::NewBlobRef {
-            ref_id: ref_id.to_string(),
-            attempt_id: attempt_id.to_string(),
-            kind,
-            locator: locator.to_string(),
-        };
+        let (receipt, file) = (receipt.clone(), file.clone());
         self.db.write(move |tx| {
-            let have: Option<String> = tx
-                .query_row(
-                    "SELECT locator FROM blob_ref WHERE ref_id = ?1",
-                    [&r.ref_id],
-                    |row| row.get(0),
-                )
-                .optional()?;
-            match have {
-                Some(l) if l == r.locator => Ok(()),
-                Some(_) => Err(StorageError::Immutable(format!("reference {}", r.ref_id))),
-                None => common::add_blob_ref(tx, &r, at_ms),
+            let a = receipt.attempt_id.to_string();
+            add_ref(tx, &a, &file, at_ms)?;
+            Self::record_artifact_in(tx, &receipt, at_ms)?;
+            clear_strikes(tx, &a)
+        })
+    }
+
+    /// What the open collection recorded is not (or no longer) in the
+    /// result store as recorded: take the record back, so that it is
+    /// collected again. `logs`: the logs are read again from their start;
+    /// `artifacts`: these names are fetched again. Nothing is taken back
+    /// from a closed collection. Returns whether the collection is open.
+    pub fn recollect(
+        &self,
+        attempt_id: &AttemptId,
+        logs: bool,
+        artifacts: &[String],
+        at_ms: u64,
+    ) -> Result<bool> {
+        let (a, names) = (attempt_id.to_string(), artifacts.to_vec());
+        self.db.write(move |tx| {
+            let row = ensure_row(tx, &a, at_ms)?;
+            if row.closed_at_ms.is_some() {
+                return Ok(false);
             }
+            if logs {
+                tx.execute(
+                    "UPDATE collection SET logs_json = NULL, updated_at_ms = ?1
+                     WHERE attempt_id = ?2",
+                    params![to_i64(at_ms)?, a],
+                )?;
+            }
+            for name in &names {
+                tx.execute(
+                    "UPDATE artifact_receipt SET persisted_at_ms = NULL
+                     WHERE attempt_id = ?1 AND name = ?2",
+                    params![a, name],
+                )?;
+            }
+            let run = run_of(tx, &a)?;
+            common::append_event(
+                tx,
+                run.as_deref(),
+                Some(&a),
+                "collection_recollect",
+                &json!({"logs": logs, "artifacts": names}),
+                at_ms,
+            )?;
+            Ok(true)
+        })
+    }
+
+    /// Open a collection that was given up again, from its start: the
+    /// result is read again, and everything that is still in the result
+    /// store is verified again before it counts. Only a collection that was
+    /// given up is reopened: one that the worker acknowledged, or that was
+    /// closed without a worker, has nothing left to fetch.
+    ///
+    /// What this can still get depends on the worker: it keeps a result
+    /// that was never acknowledged for its `ack_wait_ms` after the end and
+    /// may delete it then. Reopened after that, the collection is answered
+    /// `NOT_FOUND` and is given up again.
+    ///
+    /// The retention of what was collected is measured from the close; the
+    /// failure that started it is taken back with the close. Returns whether
+    /// this call reopened it.
+    pub fn reopen_collection(&self, attempt_id: &AttemptId, at_ms: u64) -> Result<bool> {
+        let a = attempt_id.to_string();
+        self.db.write(move |tx| {
+            let Some(row) = load_row(tx, &a)? else {
+                return Ok(false);
+            };
+            if row.closed_at_ms.is_none() || row.verdict != Some(Verdict::GaveUp) {
+                return Ok(false);
+            }
+            tx.execute(
+                "UPDATE collection SET result_digest = NULL, result_json = NULL,
+                    logs_json = NULL, verdict = NULL, acked_at_ms = NULL, closed_at_ms = NULL,
+                    strikes = 0, updated_at_ms = ?1 WHERE attempt_id = ?2",
+                params![to_i64(at_ms)?, a],
+            )?;
+            tx.execute(
+                "UPDATE artifact_receipt SET persisted_at_ms = NULL WHERE attempt_id = ?1",
+                [&a],
+            )?;
+            tx.execute(
+                "UPDATE attempt SET collection_failed_at_ms = NULL WHERE attempt_id = ?1",
+                [&a],
+            )?;
+            let run = run_of(tx, &a)?;
+            common::append_event(
+                tx,
+                run.as_deref(),
+                Some(&a),
+                "collection_reopened",
+                &Value::Null,
+                at_ms,
+            )?;
+            Ok(true)
         })
     }
 
@@ -454,6 +613,7 @@ impl CoordinatorStore {
     /// is `missing`, and neither is a success.
     pub fn run_standing(&self, run_id: &RunId, expected: Option<u32>) -> Result<RunStanding> {
         let run = run_id.to_string();
+        let (collections, task_cancel) = (self.collections, self.task_cancel);
         self.db.call(move |c| {
             let known: i64 =
                 c.query_row("SELECT count(*) FROM run WHERE run_id = ?1", [&run], |r| {
@@ -462,10 +622,15 @@ impl CoordinatorStore {
             if known == 0 {
                 return Err(not_found(format!("run {run}")));
             }
-            let mut s = c.prepare(
-                "SELECT task_id, cancel_requested_at_ms IS NOT NULL FROM task
-                 WHERE run_id = ?1 ORDER BY rowid",
-            )?;
+            // A file from before the cancel column has no cancelled task.
+            let cancelled = if task_cancel {
+                "cancel_requested_at_ms IS NOT NULL"
+            } else {
+                "0"
+            };
+            let mut s = c.prepare(&format!(
+                "SELECT task_id, {cancelled} FROM task WHERE run_id = ?1 ORDER BY rowid"
+            ))?;
             let rows = s
                 .query_map([&run], |r| {
                     Ok((r.get::<_, String>(0)?, r.get::<_, bool>(1)?))
@@ -486,7 +651,9 @@ impl CoordinatorStore {
                     Some(aid) => {
                         let rec = load_attempt(c, aid)?
                             .ok_or_else(|| not_found(format!("attempt {aid}")))?;
-                        let closed = load_row(c, aid)?
+                        // A file from before collections has closed none.
+                        let row = if collections { load_row(c, aid)? } else { None };
+                        let closed = row
                             .filter(|row| row.closed_at_ms.is_some())
                             .and_then(|row| row.verdict);
                         (rec.termination.map(|t: Termination| t.outcome()), closed)
