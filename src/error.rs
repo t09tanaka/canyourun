@@ -99,6 +99,11 @@ pub enum ConflictReason {
     /// lists commits the clone does hold (see `blob_verify`): a bundle built
     /// on those is taken.
     BundleBaseMissing { have: Vec<String> },
+    /// A reason this version does not know (a newer peer sent it). What it
+    /// carried is dropped: the caller treats the error as a plain
+    /// `CONFLICT`.
+    #[serde(other)]
+    Unknown,
 }
 
 impl ErrorCode {
@@ -241,6 +246,7 @@ impl ApiError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
     use std::collections::HashSet;
 
     #[test]
@@ -365,6 +371,34 @@ mod tests {
         assert_eq!(serde_json::from_value::<ApiError>(v).unwrap(), e);
         let blocked = ApiError::blocked(BlockedReason::SecretUnavailable, "x");
         assert_eq!(blocked.conflict_reason, None);
+    }
+
+    #[test]
+    fn a_conflict_reason_of_a_newer_peer_is_read_as_unknown() {
+        for reason in [
+            json!({"reason": "clone_is_being_moved"}),
+            json!({"reason": "clone_is_being_moved", "have": ["x"], "retry_after_ms": 5}),
+        ] {
+            let v = json!({"code": "CONFLICT", "message": "later", "conflict_reason": reason});
+            let e: ApiError = serde_json::from_value(v).unwrap();
+            assert_eq!(e.code, ErrorCode::Conflict);
+            assert_eq!(e.message, "later");
+            assert_eq!(e.conflict_reason, Some(ConflictReason::Unknown));
+        }
+        // a reason that is known keeps what it carries
+        let known: ConflictReason =
+            serde_json::from_value(json!({"reason": "bundle_base_missing", "have": ["a"]}))
+                .unwrap();
+        assert_eq!(
+            known,
+            ConflictReason::BundleBaseMissing {
+                have: vec!["a".into()]
+            }
+        );
+        assert_eq!(
+            serde_json::to_value(ConflictReason::Unknown).unwrap(),
+            json!({"reason": "unknown"})
+        );
     }
 
     #[test]
