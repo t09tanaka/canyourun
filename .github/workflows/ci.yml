@@ -72,8 +72,47 @@ jobs:
         run: ./scripts/coverage-gate.sh
 
   # Add files to PURE below (and to the coverage gate) as pure modules land.
+  # The mutants are split over 4 parallel shards (cargo-schemata --shard K/4:
+  # every mutant belongs to exactly one shard, run exactly as in an unsharded
+  # run). The `mutation gate (pure modules)` job below merges the parts and is
+  # the only required result.
+  mutants-shard:
+    name: mutation shard (${{ matrix.shard }}/4)
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3]
+    env:
+      PURE: "src/ids.rs src/state.rs src/error.rs src/wire.rs src/config/legacy.rs src/config/parse.rs src/config/paths.rs src/config/resolve.rs src/source/safety.rs src/source/classify.rs src/source/diff.rs src/storage/policy.rs src/protocol/frame.rs src/protocol/sched.rs src/protocol/hello.rs src/protocol/chunk.rs src/protocol/ssh.rs src/supervisor/spool_plan.rs src/workspace/plan.rs src/secrets/plan.rs src/secrets/envfile.rs src/secrets/mask.rs src/supervisor/lease.rs src/supervisor/timeouts.rs src/supervisor/escalation.rs src/supervisor/identity.rs src/supervisor/termination.rs src/worker/policy.rs"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: mutation
+      - name: install cargo-schemata
+        run: |
+          # A cached binary of another version is replaced, not reused.
+          if ! cargo schemata --version 2>/dev/null | grep -q '0\.3\.0'; then
+            cargo install cargo-schemata --locked --version 0.3.0 --force
+          fi
+      - name: mutate this shard
+        run: |
+          args=""; for f in $PURE; do args="$args --file $f"; done
+          cargo schemata $args --shard "${{ matrix.shard }}/4" --jobs "$(nproc)" -o schemata.out
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: schemata-shard-${{ matrix.shard }}
+          path: schemata.out
+          if-no-files-found: error
+
   mutants-pure:
     name: mutation gate (pure modules)
+    needs: mutants-shard
+    # Runs even when a shard failed, so the gate itself reports the failure.
+    if: always()
     runs-on: ubuntu-latest
     env:
       PURE: "src/ids.rs src/state.rs src/error.rs src/wire.rs src/config/legacy.rs src/config/parse.rs src/config/paths.rs src/config/resolve.rs src/source/safety.rs src/source/classify.rs src/source/diff.rs src/storage/policy.rs src/protocol/frame.rs src/protocol/sched.rs src/protocol/hello.rs src/protocol/chunk.rs src/protocol/ssh.rs src/supervisor/spool_plan.rs src/workspace/plan.rs src/secrets/plan.rs src/secrets/envfile.rs src/secrets/mask.rs src/supervisor/lease.rs src/supervisor/timeouts.rs src/supervisor/escalation.rs src/supervisor/identity.rs src/supervisor/termination.rs src/worker/policy.rs"
@@ -81,15 +120,37 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: mutation
+          save-if: false
       - name: install cargo-schemata
         run: |
-          # A cached binary of another version is replaced, not reused.
           if ! cargo schemata --version 2>/dev/null | grep -q '0\.3\.0'; then
             cargo install cargo-schemata --locked --version 0.3.0 --force
           fi
-      - name: every target file has mutants, zero survivors
+      - name: every target file has mutants
         run: |
           if [ -z "$PURE" ]; then echo "no pure modules yet"; exit 0; fi
           scripts/mutation-targets-check.sh $PURE
-          args=""; for f in $PURE; do args="$args --file $f"; done
-          cargo schemata $args --jobs "$(nproc)"
+      - uses: actions/download-artifact@v4
+        if: always()
+        with:
+          pattern: schemata-shard-*
+          path: parts
+      - name: merge the shards, zero survivors
+        env:
+          SHARDS_RESULT: ${{ needs.mutants-shard.result }}
+        run: |
+          # Any shard that did not succeed (missed or timed-out mutants, build
+          # error, cancelled, missing artifact) fails the gate.
+          if [ "$SHARDS_RESULT" != "success" ]; then
+            echo "mutation shards: $SHARDS_RESULT" >&2
+            status=1
+          fi
+          for k in 0 1 2 3; do
+            [ -f "parts/schemata-shard-$k/report.json" ] || { echo "missing report of shard $k" >&2; exit 1; }
+          done
+          cargo schemata merge parts/schemata-shard-*/report.json -o schemata.out
+          echo "missed: $(wc -l < schemata.out/missed.txt), timeout: $(wc -l < schemata.out/timeout.txt)"
+          [ ! -s schemata.out/missed.txt ] || { cat schemata.out/missed.txt >&2; exit 1; }
+          exit "${status:-0}"
