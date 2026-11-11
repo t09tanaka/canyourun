@@ -175,6 +175,25 @@ ALTER TABLE task ADD COLUMN cancel_requested_at_ms INTEGER;
 CREATE INDEX placement_attempt ON placement(attempt_id);
 ";
 
+/// Result collection: what was read from the worker, by digest, and how the
+/// collection of an ended attempt was closed.
+const COORDINATOR_V3: &str = "
+CREATE TABLE collection (
+    attempt_id    TEXT PRIMARY KEY REFERENCES attempt(attempt_id),
+    result_digest TEXT,
+    result_json   TEXT,
+    logs_json     TEXT,
+    verdict       TEXT CHECK (verdict IN ('complete','required_missing','gave_up')),
+    acked_at_ms   INTEGER,
+    closed_at_ms  INTEGER,
+    strikes       INTEGER NOT NULL DEFAULT 0 CHECK (strikes >= 0),
+    updated_at_ms INTEGER NOT NULL,
+    CHECK ((result_digest IS NULL) = (result_json IS NULL)),
+    CHECK (acked_at_ms IS NULL OR closed_at_ms IS NOT NULL),
+    CHECK ((closed_at_ms IS NULL) = (verdict IS NULL))
+);
+";
+
 const WORKER_V1: &str = "
 CREATE TABLE worker_state (
     singleton             INTEGER PRIMARY KEY CHECK (singleton = 1),
@@ -265,6 +284,7 @@ pub(crate) fn steps(kind: DbKind) -> Vec<String> {
         DbKind::Coordinator => vec![
             format!("{COMMON}{COORDINATOR_V1}"),
             COORDINATOR_V2.to_string(),
+            COORDINATOR_V3.to_string(),
         ],
         DbKind::Worker => vec![format!("{COMMON}{WORKER_V1}")],
     }

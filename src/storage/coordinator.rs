@@ -18,7 +18,9 @@ use rusqlite::{params, Connection, OptionalExtension, Row};
 use serde_json::Value;
 use std::path::Path;
 
+mod collect;
 mod queue;
+pub use collect::{Collectable, CollectionRow, ResultRef, RunStanding};
 pub use queue::{LiveAttempt, PlaceInput, PlaceOutcome, QueuedTask, RetireEnd, Seen, WorkerLoad};
 
 const ATTEMPT: &str = "attempt";
@@ -235,6 +237,9 @@ pub struct CoordinatorStore {
     /// False for a step-1 file opened read-only: its tasks have no cancel
     /// column (no task of it was ever cancelled before it was placed).
     task_cancel: bool,
+    /// False for a file from before the third step opened read-only: it has
+    /// no `collection` table (no collection of it was ever begun).
+    collections: bool,
     _lock: Option<ProcessLock>,
 }
 
@@ -295,6 +300,7 @@ impl CoordinatorStore {
             coordinator_id,
             epoch,
             task_cancel: true,
+            collections: true,
             _lock: Some(lock),
         })
     }
@@ -307,7 +313,13 @@ impl CoordinatorStore {
             DbKind::Coordinator,
             Access::ReadOnly,
         )?;
-        let (cluster_id, coordinator_id, epoch, task_cancel) = db.call(|c| {
+        let (cluster_id, coordinator_id, epoch, task_cancel, collections) = db.call(|c| {
+            let collections: bool = c.query_row(
+                "SELECT count(*) > 0 FROM sqlite_master
+                 WHERE type = 'table' AND name = 'collection'",
+                [],
+                |r| r.get(0),
+            )?;
             let task_cancel: bool = c.query_row(
                 "SELECT count(*) > 0 FROM pragma_table_info('task')
                  WHERE name = 'cancel_requested_at_ms'",
@@ -328,6 +340,7 @@ impl CoordinatorStore {
                 id("coordinator_id", CoordinatorId::parse(&co))?,
                 CoordinatorEpoch(to_u64(ep)?),
                 task_cancel,
+                collections,
             ))
         })?;
         Ok(Self {
@@ -336,6 +349,7 @@ impl CoordinatorStore {
             coordinator_id,
             epoch,
             task_cancel,
+            collections,
             _lock: None,
         })
     }
@@ -937,7 +951,17 @@ impl CoordinatorStore {
     /// same receipt again is a no-op, a different one is a conflict.
     pub fn record_artifact(&self, r: &ArtifactReceipt, at_ms: u64) -> Result<()> {
         let r = r.clone();
-        self.db.write(move |tx| {
+        self.db
+            .write(move |tx| Self::record_artifact_in(tx, &r, at_ms))
+    }
+
+    /// [`Self::record_artifact`] in the transaction of the caller.
+    pub(super) fn record_artifact_in(
+        tx: &rusqlite::Transaction<'_>,
+        r: &ArtifactReceipt,
+        at_ms: u64,
+    ) -> Result<()> {
+        {
             let a = r.attempt_id.to_string();
             common::read_core(tx, ATTEMPT, &a)?;
             let persisted: Option<Option<i64>> = tx
@@ -970,7 +994,10 @@ impl CoordinatorStore {
                     if same == 1 {
                         return Ok(());
                     }
-                    return Err(StorageError::Immutable(format!("artifact {} of {a}", r.name)));
+                    return Err(StorageError::Immutable(format!(
+                        "artifact {} of {a}",
+                        r.name
+                    )));
                 }
                 Some(None) => {
                     tx.execute(
@@ -1010,7 +1037,7 @@ impl CoordinatorStore {
                 }
             }
             Ok(())
-        })
+        }
     }
 
     /// Set the `collected` receipt. Only when the attempt is terminal and
@@ -1116,8 +1143,9 @@ impl CoordinatorStore {
         })
     }
 
-    /// Drop the references of attempts that ended at least `retention_ms`
-    /// ago and whose required outputs are collected, or that ended without
+    /// Drop the references of attempts that ended (and, when their outputs
+    /// were collected, were collected) at least `retention_ms` ago and whose
+    /// required outputs are collected, or that ended without
     /// anything to wait for: the retire was confirmed
     /// ([`Self::confirm_retire`]) or collection was given up
     /// ([`Self::record_collection_failed`]). Running, awaiting-collection,
@@ -1147,8 +1175,11 @@ impl CoordinatorStore {
                 let rec = load_attempt(conn, &r.attempt_id)?
                     .ok_or_else(|| not_found(format!("attempt {}", r.attempt_id)))?;
                 let (required, persisted) = artifact_counts(conn, &r.attempt_id)?;
+                // What was collected late is kept for the whole retention
+                // from then: the end that counts is the later of the two.
+                let closed = collect::closed_at(conn, &r.attempt_id)?;
                 Ok(GcCandidate {
-                    terminal_at_ms: rec.terminal_at_ms,
+                    terminal_at_ms: rec.terminal_at_ms.map(|t| t.max(closed.unwrap_or(0))),
                     retired_at_ms: rec.retired_at_ms,
                     collected: rec.receipts.reached(Receipt::Collected),
                     collection_failed_at_ms: rec.collection_failed_at_ms,

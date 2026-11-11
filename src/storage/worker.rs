@@ -1048,6 +1048,31 @@ impl WorkerStore {
         epoch: CoordinatorEpoch,
         at_ms: u64,
     ) -> Result<bool> {
+        self.ack(attempt_id, epoch, at_ms, None)
+    }
+
+    /// [`Self::ack_collected`] for a parent whose digest was checked against
+    /// a read that found a stored result (`had_result`) or none. Refused,
+    /// in the same transaction as the acknowledgement, when that is not so
+    /// any more: a result is stored once and never changed, so the only way
+    /// the checked digest can be stale is a result that was stored since.
+    pub fn ack_collected_as_read(
+        &self,
+        attempt_id: &AttemptId,
+        epoch: CoordinatorEpoch,
+        at_ms: u64,
+        had_result: bool,
+    ) -> Result<bool> {
+        self.ack(attempt_id, epoch, at_ms, Some(had_result))
+    }
+
+    fn ack(
+        &self,
+        attempt_id: &AttemptId,
+        epoch: CoordinatorEpoch,
+        at_ms: u64,
+        had_result: Option<bool>,
+    ) -> Result<bool> {
         let a = attempt_id.to_string();
         under_epoch(&self.db, epoch, move |tx| {
             let rec = require(tx, &a)?;
@@ -1057,6 +1082,20 @@ impl WorkerStore {
                     state: rec.state,
                     why: "only a terminal attempt can be acknowledged",
                 });
+            }
+            if let Some(had) = had_result {
+                let has: bool = tx.query_row(
+                    "SELECT result_json IS NOT NULL FROM worker_attempt WHERE attempt_id = ?1",
+                    [&a],
+                    |r| r.get(0),
+                )?;
+                if has != had {
+                    return Err(StorageError::IllegalState {
+                        attempt: a,
+                        state: rec.state,
+                        why: "its result was stored after the acknowledged one was read",
+                    });
+                }
             }
             let n = tx.execute(
                 "UPDATE worker_attempt SET acked_at_ms = ?1 WHERE attempt_id = ?2 AND acked_at_ms IS NULL",
@@ -1236,7 +1275,8 @@ fn canonical_result(result: &Value) -> Result<String> {
 }
 
 /// Store `text` as the result of the terminal attempt `a`, unless it has an
-/// equal one already (`false`); another one is refused.
+/// equal one already (`false`); another one is refused, and so is a first
+/// one after the attempt was acknowledged without a result.
 fn store_result(tx: &rusqlite::Transaction<'_>, a: String, text: String) -> Result<bool> {
     let rec = require(tx, &a)?;
     if !rec.state.is_terminal() {
@@ -1252,6 +1292,14 @@ fn store_result(tx: &rusqlite::Transaction<'_>, a: String, text: String) -> Resu
         |r| r.get(0),
     )?;
     match existing {
+        // The parent closed its collection on "this attempt has no result"
+        // and nothing protects what would be stored now: refuse it, so that
+        // the caller fails instead of losing the result silently.
+        None if rec.acked_at_ms.is_some() => Err(StorageError::IllegalState {
+            attempt: a,
+            state: rec.state,
+            why: "the attempt was acknowledged without a result",
+        }),
         None => {
             tx.execute(
                 "UPDATE worker_attempt SET result_json = ?1 WHERE attempt_id = ?2",

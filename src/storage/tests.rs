@@ -1335,6 +1335,14 @@ fn receipts_log_positions_and_results() {
     ));
     assert_eq!(w.store.get_result(id).unwrap(), Some(json!({"ok": 1})));
     assert_eq!(w.store.get_result(&AttemptId::generate()).unwrap(), None);
+    // The result that was acknowledged is stored again as often as it is
+    // asked for; only a first result after the acknowledgement is refused.
+    assert!(w
+        .store
+        .ack_collected_as_read(id, CoordinatorEpoch(1), 10, true)
+        .unwrap());
+    w.store.record_result(id, &json!({"ok": 1})).unwrap();
+    assert_eq!(w.store.get_result(id).unwrap(), Some(json!({"ok": 1})));
 }
 
 #[test]
@@ -1379,10 +1387,60 @@ fn worker_gc_waits_for_the_ack_and_the_retention_and_skips_pins() {
         .store
         .ack_collected(&ids[0], CoordinatorEpoch(1), 2_001)
         .unwrap());
+    // An acknowledgement of a read that found no result is refused once a
+    // result is there (and the other way round), and changes nothing.
+    assert_eq!(w.store.get_result(&ids[1]).unwrap(), None);
+    assert!(matches!(
+        w.store
+            .ack_collected_as_read(&ids[1], CoordinatorEpoch(1), 2_002, true),
+        Err(StorageError::IllegalState { .. })
+    ));
+    assert!(w
+        .store
+        .events_of(&ids[1], "ack_collected")
+        .unwrap()
+        .is_empty());
+    w.store
+        .finalize_with_result(
+            &ids[1],
+            done(Outcome::Succeeded),
+            2_003,
+            |t| serde_json::json!({ "termination": t, "artifacts": [] }),
+        )
+        .unwrap();
+    assert!(matches!(
+        w.store
+            .ack_collected_as_read(&ids[1], CoordinatorEpoch(1), 2_004, false),
+        Err(StorageError::IllegalState { .. })
+    ));
+    assert!(w
+        .store
+        .events_of(&ids[1], "ack_collected")
+        .unwrap()
+        .is_empty());
     assert!(w
         .store
         .ack_collected(&running, CoordinatorEpoch(1), 1)
         .is_err());
+    // An attempt that was acknowledged without a result takes none any
+    // more: storing one fails, loudly, and nothing is stored.
+    assert_eq!(w.store.get_result(&ids[3]).unwrap(), None);
+    assert!(matches!(
+        w.store.finalize_with_result(
+            &ids[3],
+            done(Outcome::Succeeded),
+            2_005,
+            |t| serde_json::json!({ "termination": t, "artifacts": [] }),
+        ),
+        Err(StorageError::IllegalState { why, .. })
+            if why == "the attempt was acknowledged without a result"
+    ));
+    assert!(matches!(
+        w.store
+            .record_result(&ids[3], &serde_json::json!({"ok": 1})),
+        Err(StorageError::IllegalState { .. })
+    ));
+    assert_eq!(w.store.get_result(&ids[3]).unwrap(), None);
     w.store.pin_blob("r2").unwrap();
     let now = 1_000 + 7 * DAY;
     // r3 would be old enough too; make it recent by giving it a later terminal.
@@ -2924,7 +2982,11 @@ fn a_step_1_coordinator_database_with_rows_is_read_as_it_is_and_upgraded_once() 
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("coordinator.db");
     let all = schema::steps(DbKind::Coordinator);
-    assert_eq!(all.len(), 2, "this test is about step 1 -> 2");
+    assert_eq!(
+        all.len(),
+        3,
+        "this test is about step 1 and the steps after it"
+    );
     let (cluster, coordinator) = (ClusterId::generate(), CoordinatorId::generate());
     let (run, queued_task, placed_task) =
         (RunId::generate(), TaskId::generate(), TaskId::generate());
@@ -3020,14 +3082,28 @@ fn a_step_1_coordinator_database_with_rows_is_read_as_it_is_and_upgraded_once() 
             ro.task_cancel_requested(&TaskId::generate()),
             Err(StorageError::NotFound { .. })
         ));
+        // It has no collections: none is open, none is closed, and the run
+        // stands as its attempts do.
+        assert_eq!(ro.collection(&attempt).unwrap(), None);
+        assert!(ro.collectable(None, 10).unwrap().is_empty());
+        assert!(ro.persisted_artifacts(&attempt).unwrap().is_empty());
+        let standing = ro.run_standing(&run, None).unwrap();
+        assert_eq!(
+            standing.verdict,
+            crate::results::plan::RunVerdict::Collecting
+        );
+        assert_eq!(standing.tasks.len(), 2);
     }
 
     // Opened for writing, it is migrated, and every row is still there.
     let store = CoordinatorStore::open(dir.path(), 10).unwrap();
-    assert_eq!(schema_of(&store), ("2".to_string(), 1, 1));
+    assert_eq!(schema_of(&store), ("3".to_string(), 1, 1));
     assert_eq!(store.epoch(), CoordinatorEpoch(4));
     assert_eq!(store.cluster_id(), &cluster);
     check_rows(&store);
+    // What the third step added is there, and empty.
+    assert!(store.collectable(None, 10).unwrap().is_empty());
+    assert_eq!(store.collection(&attempt).unwrap(), None);
     // What the second step added works on the old rows.
     assert_eq!(store.cancel_task(&queued_task, 11).unwrap(), None);
     assert_eq!(store.task_cancel_requested(&queued_task).unwrap(), Some(11));
@@ -3039,7 +3115,7 @@ fn a_step_1_coordinator_database_with_rows_is_read_as_it_is_and_upgraded_once() 
 
     // Opening again migrates nothing and loses nothing.
     let store = CoordinatorStore::open(dir.path(), 20).unwrap();
-    assert_eq!(schema_of(&store), ("2".to_string(), 1, 1));
+    assert_eq!(schema_of(&store), ("3".to_string(), 1, 1));
     assert_eq!(store.epoch(), CoordinatorEpoch(5));
     assert_eq!(store.task_cancel_requested(&queued_task).unwrap(), Some(11));
     assert_eq!(store.live_attempts(None).unwrap().len(), 1);

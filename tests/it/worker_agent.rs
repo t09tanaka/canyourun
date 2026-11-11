@@ -2407,6 +2407,50 @@ async fn a_supervisor_that_cannot_be_started_is_tried_five_times_then_the_attemp
     });
     assert_eq!(events(&f, &a, "agent_gave_up"), 1);
     wait_for("the cleanup", || f.host.count(&format!("cleanup {a}")) > 0);
+
+    // The attempt ended without a result. While a supervisor of it may
+    // live (its lock is held), one could still be stored: the
+    // acknowledgement waits, and nothing is released.
+    let Response::GetResult(result) = call(
+        &c,
+        Request::GetResult(GetResultRequest {
+            schema_version: SchemaVersion::CURRENT,
+            request_id: RequestId::generate(),
+            attempt_id: a.clone(),
+            generation: Generation(1),
+        }),
+    )
+    .await
+    .unwrap() else {
+        panic!()
+    };
+    let ack = || {
+        Request::AckCollected(AckCollectedRequest {
+            schema_version: SchemaVersion::CURRENT,
+            request_id: RequestId::generate(),
+            attempt_id: a.clone(),
+            generation: Generation(1),
+            result_digest: result.result_digest.clone(),
+        })
+    };
+    let held = remote_task_runner::supervisor::lock::SupervisorLock::try_acquire(&f.state(), &a)
+        .unwrap()
+        .expect("no supervisor lives");
+    let e = call(&c, ack()).await.unwrap_err();
+    assert_eq!(e.code, ErrorCode::Overloaded);
+    assert!(f.rec(&a).acked_at_ms.is_none());
+    drop(held);
+    let Response::AckCollected(r) = call(&c, ack()).await.unwrap() else {
+        panic!()
+    };
+    assert!(r.released);
+    assert!(f.rec(&a).acked_at_ms.is_some());
+    // And the lock is free again for whoever comes next.
+    assert!(
+        remote_task_runner::supervisor::lock::SupervisorLock::try_acquire(&f.state(), &a)
+            .unwrap()
+            .is_some()
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

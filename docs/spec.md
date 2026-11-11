@@ -680,7 +680,21 @@ artifactの記録（`get_result` の `artifacts` の1件）は、name、相対pa
 
 親は検証と永続commit後に冪等な `ack_collected` を送る。workerはそのACKを受理してから回収待ちのGC保護を解除する。単なるdownload完了やSSH正常終了を保存確認には使わない。
 
+**親の回収の手順**: 親は、terminalになったattemptごとに回収の記録を1件持ち、次の順に進める。どの段階で親が落ちても、接続が切れても、次の回収は親に永続保存済みの事実から続きを行い、commandは実行し直さない。
+
+1. `get_result` でresultを読み、`<attempt>/result.json` へ書いて（一時ファイル → fsync → rename → directoryのfsync）から、`result_digest` とともに記録する。記録と、result・logのファイルへのGC参照は同じtransactionで確定する。resultのattempt・generation・terminationが親の記録と違うもの、artifactの名前が相対pathとして使えないもの、同じ名前を2回載せたもの、1024件を超えるもの、上限（既定1 GiB）を超えるartifactを載せたものは記録しない。
+2. `read_log` でstdout・stderrを終端まで読む。終端は `read_log` の `eof`（spoolが閉じられ、その末尾まで読んだ）であり、`log_truncated` と保存されなかったbytes数はこの応答から取る。event journalの `log_truncated` はterminalの後に書かれるので、logの完了の判定に使わない。resultを持たないattempt（`result_digest` がterminationだけのresultのもの）はspoolが閉じられないことがあるので、読めた分を取り、不完全（`complete: false`）と記録する。
+3. resultに載っていて親が宣言したartifactを `blob_get` で取得する。途中までのbytesは `<attempt>/tmp/<sha256>.part` に置き、chunkごとにfsyncする。再開はこのファイルの長さから行う。全bytesが揃ったらsizeとdigestを照合し、合えばfsyncしてから `<attempt>/artifacts/<sha256>` へrenameする（合わなければ捨てて最初から取り直す）。親の保存先はdigestであり、workerが決めた名前を親のpathに使わない（大文字小文字だけが違う名前、他の名前のdirectoryになる名前、長すぎる名前が、親のファイルシステムで衝突も失敗もしない）。どの名前がどのdigestかは、resultと受領の記録が持つ。公開済みで受領の記録がまだ無いファイル（renameの直後に親が落ちた場合）は、記録の前にdigestを確かめ直す。受領の記録とそのファイルへのGC参照は同じtransactionで確定する。親が宣言していないartifactは取得しない。親が送ったpayload（宣言の出所）を読めないattemptは、宣言なしとして扱わず、回収もACKもしない。
+4. すべてが検証され永続保存された後に、記録した `result_digest` で `ack_collected` を送る。送る直前に、記録したものがdiskにあることを確かめ直す: `result.json` を記録から書き直し、各logと各artifactを読んで記録した長さとdigestに照合し、ファイルとその上の各directoryをfsyncする（新しく作ったdirectoryとファイルは、作った時点でも親directoryをfsyncする）。記録と合わないものは記録を取り消して回収し直し、それが済むまでACKを送らない。workerが別のresultを持っていれば（resultなしで確定したattemptに後からresultが保存された場合）`CONFLICT` で断るので、親はresultを読み直し、digestが違えば1から回収し直す。workerは、digestを照合した読み取りの後にresultが保存された場合も、ACKの記録と同じtransactionで断る。
+5. workerがACKを受理した記録と、attemptの `collected` を、同じtransactionで確定する。応答を失ったACKは送り直す（workerは同じACKを何度でも受理する）。送り直したACKにworkerが `NOT_FOUND`・`RETIRED` で答えた場合（解放して削除した後）は、親にすべてが揃っているので回収を閉じる。resultを持たないattemptへのACKは、workerがそのattemptのsupervisorのlockを取れたときだけ記録する（supervisorが生きている間は後からresultが保存されうるので `OVERLOADED` で断り、親は待つ）。resultなしでACKされたattemptへのresultの保存は、workerが失敗として断る。
+
+回収の失敗に数えるのは、問い合わせ直しても変わらないものだけである: 全bytesを受け取ったobjectのdigest・sizeの不一致、問い合わせと合わない・自己矛盾した応答（使えない名前を含む）、workerの `NOT_FOUND`・`RETIRED`（workerはACKを待つ期限 `ack_wait_ms` を過ぎたresultだけを削除する）。これが、間に検証済みの前進（artifactの公開）を挟まずに3回続いたら回収を打ち切り、`COLLECTION_FAILED` を確定する。それ以外（接続の切断、`OVERLOADED`、worker内部の失敗 `INTERNAL`、未知のerror code、親自身のdiskやDBの失敗）は数えず、間隔を延ばしながら（既定1秒から倍々、最大64秒。切断は待たない）何度でも待つ。前の親が残した `.part`（末尾が壊れているかもしれない）がdigestに合わないときは、失敗に数えずに捨てて最初から取り直す。1つのattemptの失敗は、同じworkerの他のattemptの回収を止めない。打ち切った回収ではACKを送らず、途中のファイル（`tmp/`）を消す。打ち切った回収は開き直せる（resultの読み直しから。親に残っているファイルは検証し直す）。workerが未ACKのresultを保持するのは `ack_wait_ms` の間なので、それを過ぎて開き直した回収は `NOT_FOUND` で再び打ち切られる。
+
+**必須artifactと任意artifactの判定**: 親が `required` で宣言したartifactがresultの `artifacts` に無い場合（`artifacts_not_stored` の `missing`・`refused`、またはどちらの一覧にも無い）、そのattemptは `collected` にならず、taskは成功にならない（commandが成功していても「必須artifactの欠落」）。resultは変わらないので、`missing` も `refused` も取り直さない。存在するartifactとlogは回収し、ACKも送る（workerに残す理由が無い）。`optional` の欠落はtaskの結果を変えない。親がterminationを確定したattempt（workerが受理していない、またはretireを親が確定した）は、workerに問い合わせずに回収を閉じる。
+
 attemptごとの保存領域を分け、古いattemptの結果は診断用に保持しても新attemptの結果を上書きしない。CIの全expected Unit、展開済みmatrix、必須stepがterminalか、明示されたskip理由を持つことを検査する。空の結果集合や欠落resultをsuccessと解釈しない。フィルタによって実行対象0件なら `no_work` とし、「テスト成功」と区別する。
+
+runの判定は、taskごとの「現在のattempt（retireされていないもの）の終わり方」と「閉じた回収の結果」から決める。期待するtaskが0件なら `no_work`、期待より少なければ `missing`、終わっていないか回収が閉じていないtaskがあれば `collecting`、全taskが成功しかつ回収が完全なら `passed`、それ以外は `failed` である。`no_work`・`missing`・`collecting` は成功ではない。
 
 matrixのoutputは既定で元のmatrix順に集約し、完了到着順によるlast-write-winsを禁止する。明示shardはby-shard namespaceまたは指定reducerを使用する。CIの判定には既存のcondition、continue-on-error、fail-fastの意味を保持する。
 
@@ -688,7 +702,7 @@ matrixのoutputは既定で元のmatrix順に集約し、完了到着順によ�
 
 中間artifactはupload step時点でimmutableに固定し、親で検証・永続保存したreceiptを公開してからstepを完了する。download側はこのreceiptを待つ。最終run回収とは別の処理とし、後段がUnit terminalまでartifactを待つdeadlockを作らない。同名artifactのconflictもworkflow単位で判定し、別workflowが同名のartifactをuploadしてもconflictにならない（local-ci 0.8.0以降の実装と同じ）。別workflowのartifactはdownloadできない。同名artifactは同じworkflow内では既定でconflict、明示overwriteは新しいartifact versionとして記録する。matrixにはvariantを含む名前または明示reducerを必要とする。
 
-`outputs` は明示directoryへ展開する。元worktreeへ戻す操作を用意する場合は、実行時sourceと現在内容の差分を確認し、競合を拒否する。入力、ログ、結果の既定保持はterminal後7日とし、実行中・回収待ち・参照中cacheはGCしない。削除前に未回収必須artifactを検査する。
+`outputs` は明示directoryへ展開する。元worktreeへ戻す操作を用意する場合は、実行時sourceと現在内容の差分を確認し、競合を拒否する。入力、ログ、結果の既定保持はterminal後7日とし、実行中・回収待ち・参照中cacheはGCしない。削除前に未回収必須artifactを検査する。親が回収した結果（result・log・artifact）は、回収が閉じた（`collected`、または回収の打ち切り・必須artifactの欠落を確定した）attemptについて消す。保持期間は、terminalと回収を閉じた時点の遅い方から数える（workerが長く不在で、terminalから保持期間を過ぎて回収された結果を、回収の直後に消さない）。回収の判定の記録は消さない。
 
 secret bundleの内容はartifact・outputs・ログspoolのいずれにも含めない（第22章）。
 
