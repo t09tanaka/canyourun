@@ -462,7 +462,7 @@ async fn two_workers_without_history_are_ordered_by_their_ranking() {
     }
     assert!(d
         .summary()
-        .contains("w-b=10000ms fallback, w-a=30000ms fallback"));
+        .contains("w-b=rank 10000 fallback, w-a=rank 30000 fallback"));
 }
 
 // ------------------------------------------------- the age of a forecast

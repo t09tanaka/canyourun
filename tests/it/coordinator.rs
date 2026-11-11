@@ -190,7 +190,9 @@ impl FakeWorker {
                     says: Says::Number(RuntimeSource::Measured),
                     boot: "boot-1",
                     epoch: 1,
-                    ttl_ms: 2000,
+                    // Long: a test that is about something else must not
+                    // turn on how fast the machine is.
+                    ttl_ms: 600_000,
                     delay_ms: 0,
                 },
                 asked: Vec::new(),
@@ -611,7 +613,12 @@ pub(crate) fn fx() -> Fx {
             lease_ms: 60_000,
             worker_budget_ms: 10_000,
         },
-        sched: SchedulerConfig::default(),
+        sched: {
+            let mut sched = SchedulerConfig::default();
+            // See the fake's `ttl_ms`.
+            sched.rules.forecast_ttl_ms = 600_000;
+            sched
+        },
         costs: Arc::new(UnknownCosts),
     }
 }
@@ -1881,6 +1888,17 @@ async fn a19_a_real_worker_stops_the_retired_run_and_the_resent_retire_frees_the
     .unwrap();
     assert_eq!(c.tick().await.unwrap().placed.len(), 1);
     let first = only(&c, &task);
+    // The real worker answered the scheduler's forecast question with a
+    // number to compare by (a ranking: nothing has run here before).
+    let decision = remote_task_runner::scheduler::reason_of(c.store(), &first.attempt_id)
+        .unwrap()
+        .unwrap();
+    let outlook = decision.compared[0].outlook;
+    assert_eq!(outlook.unusable, None, "{decision:?}");
+    assert!(
+        outlook.finish_ms.or(outlook.ranking_ms).is_some(),
+        "{decision:?}"
+    );
     worker_agent::wait_for("the command", || read_pid(&pidfile).is_some());
     let pid = read_pid(&pidfile).unwrap();
     c.tick().await.unwrap();

@@ -301,7 +301,8 @@ fn word<T: Serialize>(t: &T) -> String {
 }
 
 impl Decision {
-    /// One line for a person. The numbers are compared values in ms.
+    /// One line for a person. A measured worker shows its compared value as
+    /// a time; a fallback figure is shown as a rank, never as a time.
     pub fn summary(&self) -> String {
         let head = match (&self.winner, self.why) {
             (Some(w), Why::OnlyCandidate) => format!("{w}: the only candidate"),
@@ -314,9 +315,10 @@ impl Decision {
         let compared: Vec<String> = self
             .compared
             .iter()
-            .map(|c| match c.compare_ms {
-                Some(ms) => format!("{}={}ms {}", c.worker_id, ms, word(&c.label)),
-                None => format!("{}=unknown (not counted as free)", c.worker_id),
+            .map(|c| match (c.compare_ms, c.label) {
+                (Some(ms), Label::Measured) => format!("{}={}ms measured", c.worker_id, ms),
+                (Some(rank), _) => format!("{}=rank {} fallback", c.worker_id, rank),
+                (None, _) => format!("{}=unknown (not counted as free)", c.worker_id),
             })
             .collect();
         let excluded: Vec<String> = self
@@ -830,7 +832,7 @@ mod tests {
         ]);
         assert_eq!(
             d.summary(),
-            "w-b: earliest predicted completion; compared: [w-b=50000ms fallback, \
+            "w-b: earliest predicted completion; compared: [w-b=rank 50000 fallback, \
              w-a=80000ms measured, w-c=unknown (not counted as free)]; excluded: []"
         );
         let d = pair(|a, _| a.load = 1);
