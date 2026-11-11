@@ -290,9 +290,7 @@ impl Setups {
         if launched {
             // something may still run: the supervisor's recovery stops what
             // it recorded, through the guarded path, and settles the attempt
-            let spec = SuperviseSpec::from_file(&dir.join("spec.json"));
-            let settled = spec.ok().and_then(|s| supervise(&s).ok());
-            if settled.is_none_or(|r| r.unresolved.is_some()) {
+            if !self.settle_in_process(dir, attempt) {
                 return false;
             }
         }
@@ -525,11 +523,7 @@ impl Setups {
                 return;
             }
             std::thread::sleep(Duration::from_millis(self.cfg.poll_ms.max(REAP_PAUSE_MS)));
-            let settled = SuperviseSpec::from_file(&dir.join("spec.json"))
-                .ok()
-                .and_then(|s| supervise(&s).ok())
-                .is_some_and(|r| r.unresolved.is_none());
-            if !settled {
+            if !self.settle_in_process(dir, attempt) {
                 continue;
             }
             if let Some(ws) = std::fs::read(dir.join("workspace.json"))
@@ -545,6 +539,35 @@ impl Setups {
                 return;
             }
         }
+    }
+
+    /// Settle a builder whose supervisor is gone, in this process, through
+    /// the supervisor's own recovery. The builder is cancelled first: a
+    /// supervisor that died before it recorded a launch left the attempt
+    /// `Ready` with nothing started, and `supervise` would then *run* the
+    /// steps here, in the agent, with nobody renewing the lease. With the
+    /// cancel recorded it starts nothing and only stops what was recorded.
+    /// `true` when the attempt is settled and nothing of it can still run.
+    fn settle_in_process(&self, dir: &Path, attempt: &AttemptId) -> bool {
+        let Ok(store) = WorkerStore::open(dir, &self.cfg.worker_id) else {
+            return false;
+        };
+        match store.get(attempt) {
+            Ok(None) => return true,
+            Ok(Some(_)) => {}
+            Err(_) => return false,
+        }
+        if store
+            .cancel(attempt, CoordinatorEpoch(1), platform::wall_ms())
+            .is_err()
+        {
+            return false;
+        }
+        drop(store);
+        SuperviseSpec::from_file(&dir.join("spec.json"))
+            .ok()
+            .and_then(|s| supervise(&s).ok())
+            .is_some_and(|r| r.unresolved.is_none())
     }
 
     fn finish(&self, id: &BuilderId, end: BuildEnd) {
@@ -708,11 +731,7 @@ impl Setups {
                 // The supervisor died or failed: what it started is stopped
                 // by the supervisor's own recovery, which settles the
                 // attempt. Only a builder that could not be settled is kept.
-                let settled = SuperviseSpec::from_file(&dir.join("spec.json"))
-                    .ok()
-                    .and_then(|s| supervise(&s).ok())
-                    .is_some_and(|r| r.unresolved.is_none());
-                if !settled {
+                if !self.settle_in_process(dir, attempt) {
                     *made = None;
                     lock(&self.leftover).insert(attempt.clone());
                 }

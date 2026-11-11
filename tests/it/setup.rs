@@ -80,6 +80,12 @@ fn cfg(base: &Path) -> SetupConfig {
 }
 
 fn fx() -> Fx {
+    fx_with(|_, _| {})
+}
+
+/// A fixture whose configuration `change` may alter (it gets the fixture's
+/// directory too).
+fn fx_with(change: impl FnOnce(&mut SetupConfig, &Path)) -> Fx {
     // Not under the system temp directory: a process a failed test leaves
     // behind must not write into a directory a test runner clears.
     let dir = tempfile::Builder::new()
@@ -89,7 +95,9 @@ fn fx() -> Fx {
     let ws = Arc::new(DirWs {
         base: dir.path().to_path_buf(),
     });
-    let setups = Setups::open(cfg(dir.path()), ws.clone()).unwrap();
+    let mut c = cfg(dir.path());
+    change(&mut c, dir.path());
+    let setups = Setups::open(c, ws.clone()).unwrap();
     Fx {
         dir,
         ws,
@@ -383,6 +391,30 @@ fn a_builder_that_dies_releases_its_waiters_and_a_later_attempt_rebuilds() {
     assert_eq!(f.done(&c, &p, &wc), (vec!["i1".to_string()], None));
     assert_eq!(f.setups.builds_started(), 2);
     assert_eq!(f.template_dirs().len(), 1);
+}
+
+#[test]
+fn a_supervisor_that_dies_before_it_started_anything_does_not_make_the_agent_run_the_steps() {
+    // The supervisor of this fixture ends with a failure before it has
+    // looked at its attempt: the attempt is `Ready`, with no launch. The
+    // agent settles it in its own process, and must not run the step there.
+    let f = fx_with(|c, dir| {
+        let exe = dir.join("dead-supervisor.sh");
+        crate::common::write_executable(&exe, "#!/bin/sh\nexit 3\n");
+        c.supervisor_exe = exe;
+    });
+    let ran = f.path("ran");
+    let s = spec(vec![step("i1", &format!("echo x >> {}", ran.display()))]);
+    let p = f.payload(&s);
+    let (a, wa) = f.consumer();
+    let (skip, note) = f.done(&a, &p, &wa);
+    assert!(skip.is_empty());
+    let note = note.unwrap();
+    assert!(note.contains("setup builder was lost"), "{note}");
+    wait_for("the builder to be removed", || f.builder_dirs() == 0);
+    assert!(f.setups.unsettled().is_empty());
+    assert!(!ran.exists(), "the step ran inside the agent");
+    assert!(f.template_dirs().is_empty());
 }
 
 #[test]
