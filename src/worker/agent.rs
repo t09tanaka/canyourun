@@ -187,6 +187,15 @@ pub struct Agent {
     shards: Arc<Vec<Mutex<()>>>,
     /// When this process accepted an attempt and last extended its lease.
     clocks: Mutex<BTreeMap<String, Clock>>,
+    /// A renewal (its commit and the new grant time) and the measuring of a
+    /// lease before a start (the applied key, the grant time, the expiry it
+    /// may write) never interleave: whoever measures sees a key together
+    /// with the time of that key's grant, and no renewal lands between the
+    /// finding that a lease ran out and the record of it. Not the attempt's
+    /// shard: that one is held across a cleanup, which may take long.
+    lease_step: Mutex<()>,
+    /// See [`Agent::set_probe`].
+    probe: Mutex<Option<Probe>>,
     /// Supervisors this agent started that had not exited when their watcher
     /// let go of them: waited for later, so none stays a zombie.
     children: Mutex<Vec<Child>>,
@@ -199,6 +208,19 @@ pub struct Agent {
     submitting: Mutex<()>,
     ticking: AtomicBool,
 }
+
+/// A point in the agent's work a test may stop at. See [`Agent::set_probe`].
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProbePoint {
+    /// A start is about to measure the lease of the attempt.
+    LeaseMeasure,
+    /// A renewal is committed; its grant time is not recorded yet.
+    LeaseRenewed,
+}
+
+#[doc(hidden)]
+pub type Probe = Arc<dyn Fn(ProbePoint, &AttemptId) + Send + Sync>;
 
 /// Monotonic times (suspend included) of this process.
 #[derive(Debug, Clone, Copy)]
@@ -426,6 +448,8 @@ impl Agent {
             }),
             shards: Arc::new((0..SHARDS).map(|_| Mutex::new(())).collect()),
             clocks: Mutex::default(),
+            lease_step: Mutex::new(()),
+            probe: Mutex::new(None),
             children: Mutex::default(),
             gave_up: Mutex::default(),
             noted: Mutex::default(),
@@ -465,6 +489,21 @@ impl Agent {
             let _ = t.join();
         }
         lock(&self.lock).take();
+    }
+
+    /// For the tests: `probe` is called at each [`ProbePoint`] the agent
+    /// passes, on the thread that passes it, and that thread goes on when it
+    /// returns. This is how a test puts a renewal and a start in an order.
+    #[doc(hidden)]
+    pub fn set_probe(&self, probe: Probe) {
+        *lock(&self.probe) = Some(probe);
+    }
+
+    fn at(&self, point: ProbePoint, attempt: &AttemptId) {
+        let probe = lock(&self.probe).clone();
+        if let Some(probe) = probe {
+            probe(point, attempt);
+        }
     }
 
     fn stopping(&self) -> bool {
@@ -782,18 +821,44 @@ impl Agent {
                 json!({ "error": format!("stored payload: {e}") }),
             );
         })?;
-        // The key first: a renewal that arrives after this read makes the
-        // seed void (the supervisor then counts that grant in full), never
-        // too short.
-        let key = self.store.lease(a).ok().flatten().map(|(k, _)| k);
-        let (since_accept, since_grant) = self.elapsed(rec);
+        self.at(ProbePoint::LeaseMeasure, a);
+        // The key and the time of its grant, with no renewal in between
+        // (`lease_step`): a key read with the time of an earlier grant would
+        // end a lease that was just renewed, here or in the supervisor. A
+        // renewal that arrives after this makes the seed void (the supervisor
+        // then counts that grant in full), never too short.
+        let measuring = lock(&self.lease_step);
+        let measured = self
+            .store
+            .lease(a)
+            .and_then(|lease| Ok((lease.map(|(k, _)| k), self.elapsed(rec)?)));
+        let (key, (since_accept, since_grant)) = match measured {
+            Ok(m) => m,
+            Err(e) => {
+                // Without the key the supervisor would take the seed for
+                // void and count a full period from its start; without the
+                // grant time the lease cannot be measured at all. Nothing is
+                // started and nothing is given up: the next look reads again.
+                drop(measuring);
+                self.note_once(
+                    a,
+                    "agent_lease_unreadable",
+                    json!({ "error": e.to_string() }),
+                );
+                self.pause(self.cfg.retry_ms);
+                return Ok(None);
+            }
+        };
         let Some(lease_left) = policy::remaining_ms(payload.lease_ms, since_grant) else {
-            // The journal gets `lease_expired` with it.
+            // The journal gets `lease_expired` with it. Still under the
+            // lock: a renewal either came before the measuring or is refused.
             let _ = self.store.expire_lease(a, now());
+            drop(measuring);
             let t = termination(Some(StopReason::LeaseExpired), None);
             self.settle_unstarted(a, t);
             return Ok(None);
         };
+        drop(measuring);
         let mut deadline_left = None;
         if let Some(total) = payload.deadline_ms {
             let Some(left) = policy::remaining_ms(total, since_accept) else {
@@ -858,27 +923,27 @@ impl Agent {
     /// How long ago the attempt was accepted and its lease last granted, in
     /// milliseconds: on this process's monotonic clock when it saw both, else
     /// (the agent restarted since) from the wall-clock times this worker
-    /// recorded. No other host's time is involved.
-    fn elapsed(&self, rec: &AcceptedAttempt) -> (u64, u64) {
+    /// recorded. No other host's time is involved. A renewal time that
+    /// cannot be read is an error, not "never renewed": that would end a
+    /// renewed lease early.
+    fn elapsed(&self, rec: &AcceptedAttempt) -> Result<(u64, u64), StorageError> {
         let mono = platform::monotonic_ms();
         if let Some(c) = lock(&self.clocks).get(rec.attempt_id.as_str()) {
-            return (
+            return Ok((
                 mono.saturating_sub(c.accepted_ms),
                 mono.saturating_sub(c.granted_ms),
-            );
+            ));
         }
         let wall = now();
         let granted = self
             .store
-            .lease_renewed_at(&rec.attempt_id)
-            .ok()
-            .flatten()
+            .lease_renewed_at(&rec.attempt_id)?
             .unwrap_or(rec.accepted_at_ms)
             .max(rec.accepted_at_ms);
-        (
+        Ok((
             wall.saturating_sub(rec.accepted_at_ms),
             wall.saturating_sub(granted),
-        )
+        ))
     }
 
     /// Wait (without blocking) for the supervisors that have exited.
@@ -1002,8 +1067,20 @@ impl Agent {
 
         // The secret bundle arrives by its own request once the workspace is
         // there; the commands do not start before the set is complete.
+        //
+        // From the look that finds the set complete until the attempt is
+        // `Ready`, the attempt's shard is held, the lock a
+        // `secret_bundle_put` places its files under: a put is either done
+        // before that look, and the mask below is made of all it placed, or
+        // it finds the attempt `Ready` and places nothing. No file is read
+        // for the mask while it is being written, and none arrives after.
         let mut waited = 0;
-        while !self.host.secrets_ready(rec)? {
+        let _placed = loop {
+            let one = lock(shard(&self.shards, attempt));
+            if self.host.secrets_ready(rec)? {
+                break one;
+            }
+            drop(one);
             if self.stopping() || self.stop_requested(attempt) {
                 return Ok(());
             }
@@ -1015,7 +1092,7 @@ impl Agent {
             }
             self.pause(self.cfg.poll_ms);
             waited += self.cfg.poll_ms;
-        }
+        };
 
         // The values of the secret files in place, read now that the set is
         // complete: everything the commands print goes through a masker made
@@ -1500,16 +1577,21 @@ impl Agent {
     fn renew(&self, r: RenewLeaseRequest) -> Result<RenewLeaseResponse, ApiError> {
         let rec = self.known(&r.attempt_id)?;
         Self::generation(&rec, r.generation)?;
+        // The new key and the time of its grant change as one step for a
+        // start that measures the lease (`lease_step`).
+        let renewing = lock(&self.lease_step);
         let outcome = self
             .store
             .renew_lease(&r.attempt_id, r.key(), now())
             .map_err(api)?;
         let extended = outcome == LeaseOutcome::Extended;
         if extended {
+            self.at(ProbePoint::LeaseRenewed, &r.attempt_id);
             if let Some(c) = lock(&self.clocks).get_mut(r.attempt_id.as_str()) {
                 c.granted_ms = platform::monotonic_ms();
             }
         }
+        drop(renewing);
         let lease_ms = serde_json::from_value::<AttemptPayload>(rec.spec)
             .map(|p| p.lease_ms)
             .unwrap_or(0);

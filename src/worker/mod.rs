@@ -14,5 +14,5 @@ pub mod machine;
 pub mod policy;
 pub mod serve;
 
-pub use agent::{Agent, AgentConfig, Session, StartupReport};
+pub use agent::{Agent, AgentConfig, Probe, ProbePoint, Session, StartupReport};
 pub use host::Host;

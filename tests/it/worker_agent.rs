@@ -18,13 +18,13 @@ use remote_task_runner::storage::{AcceptedAttempt, BlobKind, NewBlobRef, WorkerS
 use remote_task_runner::wire::*;
 use remote_task_runner::worker::policy::{Step, STARTUP_ORDER};
 use remote_task_runner::worker::serve::serve_connection;
-use remote_task_runner::worker::{Agent, AgentConfig, Host};
+use remote_task_runner::worker::{Agent, AgentConfig, Host, ProbePoint, Session};
 use remote_task_runner::workspace::{Workspace, WorkspaceKind};
 use std::collections::BTreeMap;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
 use tokio::sync::Semaphore;
@@ -50,7 +50,11 @@ struct DirHost {
     /// The attempts being cleaned right now, and whether one ever was twice.
     cleaning: Mutex<Vec<String>>,
     overlap: AtomicBool,
+    /// Called by `mask_values` once it has read the values.
+    on_mask: Mutex<Option<MaskHook>>,
 }
+
+type MaskHook = Box<dyn Fn(&AttemptId) + Send + Sync>;
 
 impl DirHost {
     fn log(&self, what: impl Into<String>) {
@@ -141,6 +145,9 @@ impl Host for DirHost {
                 .values
                 .push(vec![0xff, 0xfe, 0xfd, 0xfc, 0xfb, 0xfa, 0xf9, 0xf8]);
         }
+        if let Some(hook) = self.on_mask.lock().unwrap().as_ref() {
+            hook(&a.attempt_id);
+        }
         Ok(values)
     }
     fn cleanup(&self, a: &AttemptId, ws: Option<&Workspace>) -> Result<(), ApiError> {
@@ -194,6 +201,7 @@ fn fx() -> Fx {
         slow_cleanup_ms: AtomicU64::new(0),
         cleaning: Mutex::default(),
         overlap: AtomicBool::new(false),
+        on_mask: Mutex::default(),
     });
     Fx {
         dir,
@@ -1031,6 +1039,63 @@ async fn an_agent_restarted_after_the_bundle_arrived_still_masks_it() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_secret_file_sent_while_the_mask_is_made_is_refused_and_never_placed() {
+    let f = fx();
+    let agent = f.start("boot-a");
+    let c = f.connect(&agent).await;
+    f.host.secrets_ready.store(false, Ordering::SeqCst);
+    let mut p = payload("cat .env");
+    p.has_secret_bundle = true;
+    let a = AttemptId::generate();
+    let put = |content: &str| {
+        let Request::SecretBundlePut(mut r) = put_req(&a) else {
+            panic!()
+        };
+        r.files[0].content = Bytes(content.as_bytes().to_vec());
+        Request::SecretBundlePut(r)
+    };
+    // The values are read for the mask; before the attempt is `Ready`,
+    // another file for the same path arrives (this host would overwrite).
+    let late = put("KEY=a-later-S3cret-value\n");
+    type Answer = Result<Response, ApiError>;
+    let (seen_tx, seen_rx) = mpsc::channel::<(Option<Answer>, mpsc::Receiver<Answer>)>();
+    {
+        let agent = agent.clone();
+        *f.host.on_mask.lock().unwrap() = Some(Box::new(move |_| {
+            let (tx, rx) = mpsc::channel();
+            let (agent, late) = (agent.clone(), late.clone());
+            std::thread::spawn(move || {
+                let session = Session {
+                    coordinator_epoch: CoordinatorEpoch(1),
+                };
+                let _ = tx.send(agent.handle(session, late));
+            });
+            // Long enough for a put that is not kept out to be answered; a
+            // put that is kept out is never answered in here.
+            let early = rx.recv_timeout(Duration::from_millis(500)).ok();
+            let _ = seen_tx.send((early, rx));
+        }));
+    }
+    submit(&c, &a, &p).await;
+    wait_for("the workspace record", || workspace_record(&f, &a).exists());
+    call(&c, put("KEY=the-first-S3cret-value\n")).await.unwrap();
+    let (early, later) = seen_rx.recv_timeout(T).unwrap();
+    assert!(
+        early.is_none(),
+        "answered while the mask was made: {early:?}"
+    );
+    // Answered once the attempt is `Ready`: too late, for good.
+    let e = later.recv_timeout(T).unwrap().unwrap_err();
+    assert_eq!(e.code, ErrorCode::Conflict, "{e:?}");
+    *f.host.on_mask.lock().unwrap() = None;
+    assert_eq!(f.wait_terminal(&a), Outcome::Succeeded);
+    assert_eq!(f.host.count(&format!("place {a}")), 1);
+    // What the command read is what the mask was made of.
+    let out = String::from_utf8(read_all(&c, &a, LogStream::Stdout).await).unwrap();
+    assert_eq!(out.trim(), "KEY=***");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_secret_that_cannot_be_masked_keeps_the_command_from_starting() {
     let f = fx();
     let agent = f.start("boot-a");
@@ -1774,6 +1839,124 @@ async fn a_renewal_before_the_start_seeds_the_supervisor_with_what_is_left_of_it
     // after it) and not a full period after the supervisor's start (6 s).
     let after = expired[0].at_ms - renewed_at;
     assert!((3_500..5_500).contains(&after), "{after} ms");
+}
+
+fn renew_req(a: &AttemptId, seq: u64, lease_ms: u64) -> Request {
+    Request::RenewLease(RenewLeaseRequest {
+        schema_version: SchemaVersion::CURRENT,
+        request_id: RequestId::generate(),
+        coordinator_epoch: CoordinatorEpoch(1),
+        attempt_id: a.clone(),
+        generation: Generation(1),
+        lease_seq: seq,
+        lease_ms,
+    })
+}
+
+fn seed_of(f: &Fx, a: &AttemptId) -> serde_json::Value {
+    let spec = f
+        .state()
+        .join("attempts")
+        .join(a.as_str())
+        .join("supervise.json");
+    let spec: serde_json::Value = serde_json::from_slice(&std::fs::read(spec).unwrap()).unwrap();
+    spec["lease_seed"].clone()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_start_that_meets_a_renewal_half_done_waits_for_all_of_it() {
+    let f = fx();
+    let agent = f.start("boot-a");
+    let c = f.connect(&agent).await;
+    f.host.block_prepare.store(true, Ordering::SeqCst);
+    let (script, marker, _) = stay(&f);
+    let mut p = payload(&script);
+    p.lease_ms = 1_500;
+    let a = AttemptId::generate();
+    // The order, made by the probe and not by luck: the renewal is
+    // committed (the new key is in the database), then the start comes to
+    // measure the lease, and only then is the renewal's grant time recorded.
+    let (measure_tx, measure_rx) = mpsc::channel::<()>();
+    let measure_rx = Mutex::new(measure_rx);
+    let host = f.host.clone();
+    agent.set_probe(Arc::new(move |point, _| match point {
+        ProbePoint::LeaseMeasure => {
+            let _ = measure_tx.send(());
+        }
+        ProbePoint::LeaseRenewed => {
+            host.block_prepare.store(false, Ordering::SeqCst);
+            measure_rx
+                .lock()
+                .unwrap()
+                .recv_timeout(T)
+                .expect("the start came to measure the lease");
+            // A start that is not kept out reads the new key with the first
+            // grant's time now. Time for it to do that; a start that is
+            // kept out does nothing however long this is.
+            std::thread::sleep(Duration::from_millis(300));
+        }
+    }));
+    submit(&c, &a, &p).await;
+    // The first grant runs out during the preparation.
+    std::thread::sleep(Duration::from_millis(1_800));
+    let Response::RenewLease(r) = call(&c, renew_req(&a, 1, 1_500)).await.unwrap() else {
+        panic!()
+    };
+    assert!(r.extended);
+    // The renewed lease is neither ended by the agent nor cut short by the
+    // seed: the command starts, and the seed is the renewal's.
+    wait_for("the command to start", || lines(&marker) == 1);
+    assert_eq!(events(&f, &a, "lease_expired"), 0);
+    assert_eq!(seed_of(&f, &a)["key"]["lease_seq"], 1);
+    let renewed_at = f.store().lease_renewed_at(&a).unwrap().unwrap();
+    assert_eq!(f.wait_terminal(&a), Outcome::Interrupted);
+    let expired = f.store().events_of(&a, "lease_expired").unwrap();
+    assert_eq!(expired.len(), 1);
+    let after = expired[0].at_ms - renewed_at;
+    assert!((1_000..3_500).contains(&after), "{after} ms");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_lease_that_cannot_be_read_starts_nothing_until_it_can_be() {
+    let f = fx();
+    let agent = f.start("boot-a");
+    let c = f.connect(&agent).await;
+    f.host.block_prepare.store(true, Ordering::SeqCst);
+    let (script, marker, _) = stay(&f);
+    let a = AttemptId::generate();
+    submit(&c, &a, &payload(&script)).await;
+    let Response::RenewLease(r) = call(&c, renew_req(&a, 1, 60_000)).await.unwrap() else {
+        panic!()
+    };
+    assert!(r.extended);
+    // Only the lease cannot be read: the table is away, the rest of the
+    // database answers.
+    let db = rusqlite::Connection::open(f.state().join("worker.db")).unwrap();
+    db.busy_timeout(T).unwrap();
+    db.execute_batch("ALTER TABLE lease RENAME TO lease_away")
+        .unwrap();
+    assert!(f.store().lease(&a).is_err());
+    f.host.block_prepare.store(false, Ordering::SeqCst);
+    wait_for("the unreadable lease to be noted", || {
+        events(&f, &a, "agent_lease_unreadable") == 1
+    });
+    // Several looks later (one every 200 ms): prepared, nothing started,
+    // nothing given up, one entry in the journal.
+    std::thread::sleep(Duration::from_millis(1_000));
+    assert_eq!(f.rec(&a).state, AttemptState::Ready);
+    assert_eq!(lines(&marker), 0);
+    assert!(f.store().launches(&a).unwrap().is_empty());
+    assert!(f.supervisors(&a).is_empty());
+    assert_eq!(seed_of(&f, &a), serde_json::Value::Null);
+    assert_eq!(events(&f, &a, "agent_lease_unreadable"), 1);
+    assert_eq!(events(&f, &a, "agent_gave_up"), 0);
+    db.execute_batch("ALTER TABLE lease_away RENAME TO lease")
+        .unwrap();
+    // The next look reads it: the start is seeded with the applied key.
+    wait_for("the command to start", || lines(&marker) == 1);
+    assert_eq!(seed_of(&f, &a)["key"]["lease_seq"], 1);
+    call(&c, cancel_req(&a)).await.unwrap();
+    assert_eq!(f.wait_terminal(&a), Outcome::Cancelled);
 }
 
 // Its own test, not the second half of the one above: both wait out real
