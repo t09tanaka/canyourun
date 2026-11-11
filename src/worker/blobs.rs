@@ -583,19 +583,24 @@ impl Incoming {
         let dir = self.dir(source);
         let mut objects = None;
         if let (Some(_), Some(repository_id)) = (&root.execution_commit, &root.repository_id) {
-            let repo = self
-                .objects(repository_id, true)?
-                .expect("a clone is made when there is none");
-            match Self::bundle_done(&dir)? {
+            // A clone is made only to unpack a bundle into it: asking
+            // whether the commits are here never makes one.
+            let repo = match Self::bundle_done(&dir)? {
                 Some(bundle) => {
+                    let repo = self
+                        .objects(repository_id, true)?
+                        .expect("a clone is made when there is none");
                     if let Err(e) = repo.receive_bundle(&bundle, root) {
                         remove_staged(&bundle);
                         return Err(invalid(format!("the bundle is refused: {e:#}")));
                     }
+                    repo
                 }
-                None if repo.check_reachable(root).is_err() => return Ok(false),
-                None => {}
-            }
+                None => match self.objects(repository_id, false)? {
+                    Some(repo) if repo.check_reachable(root).is_ok() => repo,
+                    _ => return Ok(false),
+                },
+            };
             objects = Some(repo);
         }
         self.store
