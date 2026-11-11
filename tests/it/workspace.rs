@@ -226,7 +226,8 @@ impl Fixture {
         let bundle = store
             .export_bundle(&ExecContext::new(self.env()), m, &[])
             .unwrap();
-        repo.receive_bundle(&bundle, m).unwrap();
+        repo.receive_bundle(&bundle, m, &store.dirty_below(m).unwrap())
+            .unwrap();
     }
     fn commit(&self, file: &str, content: &str) -> String {
         std::fs::write(self.dir.join(file), content).unwrap();

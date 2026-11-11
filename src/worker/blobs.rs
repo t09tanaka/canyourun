@@ -991,6 +991,50 @@ impl Incoming {
             .map(|f| dir.join(f.name)))
     }
 
+    /// The manifests of the dirty submodules below `root`, at every depth,
+    /// each once: the staged ones, and the store's copy of one that was
+    /// published before by another transfer. They go into the import with
+    /// the bundle, which holds every snapshot ref and every gitlink to them.
+    fn nested(
+        &self,
+        dir: &Path,
+        limits: &BlobLimits,
+        root: &CiManifest,
+        st: &Staged,
+    ) -> Result<Vec<CiManifest>, ApiError> {
+        let mut out: Vec<CiManifest> = vec![];
+        let mut seen = BTreeSet::new();
+        let mut todo = vec![root.submodules.clone()];
+        while let Some(subs) = todo.pop() {
+            for s in subs.iter().filter(|s| s.dirty) {
+                let Some(id) = &s.source_id else { continue };
+                if !seen.insert(id.clone()) {
+                    continue;
+                }
+                if seen.len() > local_ci::source::MAX_NESTED {
+                    return Err(invalid("too many dirty submodules below the source"));
+                }
+                let m = match st.manifests.get(id) {
+                    Some(info) => {
+                        let name =
+                            staged_name(SourceBlobKind::Manifest, &info.hex, info.size, true);
+                        read_manifest(&dir.join(name), limits)?
+                    }
+                    None => self
+                        .store
+                        .manifest(id)
+                        .map_err(|e| internal("source store", format!("{e:#}")))?
+                        .ok_or_else(|| {
+                            invalid(format!("the capture {id} of a dirty submodule is not here"))
+                        })?,
+                };
+                todo.push(m.submodules.clone());
+                out.push(m);
+            }
+        }
+        Ok(out)
+    }
+
     /// Unpack the staged `bundle` into the clone of `repository_id`.
     ///
     /// A bundle built on commits the clone does not hold is not a broken
@@ -1019,6 +1063,13 @@ impl Incoming {
         let prerequisites = bundle_head(bundle)
             .map_err(io_err)
             .and_then(|head| bundle_prerequisites(&head).map_err(|why| refuse(why.to_string())))?;
+        // One import into a clone at a time, whichever source it is for
+        // (the lock of the source is held already; never the other way
+        // round). Two sources of a repository share the snapshot refs of the
+        // dirty submodules they share.
+        let busy = format!("the clone of {repository_id} is busy");
+        let _importing =
+            Self::wait_lock(self.workspaces.import_lock(repository_id)?, limits, &busy)?;
         let existing = self.objects(repository_id);
         let fits = match &existing {
             Some(repo) => repo.holds_base(&prerequisites),
@@ -1044,10 +1095,16 @@ impl Incoming {
             limits,
         )?;
         let carried = st.carried(root_id);
+        let nested = self
+            .nested(dir, limits, &body, st)
+            .map_err(|e| match e.code {
+                ErrorCode::InvalidInput => refuse(e.message),
+                _ => e,
+            })?;
         {
             let (_scratch, trial) = self.workspaces.rehearsal(repository_id)?;
             trial
-                .receive_bundle(bundle, &body)
+                .receive_bundle(bundle, &body, &nested)
                 .map_err(|e| refuse(format!("{e:#}")))?;
             if !self.commits_here(&trial, st, &carried) {
                 return Err(refuse(
@@ -1061,7 +1118,7 @@ impl Incoming {
             None => self.workspaces.ensure_clone(repository_id, None)?,
         };
         let taken = repo
-            .receive_bundle(bundle, &body)
+            .receive_bundle(bundle, &body, &nested)
             .map_err(|e| format!("{e:#}"))
             .and_then(|()| {
                 if self.commits_here(&repo, st, &carried) {

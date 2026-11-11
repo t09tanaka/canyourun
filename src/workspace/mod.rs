@@ -175,6 +175,21 @@ impl Workspaces {
         Ok(ObjectsRepo::new(self.env.clone(), dir))
     }
 
+    /// The file whose lock keeps the imports of bundles into the clone of
+    /// `repository_id` apart (opened, not locked: the caller decides how
+    /// long it waits). Whoever unpacks a bundle into the clone holds it from
+    /// before the clone is made until what the bundle brought is checked,
+    /// and a clone left empty is removed. It is beside the clone, so it is
+    /// there before the clone is, and it is not the lock [`Self::ensure_clone`]
+    /// takes for itself.
+    pub fn import_lock(&self, repository_id: &str) -> Result<File, ApiError> {
+        let root = self.clones_root();
+        std::fs::create_dir_all(&root)
+            .map_err(|e| io_err("cannot create the clones directory", e))?;
+        let name = plan::clone_dir_name(repository_id);
+        open_lock(&root.join(format!("{name}.import.lock")))
+    }
+
     /// A scratch repository to try a bundle in before it touches the clone
     /// of `repository_id`: it has the refs of the clone and borrows its
     /// objects (nothing is copied, and nothing is written to the clone), or

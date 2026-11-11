@@ -265,7 +265,7 @@ worktree snapshotには、追跡済みファイルのstaged／unstaged変更、�
 
 generic execでは可能な範囲でHEAD・index・worktreeの区別を再現し、`git diff` と `git diff --cached` が元の変更を表せるようにする。CIでは同じcaptureからsynthetic commit viewを作り、その内容でworkflow・config・changed filesを解釈する。元HEADやbranchの論理文脈は別フィールドで渡す。
 
-必要なGit objectsとbase履歴をbundle等で転送する。workerが移動中のorigin branchをfetchして入力を決め直す方式は使わない。workerのcanonical cloneはoriginを持たず、最初のbundleを受け取るときに作る。bundleはsourceごとに1つで、親は、workerが `blob_verify` で答えた「cloneが履歴ごと持っているcommit」（`have`）より下を除いて作る。`have` が空なら、execution commitの全履歴を入れる（第11章）。未pushのHEADも実行できる。submoduleとGit LFSは、固定revisionと実体をmanifestに含める。dirty submoduleは再帰capture、LFS payload不足は実行前errorとする。
+必要なGit objectsとbase履歴をbundle等で転送する。workerが移動中のorigin branchをfetchして入力を決め直す方式は使わない。workerのcanonical cloneはoriginを持たず、最初のbundleを受け取るときに作る。bundleはsourceごとに1つで、親は、workerが `blob_verify` で答えた「cloneが履歴ごと持っているcommit」（`have`）より下を除いて作る。`have` が空なら、execution commitの全履歴を入れる（第11章）。`have` はworkerが決める値なので、親は形式の合わないものを捨て、256個までしか見ない。親のstoreに置くbundleのファイルは `have` の集合ごとに1つで、1つのsourceにつき4つまでとし、超えた分は古いものから消す。workerがそのsourceを持った（`blob_verify` の `ready`）とき、または転送をあきらめたときに、そのsourceのbundleのファイルを全部消す。親は1つのworkerと1つのsourceについて、bundleを最初の1回と `bundle_base_missing` を受けての作り直し2回までしか作らず、それでも合わなければその転送を失敗にする。未pushのHEADも実行できる。submoduleとGit LFSは、固定revisionと実体をmanifestに含める。dirty submoduleは再帰capture、LFS payload不足は実行前errorとする。
 
 worktreeのraw bytesとGitのcanonical blobを区別する。LFS、clean／smudge filter、改行変換を経た実際のmaterialized fileがmanifestのhashと一致することを検証し、capture済み内容へfilterを重複適用しない。pathはlosslessに扱い、shell文字列連結やlossyな文字コード変換で収集対象を変えない。
 
@@ -505,6 +505,8 @@ workerは受け取る量に上限を持ち、超える要求は一部だけ処�
   - 同じhashのファイルに、manifestによって違うサイズを付けることはできない（後から来たmanifestを `INVALID_INPUT` で断る）。storeに既にあるファイルに別のサイズを付けたmanifestも `INVALID_INPUT`（manifestが届いた時点で断る。その後にstoreへ入った場合は公開の直前に断り、そのsourceの受け取り済みのものを全部捨てる）。
   - storeに既にあるsubmodule captureは書き直さない。同じidで中身の違うmanifestは `INVALID_INPUT`。
   - bundleが前提にするcommitをworkerのcloneが持っていないときは、`CONFLICT`（`conflict_reason.reason = "bundle_base_missing"`、`have` 付き）で答える。そのbundleは保存せず、cloneも作らない。親は `have` を基にbundleを作り直して送る。壊れたbundleや、manifestが名指しするcommitを運ばないbundleは `INVALID_INPUT`（cloneには何も書かず、cloneが無ければ作らない）。`conflict_reason.reason` が知らない値のときは、理由なしの `CONFLICT` として扱う（`unknown` と読む）。
+  - bundleは、dirty submoduleの中のdirty submoduleのcommitも、どの深さのものも運ぶ。workerは、そのsource自身のmanifestと、その下のdirty submoduleのmanifest全部（届いたもの、または以前に公開済みのもの。256個まで）をbundleと突き合わせる。各snapshot refがmanifestの名指すcommitであること、そのtreeがmanifestのtreeであること、どの階層のgitlinkも下の階層のcommitであることを確かめ、1つでも合わなければ `INVALID_INPUT` で断る。cloneに同じ名前のrefが別の値で既にあるときも `INVALID_INPUT` で、そのrefは書き換えない。refは全部入るか1つも入らないかのどちらかである（`git fetch --atomic`。workerのGitは2.31以上が要る）。
+  - 1つのcloneへbundleを展開するのは同時に1つだけで、repositoryごとのlockで順番に行う（sourceのlockを取ったあとに取る）。待ち時間の上限を超えたら `OVERLOADED` で答え、届いたbundleは残す（送り直せば続きから公開される）。
 - `blob_verify`: 問い合わせたblobごとの present / missing（受信済みoffsetつき）/ corrupt のほかに、sourceが公開済みか（`ready`）、bundleが要るか（`bundle_needed`）、sourceのrepositoryのcloneが持つcommit（`have`、64個まで。そのsourceのcommitで既にあるものが先、続いて、新しいcommitの上で作られたsnapshotの先端が先）を返す。何も変更しない。
 - `blob_get`: attemptの保存済みresultに載っているartifactだけを返す。artifactのファイルは、途中のディレクトリを1つずつsymlinkをたどらずに開いて読む。
 - `secret_bundle_put`: workspaceがまだ無いときは `NOT_FOUND`（送り直す）、commandが始まり得る状態以降は `CONFLICT`（確定）、cancel・retire済みは `RETIRED`。

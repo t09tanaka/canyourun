@@ -2507,3 +2507,270 @@ fn the_free_space_of_the_store_and_of_the_clones_counts_too() {
         }
     }
 }
+
+// ------------------------- dirty submodules inside dirty submodules
+
+/// [`project`] one level deeper: the submodule (`vendor/lib`) has a
+/// submodule of its own (`inner/deep`), and all three levels hold an edit
+/// that was never committed.
+fn nested_project(f: &Fx) -> PathBuf {
+    let deep = f.path("deep");
+    std::fs::create_dir_all(&deep).unwrap();
+    git(&deep, &["init", "-q", "-b", "main"]);
+    std::fs::write(deep.join("deep.txt"), "deep\n").unwrap();
+    git(&deep, &["add", "."]);
+    git(&deep, &["commit", "-qm", "deep"]);
+    let lib = f.path("lib");
+    std::fs::create_dir_all(&lib).unwrap();
+    git(&lib, &["init", "-q", "-b", "main"]);
+    std::fs::write(lib.join("lib.txt"), "lib\n").unwrap();
+    git(&lib, &["add", "."]);
+    git(&lib, &["commit", "-qm", "lib"]);
+    git(
+        &lib,
+        &[
+            "submodule",
+            "add",
+            "-q",
+            deep.to_str().unwrap(),
+            "inner/deep",
+        ],
+    );
+    git(&lib, &["commit", "-qm", "add deep"]);
+    let up = f.path("up");
+    std::fs::create_dir_all(&up).unwrap();
+    git(&up, &["init", "-q", "-b", "main"]);
+    std::fs::write(up.join("a.txt"), "a\n").unwrap();
+    std::fs::write(up.join("history.bin"), noise(78, 40_000)).unwrap();
+    git(&up, &["add", "."]);
+    git(&up, &["commit", "-qm", "base"]);
+    git(
+        &up,
+        &[
+            "submodule",
+            "add",
+            "-q",
+            lib.to_str().unwrap(),
+            "vendor/lib",
+        ],
+    );
+    git(&up, &["commit", "-qm", "add submodule"]);
+    git(
+        f.dir.path(),
+        &[
+            "clone",
+            "-q",
+            "--recurse-submodules",
+            up.to_str().unwrap(),
+            "repo",
+        ],
+    );
+    let repo = f.path("repo");
+    std::fs::write(repo.join("a.txt"), "edited\n").unwrap();
+    std::fs::write(repo.join("vendor/lib/lib.txt"), "edited lib\n").unwrap();
+    std::fs::write(repo.join("vendor/lib/inner/deep/deep.txt"), "edited deep\n").unwrap();
+    repo
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_dirty_submodule_inside_a_dirty_submodule_reaches_the_worker_at_every_level() {
+    let mut f = fx();
+    f.tools = fast_worktree_dir();
+    let repo = nested_project(&f);
+    let first = f.capture(&SourceRequest::Worktree { dir: repo.clone() });
+    assert_eq!(first.manifests.len(), 3);
+    let parent = f.parent();
+    let lib = &first.root.submodules[0];
+    assert!(lib.dirty);
+    let lib_m = parent
+        .manifest(lib.source_id.as_ref().unwrap())
+        .unwrap()
+        .unwrap();
+    let deep = &lib_m.submodules[0];
+    assert!(deep.dirty);
+    let deep_m = parent
+        .manifest(deep.source_id.as_ref().unwrap())
+        .unwrap()
+        .unwrap();
+    // The next source: one more edit at the top; both submodules stay.
+    std::fs::write(repo.join("a.txt"), "edited again\n").unwrap();
+    let second = f.capture(&SourceRequest::Worktree { dir: repo.clone() });
+    assert_ne!(first.source, second.source);
+    assert_eq!(second.root.submodules[0].source_id, lib.source_id);
+    // Nowhere to fetch from, at any level.
+    for gone in ["up", "lib", "deep"] {
+        std::fs::remove_dir_all(f.path(gone)).unwrap();
+    }
+
+    let agent = f.start();
+    let c = f.connect(&agent).await;
+    let (have, bundle) = send_git(&c, &f, &first).await;
+    assert_eq!(have, Vec::<String>::new());
+    assert_eq!(bundle_prerequisites(&bundle), Ok(vec![]));
+    let clones = f.clones();
+    assert_eq!(clones.len(), 1);
+    let clone = &clones[0];
+
+    // In the worker's clone: the snapshot ref of every level is the commit
+    // its manifest names, with the tree it names, and each gitlink is the
+    // commit of the level below.
+    let commit_of = |m: &CiManifest| m.execution_commit.clone().unwrap();
+    for m in [&first.root, &lib_m, &deep_m] {
+        let r = format!("refs/local-ci/snapshots/{}", m.source_id);
+        assert_eq!(git(clone, &["rev-parse", "--verify", &r]), commit_of(m));
+        assert_eq!(
+            Some(git(clone, &["rev-parse", &format!("{r}^{{tree}}")])),
+            m.worktree_tree
+        );
+    }
+    let gitlink = |m: &CiManifest, path: &str| {
+        git(clone, &["rev-parse", &format!("{}:{path}", commit_of(m))])
+    };
+    assert_eq!(gitlink(&first.root, "vendor/lib"), commit_of(&lib_m));
+    assert_eq!(gitlink(&lib_m, "inner/deep"), commit_of(&deep_m));
+
+    // The files of every level come out of the worker's store.
+    let worker = f.worker_store();
+    let published = worker
+        .manifest(&first.root.source_id)
+        .unwrap()
+        .expect("the source is published");
+    let laid = f.path("laid");
+    worker.materialize(&published, &laid).unwrap();
+    let read = |p: &str| std::fs::read_to_string(laid.join(p)).unwrap();
+    assert_eq!(read("a.txt"), "edited\n");
+    assert_eq!(read("vendor/lib/lib.txt"), "edited lib\n");
+    assert_eq!(read("vendor/lib/inner/deep/deep.txt"), "edited deep\n");
+
+    let script = |out: &Path| {
+        format!(
+            "cat a.txt vendor/lib/lib.txt vendor/lib/inner/deep/deep.txt > {}",
+            out.display()
+        )
+    };
+    let out = f.path("out-1");
+    if run_script(&c, &f, &first, &script(&out)).await {
+        let text = std::fs::read_to_string(&out).unwrap();
+        assert_eq!(text, "edited\nedited lib\nedited deep\n");
+    }
+
+    // The next source is built on what the clone holds: a thin bundle. The
+    // snapshots of both submodules are in the clone already, with the same
+    // commits, and are taken as they are.
+    let (have, thin) = send_git(&c, &f, &second).await;
+    assert!(
+        have.contains(first.root.execution_commit.as_ref().unwrap()),
+        "{have:?}"
+    );
+    assert!(!bundle_prerequisites(&thin).unwrap().is_empty());
+    let whole = second.bundle.as_ref().unwrap();
+    assert!(
+        thin.len() + 30_000 < whole.len(),
+        "{} against {}",
+        thin.len(),
+        whole.len()
+    );
+    let r = format!("refs/local-ci/snapshots/{}", second.root.source_id);
+    assert_eq!(
+        git(clone, &["rev-parse", "--verify", &r]),
+        commit_of(&second.root)
+    );
+    assert_eq!(gitlink(&second.root, "vendor/lib"), commit_of(&lib_m));
+    let out = f.path("out-2");
+    if run_script(&c, &f, &second, &script(&out)).await {
+        let text = std::fs::read_to_string(&out).unwrap();
+        assert_eq!(text, "edited again\nedited lib\nedited deep\n");
+    }
+    assert_eq!(f.clones().len(), 1);
+}
+
+#[test]
+fn a_bundle_waits_for_another_import_into_the_same_clone() {
+    let f = fx();
+    let repo = project(&f);
+    let p = f.capture(&SourceRequest::Worktree { dir: repo });
+    let m = f.machine();
+    let sink = m.blobs().unwrap();
+    let l = BlobLimits {
+        lock_wait_ms: 50,
+        ..limits()
+    };
+    for man in &p.manifests {
+        put_all(sink, &l, &p.source, Manifest, man).unwrap();
+    }
+    for b in p.blobs.values() {
+        put_all(sink, &l, &p.source, Content, b).unwrap();
+    }
+    // Another import into the clone of this repository is under way.
+    let workspaces = Workspaces::new(f.state(), f.env(), Arc::new(CliFastWorktree::new(f.env())));
+    let held = workspaces
+        .import_lock(p.root.repository_id.as_ref().unwrap())
+        .unwrap();
+    held.lock().unwrap();
+    let bundle = p.bundle.as_ref().unwrap();
+    let e = put_all(sink, &l, &p.source, Bundle, bundle).unwrap_err();
+    assert_eq!(e.code, ErrorCode::Overloaded);
+    assert!(e.message.contains("busy"), "{}", e.message);
+    // Nothing was unpacked, no clone was made, and the bundle is kept.
+    assert!(f.clones().is_empty());
+    assert!(f.staged(&p.source).iter().any(|n| n.starts_with("bundle-")));
+    drop(held);
+    assert!(
+        put_all(sink, &l, &p.source, Bundle, bundle)
+            .unwrap()
+            .complete
+    );
+    assert_eq!(f.clones().len(), 1);
+    assert!(verify(sink, &l, &p.source, vec![]).ready);
+}
+
+#[test]
+fn a_source_keeps_a_few_bundle_files_in_the_parent_store_and_they_can_be_removed() {
+    use remote_task_runner::source::store::MAX_BUNDLES_PER_SOURCE;
+    let f = fx();
+    let repo = project(&f);
+    let p = f.capture(&SourceRequest::Worktree { dir: repo.clone() });
+    std::fs::write(repo.join("a.txt"), "another\n").unwrap();
+    let other = f.capture(&SourceRequest::Worktree { dir: repo });
+    let store = f.parent();
+    let ctx = ExecContext::new(f.env());
+    let files = |id: &str| -> Vec<PathBuf> {
+        std::fs::read_dir(store.root().join("bundles"))
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| {
+                let name = p.file_name().unwrap().to_string_lossy().into_owned();
+                name.starts_with(id) && name.ends_with(".bundle")
+            })
+            .collect()
+    };
+    // (the capture made one for a worker that holds nothing)
+    assert_eq!(files(&p.root.source_id).len(), 1);
+    assert_eq!(files(&other.root.source_id).len(), 1);
+    // Every set of commits a peer names is another file: a peer that names
+    // a new set each time does not fill the store.
+    let mut last = PathBuf::new();
+    for i in 0..(MAX_BUNDLES_PER_SOURCE + 3) {
+        let have = vec![format!("{:040x}", i + 1)];
+        last = store.export_bundle(&ctx, &p.root, &have).unwrap();
+        assert!(last.exists());
+        assert!(files(&p.root.source_id).len() <= MAX_BUNDLES_PER_SOURCE);
+    }
+    assert_eq!(files(&p.root.source_id).len(), MAX_BUNDLES_PER_SOURCE);
+    // What is not a commit id, and what is named twice, is not a new set.
+    let noisy = vec![
+        format!("{:040x}", MAX_BUNDLES_PER_SOURCE + 3),
+        "not a commit".to_string(),
+        format!("{:040x}", MAX_BUNDLES_PER_SOURCE + 3),
+    ];
+    assert_eq!(store.export_bundle(&ctx, &p.root, &noisy).unwrap(), last);
+    // The other source's file was not touched, and is not removed with them.
+    assert_eq!(files(&other.root.source_id).len(), 1);
+    assert_eq!(
+        store.remove_bundles(&p.root.source_id).unwrap(),
+        MAX_BUNDLES_PER_SOURCE
+    );
+    assert!(files(&p.root.source_id).is_empty());
+    assert_eq!(files(&other.root.source_id).len(), 1);
+    assert_eq!(store.remove_bundles(&p.root.source_id).unwrap(), 0);
+}

@@ -24,7 +24,7 @@ globset = "0.4"
 rustix = { version = "1", features = ["fs", "process"] }
 clap = { version = "4", features = ["derive"] }
 libc = "0.2"
-local-ci = "0.10.1"
+local-ci = "0.11.0"
 rusqlite = { version = "0.41.1", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
