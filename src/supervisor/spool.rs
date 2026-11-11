@@ -55,7 +55,7 @@
 
 use super::spool_plan::{
     admit, read_window, record_needed, Admission, IndexScan, Mark, Recovery, MAX_READ_BYTES,
-    RECORD_LEN,
+    MIN_RECORD_BYTES, RECORD_LEN,
 };
 use crate::ids::AttemptId;
 use crate::storage::LogPosition;
@@ -146,6 +146,8 @@ fn sync_dir(dir: &Path) -> io::Result<()> {
 #[derive(Debug)]
 struct Budget {
     limit: u64,
+    /// Stored bytes that may wait without an index record.
+    record_bytes: u64,
     used: AtomicU64,
 }
 
@@ -223,7 +225,12 @@ impl StreamWriter {
             g.data.write_all(&bytes[..store])?;
             g.dropped += adm.drop;
             g.data_end += adm.store;
-            if record_needed(g.data_end - g.mark.end, g.mark.dropped, g.dropped) {
+            if record_needed(
+                g.data_end - g.mark.end,
+                self.budget.record_bytes,
+                g.mark.dropped,
+                g.dropped,
+            ) {
                 sync_inner(&mut g)?;
             }
             Ok(())
@@ -378,6 +385,18 @@ impl AttemptSpool {
     /// A second writer, in this or another process, is [`SpoolError::Locked`];
     /// a spool already finished is [`SpoolError::Finished`].
     pub fn open(root: &Path, attempt: &AttemptId, limit: u64) -> Result<Self> {
+        Self::open_with_record_bytes(root, attempt, limit, MIN_RECORD_BYTES)
+    }
+
+    /// [`AttemptSpool::open`] with the number of stored bytes that may wait
+    /// for an index record set by the caller (`open` uses
+    /// [`MIN_RECORD_BYTES`]). Only tests have a reason to pass anything else.
+    pub fn open_with_record_bytes(
+        root: &Path,
+        attempt: &AttemptId,
+        limit: u64,
+        record_bytes: u64,
+    ) -> Result<Self> {
         let dir = logs_dir(root, attempt);
         DirBuilder::new().recursive(true).mode(0o700).create(&dir)?;
         let lock = open_rw(&dir.join("writer.lock"))?;
@@ -391,6 +410,7 @@ impl AttemptSpool {
         }
         let budget = Arc::new(Budget {
             limit,
+            record_bytes,
             used: AtomicU64::new(0),
         });
         let stdout = open_stream(&dir, LogStream::Stdout, &budget)?;

@@ -1,8 +1,7 @@
 //! `worker --stdio` as a real process: bytes pass through to the agent's Unix
 //! socket, stdout carries nothing else, and a missing agent is an explicit error.
 
-#[path = "proto_common/mod.rs"]
-mod common;
+use crate::proto_common as common;
 
 use common::*;
 use remote_task_runner::ids::*;
@@ -100,7 +99,6 @@ fn without_an_agent_the_bridge_exits_with_an_explicit_error_and_a_clean_stdout()
 /// space and a quote in it, so only correct quoting gets through.
 #[tokio::test]
 async fn the_ssh_command_line_reaches_the_bridge_through_a_remote_shell() {
-    use std::os::unix::fs::PermissionsExt;
     let home = short_tempdir();
     let cluster = ClusterId::generate();
     start_agent(home.path(), &cluster);
@@ -109,23 +107,19 @@ async fn the_ssh_command_line_reaches_the_bridge_through_a_remote_shell() {
     let dir = tools.path().join("it's a dir");
     std::fs::create_dir_all(&dir).unwrap();
     let wrapper = dir.join("rtr wrapper.sh");
-    std::fs::write(
+    crate::common::write_executable(
         &wrapper,
-        format!(
+        &format!(
             "#!/bin/sh\nHOME='{}' exec '{}' \"$@\"\n",
             home.path().display(),
             BIN
         ),
-    )
-    .unwrap();
-    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+    );
     let fake_ssh = tools.path().join("ssh");
-    std::fs::write(
+    crate::common::write_executable(
         &fake_ssh,
         "#!/bin/sh\n# skip options up to the terminator, then the destination\nwhile [ \"$1\" != \"--\" ]; do shift; done\nshift\nshift\nexec /bin/sh -c \"$1\"\n",
-    )
-    .unwrap();
-    std::fs::set_permissions(&fake_ssh, std::fs::Permissions::from_mode(0o755)).unwrap();
+    );
 
     let target = SshTarget::parse("worker-host").unwrap();
     let command = RemoteCommand::worker_stdio(wrapper.to_str().unwrap()).unwrap();

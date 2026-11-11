@@ -1,6 +1,7 @@
 //! The supervisor against real processes: lease, cancel, timeouts, stop,
 //! recovery, and survival of the agent's death.
 
+use crate::common::{alive, read_pid};
 use remote_task_runner::ids::*;
 use remote_task_runner::platform;
 use remote_task_runner::platform::{signal_pid, signal_process_group};
@@ -216,14 +217,6 @@ fn key(seq: u64) -> LeaseKey {
         coordinator_epoch: CoordinatorEpoch(1),
         lease_seq: seq,
     }
-}
-
-fn alive(pid: i32) -> bool {
-    u32::try_from(pid).is_ok_and(|p| signal_pid(p, 0))
-}
-
-fn read_pid(path: &Path) -> Option<i32> {
-    std::fs::read_to_string(path).ok()?.trim().parse().ok()
 }
 
 fn wait_for<F: Fn() -> bool>(what: &str, f: F) {

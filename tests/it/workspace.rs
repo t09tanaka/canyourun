@@ -6,7 +6,7 @@
 //! The real `fast-worktree` is used when it is on the PATH; set
 //! `RTR_REQUIRE_FAST_WORKTREE=1` (CI does) to make its absence a failure.
 
-mod common;
+use crate::common;
 
 use local_ci::source::SourceManifest as CiManifest;
 use local_ci::ExecContext;
@@ -1314,8 +1314,7 @@ fn fake_tool(f: &Fixture, body: &str) -> (PathBuf, BTreeMap<String, String>) {
     let bin = f.root.join("bin");
     std::fs::create_dir_all(&bin).unwrap();
     let path = bin.join("fast-worktree");
-    std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
-    std::fs::set_permissions(&path, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    common::write_executable(&path, &format!("#!/bin/sh\n{body}\n"));
     let env = script_env(f, &bin);
     (bin, env)
 }

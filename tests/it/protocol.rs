@@ -1,5 +1,4 @@
-#[path = "proto_common/mod.rs"]
-mod common;
+use crate::proto_common as common;
 
 use common::*;
 use remote_task_runner::error::ErrorCode;

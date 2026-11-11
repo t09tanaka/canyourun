@@ -39,3 +39,7 @@ unicode-normalization = "0.1.26"
 
 [dev-dependencies]
 assert_cmd = "2"
+
+[[test]]
+name = "it"
+path = "tests/it/main.rs"
