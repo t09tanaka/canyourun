@@ -15,7 +15,7 @@ use remote_task_runner::coordinator::ClientLink;
 use remote_task_runner::coordinator::{
     Coordinator, CoordinatorConfig, CoordinatorError, LinkError, TaskSpec, WorkerLink,
 };
-use remote_task_runner::error::{ApiError, ErrorCode};
+use remote_task_runner::error::{ApiError, ConflictReason, ErrorCode};
 use remote_task_runner::ids::*;
 use remote_task_runner::protocol::transport::duplex_pair;
 use remote_task_runner::protocol::{connect, ClientConfig};
@@ -97,7 +97,15 @@ struct State {
     lose: Vec<(Op, Lost)>,
     overloaded: bool,
     refuse: bool,
+    /// What a new submit is answered with instead of being taken.
+    fault: Option<ApiError>,
     slow_stop: bool,
+    /// How a command that is being retired ends, when not by the stop.
+    ends_in_retire: Option<Outcome>,
+    /// The `get_attempt` that follows a retire gets no answer.
+    lose_get_after_retire: bool,
+    /// After `inspect`, nothing is answered and nothing returns.
+    stall: bool,
     draining: bool,
     limits: (u32, u32),
     /// The requests that were carried out, in order.
@@ -134,7 +142,11 @@ impl FakeWorker {
                 lose: Vec::new(),
                 overloaded: false,
                 refuse: false,
+                fault: None,
                 slow_stop: false,
+                ends_in_retire: None,
+                lose_get_after_retire: false,
+                stall: false,
                 draining: false,
                 limits,
                 log: Vec::new(),
@@ -277,7 +289,10 @@ impl FakeWorker {
                 }
                 if let Some(h) = s.held.get(&r.attempt_id) {
                     if h.hash != r.payload_hash {
-                        return Err(err(ErrorCode::Conflict));
+                        return Err(ApiError::conflict(
+                            ConflictReason::PayloadMismatch,
+                            "another payload",
+                        ));
                     }
                     return Ok(Response::SubmitAttempt(SubmitAttemptResponse {
                         schema_version: SchemaVersion::CURRENT,
@@ -290,6 +305,9 @@ impl FakeWorker {
                 }
                 if s.refuse {
                     return Err(err(ErrorCode::InvalidInput));
+                }
+                if let Some(fault) = s.fault.clone() {
+                    return Err(fault);
                 }
                 if s.overloaded {
                     return Err(err(ErrorCode::Overloaded));
@@ -351,13 +369,14 @@ impl FakeWorker {
                 s.log.push((Op::Retire, r.attempt_id.clone()));
                 s.tombstones.insert(r.attempt_id.clone());
                 let slow = s.slow_stop;
+                let stopped_as = s.ends_in_retire.unwrap_or(Outcome::Cancelled);
                 let (known, was, now, launched) = match s.held.remove(&r.attempt_id) {
                     None => (false, false, false, false),
                     Some(mut h) => {
                         let was = h.state == AttemptState::Terminal;
                         h.retired = true;
                         if !was && !slow {
-                            self.stop(&mut h, Outcome::Cancelled);
+                            self.stop(&mut h, stopped_as);
                         }
                         let out = (true, was, h.state == AttemptState::Terminal, h.launches > 0);
                         s.held.insert(r.attempt_id.clone(), h);
@@ -419,12 +438,18 @@ impl WorkerLink for FakeWorker {
         request: Request,
     ) -> Pin<Box<dyn Future<Output = Result<Response, LinkError>> + Send + '_>> {
         Box::pin(async move {
+            let op = op_of(&request);
+            let stall = self.state.lock().unwrap().stall;
+            if stall && op != Op::Inspect {
+                // Never answered; only the caller's own deadline ends it.
+                std::future::pending::<()>().await;
+            }
             let lost = {
                 let mut s = self.state.lock().unwrap();
-                if s.offline {
+                let after_retire = matches!(s.log.last(), Some((Op::Retire, _)));
+                if s.offline || (s.lose_get_after_retire && op == Op::Get && after_retire) {
                     Some(Lost::Request)
                 } else {
-                    let op = op_of(&request);
                     let at = s.lose.iter().position(|(o, _)| *o == op);
                     at.map(|i| s.lose.remove(i).1)
                 }
@@ -459,6 +484,7 @@ fn fx() -> Fx {
                 prefetch_per_worker: 1,
             },
             lease_ms: 60_000,
+            worker_budget_ms: 10_000,
         },
     }
 }
@@ -1274,6 +1300,12 @@ async fn an_attempt_a_worker_will_never_take_is_retired_there_and_failed_here() 
     assert!(report.retired.is_empty());
     let rec = only(&c, &tasks[0]);
     assert_eq!(rec.termination.unwrap().outcome(), Outcome::Failed);
+    assert!(!rec.retired, "its result is the task's last word");
+    let tombstone = c.store().retire_tombstone(&first.attempt_id).unwrap();
+    assert!(
+        matches!(tombstone, Some((_, Some(_)))),
+        "the confirmed retire is on record here too: {tombstone:?}"
+    );
     assert!(c.store().unacked_demand().unwrap().is_empty());
     for _ in 0..3 {
         assert!(c.tick().await.unwrap().placed.is_empty());
@@ -1283,6 +1315,293 @@ async fn an_attempt_a_worker_will_never_take_is_retired_there_and_failed_here() 
         "a refusal is not a reason to try elsewhere"
     );
     assert_eq!(attempts(&c, &tasks[0]).len(), 1);
+}
+
+#[tokio::test]
+async fn the_same_attempt_with_another_payload_is_refused_for_good() {
+    let f = fx();
+    let a = f.worker("w-a", (1, 0));
+    let c = f.open(&[&a]);
+    let tasks = enqueue(&c, 1).await;
+    a.set(|s| {
+        s.fault = Some(ApiError::conflict(
+            ConflictReason::PayloadMismatch,
+            "another payload",
+        ))
+    });
+    c.tick().await.unwrap();
+    let report = c.tick().await.unwrap();
+    let first = only(&c, &tasks[0]);
+    assert_eq!(report.settled, vec![first.attempt_id.clone()]);
+    assert_eq!(first.termination.unwrap().outcome(), Outcome::Failed);
+}
+
+#[tokio::test]
+async fn a_fault_of_the_worker_is_not_a_verdict_on_the_attempt() {
+    // Every answer that says nothing about the attempt itself, a conflict
+    // without the reason that names the payload included.
+    for code in [
+        ErrorCode::Internal,
+        ErrorCode::CommunicationUnknown,
+        ErrorCode::Blocked,
+        ErrorCode::NotImplemented,
+        ErrorCode::ProtocolIncompatible,
+        ErrorCode::NotFound,
+        ErrorCode::Conflict,
+    ] {
+        let f = fx();
+        let a = f.worker("w-a", (1, 0));
+        let b = f.worker("w-b", (1, 0));
+        let c = f.open(&[&a, &b]);
+        let tasks = enqueue(&c, 1).await;
+        a.set(|s| s.fault = Some(err(code)));
+        for _ in 0..3 {
+            let report = c.tick().await.unwrap();
+            assert!(report.settled.is_empty() && report.retired.is_empty());
+        }
+        let first = only(&c, &tasks[0]);
+        assert_eq!(first.worker_id, a.id, "{code:?}");
+        assert_eq!(first.state, AttemptState::Accepted, "{code:?}");
+        assert_eq!(first.termination, None, "{code:?}: the task did not fail");
+        assert_eq!(first.observation, Observation::Known);
+        assert_eq!(c.store().retire_tombstone(&first.attempt_id).unwrap(), None);
+        assert_eq!(a.count(Op::Retire), 0);
+        assert!(b.holds().is_empty(), "and it is not tried elsewhere");
+        // Why it waits is on record, once however often it is asked.
+        let why = c
+            .store()
+            .events_of(&first.attempt_id, "submit_deferred")
+            .unwrap();
+        assert_eq!(why.len(), 1, "{code:?}");
+        assert_eq!(why[0].payload["code"], code.to_string());
+        // The fault passes: the same attempt goes to the same worker.
+        a.set(|s| s.fault = None);
+        c.tick().await.unwrap();
+        assert_eq!(a.holds(), vec![first.attempt_id.clone()], "{code:?}");
+        assert!(c.store().unacked_demand().unwrap().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn an_attempt_that_waits_on_its_worker_is_moved_by_a_retire() {
+    let f = fx();
+    let a = f.worker("w-a", (1, 0));
+    let b = f.worker("w-b", (1, 0));
+    let c = f.open(&[&a, &b]);
+    let tasks = enqueue(&c, 1).await;
+    a.set(|s| s.fault = Some(err(ErrorCode::Blocked)));
+    c.tick().await.unwrap();
+    let first = only(&c, &tasks[0]);
+    assert_eq!(first.worker_id, a.id);
+    // Whoever sees that it will not run there asks for the retire; the
+    // worker never had it, and the task is free for another one (this
+    // worker takes nothing new).
+    a.set(|s| s.draining = true);
+    c.request_retire(&first.attempt_id, "blocked")
+        .await
+        .unwrap();
+    let report = c.tick().await.unwrap();
+    assert_eq!(report.retired, vec![first.attempt_id.clone()]);
+    let second = attempts(&c, &tasks[0]).remove(1);
+    assert_eq!(second.worker_id, b.id);
+    assert_eq!(b.holds(), vec![second.attempt_id.clone()]);
+    assert!(a.holds().is_empty());
+}
+
+#[tokio::test]
+async fn a_command_that_ends_by_itself_while_it_is_retired_keeps_its_result() {
+    // `lost`: the first answer to the retire does not arrive, so the worker
+    // answers `already_terminal` to the second. Both ways end the same.
+    for lost in [false, true] {
+        let f = fx();
+        let a = f.worker("w-a", (1, 0));
+        let b = f.worker("w-b", (1, 0));
+        let c = f.open(&[&a, &b]);
+        let tasks = enqueue(&c, 1).await;
+        c.tick().await.unwrap();
+        let first = only(&c, &tasks[0]);
+        a.start(&first.attempt_id);
+        c.tick().await.unwrap();
+        // The command succeeds between the worker's look and its stop: the
+        // retire is answered `stopped`.
+        a.set(|s| s.ends_in_retire = Some(Outcome::Succeeded));
+        c.request_retire(&first.attempt_id, "move").await.unwrap();
+        if lost {
+            a.set(|s| s.lose.push((Op::Retire, Lost::Answer)));
+            let report = c.tick().await.unwrap();
+            assert_eq!(report.unknown, vec![first.attempt_id.clone()]);
+        }
+        let report = c.tick().await.unwrap();
+        assert!(
+            report.retired.is_empty() && report.placed.is_empty(),
+            "lost={lost}: {report:?}"
+        );
+        assert_eq!(report.settled, vec![first.attempt_id.clone()]);
+        let rec = only(&c, &tasks[0]);
+        assert_eq!(rec.termination.unwrap().outcome(), Outcome::Succeeded);
+        assert!(!rec.retired);
+        assert!(queued(&c).is_empty());
+        for _ in 0..2 {
+            assert!(c.tick().await.unwrap().placed.is_empty());
+        }
+        assert!(b.holds().is_empty(), "lost={lost}: it ran once");
+        assert_eq!(f.cluster.starts_of(&tasks[0]), vec!["w-a".to_string()]);
+    }
+}
+
+#[tokio::test]
+async fn a_stop_whose_ending_is_not_known_frees_nothing() {
+    let f = fx();
+    let a = f.worker("w-a", (1, 0));
+    let b = f.worker("w-b", (1, 0));
+    let c = f.open(&[&a, &b]);
+    let tasks = enqueue(&c, 1).await;
+    c.tick().await.unwrap();
+    let first = only(&c, &tasks[0]);
+    a.start(&first.attempt_id);
+    c.tick().await.unwrap();
+    // The retire is answered `stopped`; how it ended is not answered.
+    a.set(|s| s.lose_get_after_retire = true);
+    c.request_retire(&first.attempt_id, "move").await.unwrap();
+    for _ in 0..3 {
+        let report = c.tick().await.unwrap();
+        assert_eq!(report.unknown, vec![first.attempt_id.clone()]);
+        assert!(report.retired.is_empty() && report.placed.is_empty());
+    }
+    let rec = only(&c, &tasks[0]);
+    assert_eq!(rec.observation, Observation::Unknown);
+    assert!(!rec.retired);
+    assert!(queued(&c).is_empty() && b.holds().is_empty());
+    // It answers: stopped without completing, so the task is free.
+    a.set(|s| s.lose_get_after_retire = false);
+    let report = c.tick().await.unwrap();
+    assert_eq!(report.retired, vec![first.attempt_id.clone()]);
+    assert_eq!(attempts(&c, &tasks[0]).len(), 2);
+}
+
+#[tokio::test]
+async fn a_cancel_while_a_retire_is_pending_settles_the_attempt_cancelled() {
+    // The cancel before or after the retire request: the same end.
+    for cancel_first in [false, true] {
+        let f = fx();
+        let a = f.worker("w-a", (1, 0));
+        let b = f.worker("w-b", (1, 0));
+        let c = f.open(&[&a, &b]);
+        let tasks = enqueue(&c, 1).await;
+        c.tick().await.unwrap();
+        let first = only(&c, &tasks[0]);
+        a.start(&first.attempt_id);
+        c.tick().await.unwrap();
+        if cancel_first {
+            c.cancel_task(&tasks[0]).await.unwrap();
+            c.request_retire(&first.attempt_id, "move").await.unwrap();
+        } else {
+            c.request_retire(&first.attempt_id, "move").await.unwrap();
+            c.cancel_task(&tasks[0]).await.unwrap();
+        }
+        let report = c.tick().await.unwrap();
+        assert_eq!(report.settled, vec![first.attempt_id.clone()]);
+        assert!(report.retired.is_empty() && report.placed.is_empty());
+        let rec = only(&c, &tasks[0]);
+        assert_eq!(rec.state, AttemptState::Terminal);
+        assert_eq!(rec.termination.unwrap().outcome(), Outcome::Cancelled);
+        assert!(!rec.retired);
+        let tombstone = c.store().retire_tombstone(&first.attempt_id).unwrap();
+        assert!(matches!(tombstone, Some((_, Some(_)))), "{tombstone:?}");
+        assert!(c.store().live_attempts(None).unwrap().is_empty());
+        assert!(c.store().unacked_demand().unwrap().is_empty());
+        assert!(queued(&c).is_empty());
+        assert!(c.tick().await.unwrap().placed.is_empty());
+        assert!(b.holds().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn a_worker_that_stalls_does_not_keep_the_leases_of_the_others_from_renewal() {
+    let mut f = fx();
+    f.cfg.worker_budget_ms = 300;
+    // It is asked first (by id), and holds two attempts.
+    let stalled = f.worker("w-a", (2, 0));
+    let healthy = f.worker("w-b", (2, 0));
+    let c = f.open(&[&stalled, &healthy]);
+    let tasks = enqueue(&c, 3).await;
+    c.tick().await.unwrap();
+    for t in &tasks[..2] {
+        stalled.start(&only(&c, t).attempt_id);
+    }
+    let on_healthy = only(&c, &tasks[2]);
+    assert_eq!(on_healthy.worker_id, healthy.id);
+    healthy.start(&on_healthy.attempt_id);
+    c.tick().await.unwrap();
+    let before = healthy.held(&on_healthy.attempt_id).unwrap().renewals;
+
+    stalled.set(|s| s.stall = true);
+    let more = enqueue(&c, 1).await;
+    let started = std::time::Instant::now();
+    let report = tokio::time::timeout(Duration::from_secs(20), c.tick())
+        .await
+        .expect("the tick ends although a worker never answers")
+        .unwrap();
+    // Far below the lease (60 s), and not one wait per attempt.
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "{:?}",
+        started.elapsed()
+    );
+    let after = healthy.held(&on_healthy.attempt_id).unwrap().renewals;
+    assert_eq!(after, before + 1, "the healthy worker's lease was renewed");
+    let mut unknown = report.unknown.clone();
+    unknown.sort();
+    let mut want: Vec<AttemptId> = tasks[..2].iter().map(|t| only(&c, t).attempt_id).collect();
+    want.sort();
+    assert_eq!(unknown, want, "what did not answer is unknown, and kept");
+    // Nothing new goes to the worker that used up its time.
+    assert_eq!(only(&c, &more[0]).worker_id, healthy.id);
+    assert_eq!(f.cluster.starts_of(&tasks[0]), vec!["w-a".to_string()]);
+
+    // It answers again: its attempts are followed as before.
+    stalled.set(|s| s.stall = false);
+    let report = c.tick().await.unwrap();
+    assert!(report.unknown.is_empty());
+    for t in &tasks[..2] {
+        assert_eq!(only(&c, t).observation, Observation::Known);
+    }
+}
+
+#[tokio::test]
+async fn a_task_no_payload_can_be_made_for_is_passed_over_and_the_rest_is_placed() {
+    let f = fx();
+    let a = f.worker("w-a", (2, 1));
+    let c = f.open(&[&a]);
+    // Queued by something else than this coordinator: not a task spec.
+    let (run, broken) = (RunId::generate(), TaskId::generate());
+    let src = source(&c);
+    c.store()
+        .enqueue(
+            &run,
+            Some(&src),
+            &serde_json::json!({}),
+            &[(broken.clone(), serde_json::json!({"nope": 1}))],
+            1,
+        )
+        .unwrap();
+    let tasks = enqueue(&c, 2).await;
+    for _ in 0..2 {
+        c.tick().await.expect("one task does not fail the tick");
+    }
+    assert!(attempts(&c, &broken).is_empty());
+    assert_eq!(queued(&c), vec![broken.clone()], "it stays queued");
+    assert_eq!(a.holds().len(), 2);
+    for t in &tasks {
+        assert_eq!(only(&c, t).worker_id, a.id);
+    }
+    let events = c.store().events_after(0, 1_000).unwrap();
+    let noted: Vec<_> = events
+        .iter()
+        .filter(|e| e.kind == "task_unplaceable")
+        .collect();
+    assert_eq!(noted.len(), 1, "recorded once");
+    assert_eq!(noted[0].payload["task"], broken.to_string());
 }
 
 #[tokio::test]

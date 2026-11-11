@@ -19,7 +19,7 @@ use serde_json::Value;
 use std::path::Path;
 
 mod queue;
-pub use queue::{LiveAttempt, PlaceInput, PlaceOutcome, QueuedTask, Seen, WorkerLoad};
+pub use queue::{LiveAttempt, PlaceInput, PlaceOutcome, QueuedTask, RetireEnd, Seen, WorkerLoad};
 
 const ATTEMPT: &str = "attempt";
 
@@ -138,6 +138,55 @@ fn run_of(conn: &Connection, attempt_id: &str) -> Result<Option<String>> {
         .optional()?)
 }
 
+/// Confirm the retire tombstone of an attempt (it must exist).
+fn confirm_tombstone(conn: &Connection, aid: &str, at_ms: u64) -> Result<()> {
+    let n = conn.execute(
+        "UPDATE retire_tombstone SET confirmed_at_ms = COALESCE(confirmed_at_ms, ?1)
+         WHERE attempt_id = ?2",
+        params![to_i64(at_ms)?, aid],
+    )?;
+    if n != 1 {
+        return Err(not_found(format!("retire tombstone for {aid}")));
+    }
+    Ok(())
+}
+
+/// The confirmed retire of an attempt that did not end: the attempt is
+/// retired and its task is free for a new one.
+fn free_by_retire(conn: &Connection, aid: &str, at_ms: u64) -> Result<()> {
+    confirm_tombstone(conn, aid, at_ms)?;
+    let n = conn.execute(
+        "UPDATE attempt SET retired = 1, retired_at_ms = COALESCE(retired_at_ms, ?2)
+         WHERE attempt_id = ?1 AND state <> 'terminal'",
+        params![aid, to_i64(at_ms)?],
+    )?;
+    if n != 1 {
+        // A result that is fixed is never taken back by a retire: the task
+        // would be placed again.
+        return Err(StorageError::IllegalState {
+            attempt: aid.to_string(),
+            state: AttemptState::Terminal,
+            why: "a terminal attempt is not retired",
+        });
+    }
+    // A retired attempt puts no demand on its worker any more.
+    conn.execute(
+        "UPDATE placement SET acked_at_ms = COALESCE(acked_at_ms, ?2)
+         WHERE attempt_id = ?1",
+        params![aid, to_i64(at_ms)?],
+    )?;
+    let run = run_of(conn, aid)?;
+    common::append_event(
+        conn,
+        run.as_deref(),
+        Some(aid),
+        "retire_confirmed",
+        &Value::Null,
+        at_ms,
+    )?;
+    Ok(())
+}
+
 fn not_found(what: impl Into<String>) -> StorageError {
     StorageError::NotFound { what: what.into() }
 }
@@ -183,6 +232,9 @@ pub struct CoordinatorStore {
     cluster_id: ClusterId,
     coordinator_id: CoordinatorId,
     epoch: CoordinatorEpoch,
+    /// False for a step-1 file opened read-only: its tasks have no cancel
+    /// column (no task of it was ever cancelled before it was placed).
+    task_cancel: bool,
     _lock: Option<ProcessLock>,
 }
 
@@ -242,6 +294,7 @@ impl CoordinatorStore {
             cluster_id,
             coordinator_id,
             epoch,
+            task_cancel: true,
             _lock: Some(lock),
         })
     }
@@ -254,7 +307,13 @@ impl CoordinatorStore {
             DbKind::Coordinator,
             Access::ReadOnly,
         )?;
-        let (cluster_id, coordinator_id, epoch) = db.call(|c| {
+        let (cluster_id, coordinator_id, epoch, task_cancel) = db.call(|c| {
+            let task_cancel: bool = c.query_row(
+                "SELECT count(*) > 0 FROM pragma_table_info('task')
+                 WHERE name = 'cancel_requested_at_ms'",
+                [],
+                |r| r.get(0),
+            )?;
             let (cl, co, ep): (String, String, i64) = c
                 .query_row(
                     "SELECT s.cluster_id, c.coordinator_id, s.epoch
@@ -268,6 +327,7 @@ impl CoordinatorStore {
                 id("cluster_id", ClusterId::parse(&cl))?,
                 id("coordinator_id", CoordinatorId::parse(&co))?,
                 CoordinatorEpoch(to_u64(ep)?),
+                task_cancel,
             ))
         })?;
         Ok(Self {
@@ -275,6 +335,7 @@ impl CoordinatorStore {
             cluster_id,
             coordinator_id,
             epoch,
+            task_cancel,
             _lock: None,
         })
     }
@@ -592,40 +653,11 @@ impl CoordinatorStore {
 
     /// The worker confirmed the attempt never started or has stopped. Needs
     /// the tombstone from [`Self::begin_retire`]; frees the task for a new
-    /// attempt. The tombstone itself stays.
+    /// attempt. The tombstone itself stays. An attempt that is terminal
+    /// keeps its result and is not retired (`IllegalState`).
     pub fn confirm_retire(&self, attempt_id: &AttemptId, at_ms: u64) -> Result<()> {
         let aid = attempt_id.to_string();
-        self.db.write(move |tx| {
-            let n = tx.execute(
-                "UPDATE retire_tombstone SET confirmed_at_ms = COALESCE(confirmed_at_ms, ?1)
-                 WHERE attempt_id = ?2",
-                params![to_i64(at_ms)?, aid],
-            )?;
-            if n != 1 {
-                return Err(not_found(format!("retire tombstone for {aid}")));
-            }
-            tx.execute(
-                "UPDATE attempt SET retired = 1, retired_at_ms = COALESCE(retired_at_ms, ?2)
-                 WHERE attempt_id = ?1",
-                params![aid, to_i64(at_ms)?],
-            )?;
-            // A retired attempt puts no demand on its worker any more.
-            tx.execute(
-                "UPDATE placement SET acked_at_ms = COALESCE(acked_at_ms, ?2)
-                 WHERE attempt_id = ?1",
-                params![aid, to_i64(at_ms)?],
-            )?;
-            let run = run_of(tx, &aid)?;
-            common::append_event(
-                tx,
-                run.as_deref(),
-                Some(&aid),
-                "retire_confirmed",
-                &Value::Null,
-                at_ms,
-            )?;
-            Ok(())
-        })
+        self.db.write(move |tx| free_by_retire(tx, &aid, at_ms))
     }
 
     /// `(requested_at_ms, confirmed_at_ms)` of the tombstone, if any.

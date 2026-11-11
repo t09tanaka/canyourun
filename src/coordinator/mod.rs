@@ -6,6 +6,12 @@
 //! placements (spec chapter 9). A tick first looks at every attempt that
 //! still needs attention on each attached worker, then places queued tasks.
 //!
+//! The workers are looked at side by side, each within the same time budget
+//! ([`CoordinatorConfig::worker_budget_ms`]): a worker that stalls costs the
+//! tick that budget once, not one timeout per attempt, so the leases on the
+//! other workers are renewed in time. Placing stays one step after the
+//! other, by this one actor.
+//!
 //! Every step is decided from what is durable in the parent database and
 //! what the worker answers now ([`policy`]), so a tick can be repeated after
 //! a crash at any point: a placement that was committed and never sent, a
@@ -21,28 +27,35 @@ pub mod policy;
 
 pub use link::{ClientLink, LinkError, WorkerLink};
 
-use crate::error::ErrorCode;
+use crate::error::{ApiError, ConflictReason, ErrorCode};
 use crate::ids::{
-    AttemptId, CoordinatorEpoch, ManifestDigest, PlanDigest, RequestId, RunId, SourceId, TaskId,
-    WorkerId,
+    AttemptId, CoordinatorEpoch, Generation, ManifestDigest, PlanDigest, RequestId, RunId,
+    SourceId, TaskId, WorkerId,
 };
 use crate::platform::wall_ms;
 use crate::state::{AttemptState, Observation, Outcome, Termination};
 use crate::storage::{
-    AttemptRecord, CoordinatorStore, LiveAttempt, PlaceInput, PlaceOutcome, Seen, StorageError,
+    AttemptRecord, CoordinatorStore, LiveAttempt, PlaceInput, PlaceOutcome, QueuedTask, RetireEnd,
+    Seen, StorageError,
 };
 use crate::wire::{
     payload_hash, AttemptPayload, AttemptStatus, CancelAttemptRequest, CommandSpec,
     GetAttemptRequest, InspectRequest, InspectResponse, RenewLeaseRequest, Request, Response,
     RetireAttemptRequest, RetireStatus, SchemaVersion, SubmitAttemptRequest,
 };
-use policy::{Answer, Facts, Limits, Refusal, RetireVerdict, Step};
+use link::Budgeted;
+use policy::{Answer, Ended, Facts, Limits, Refusal, RetireVerdict, Step};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::task::Poll;
+use std::time::Duration;
 use thiserror::Error;
+use tokio::time::Instant;
 
 /// The reason recorded for a retire the coordinator starts by itself after a
 /// worker refused the attempt for good. Such an attempt is failed, not
@@ -119,6 +132,12 @@ pub struct CoordinatorConfig {
     pub limits: Limits,
     /// The execution lease granted with each submit and renewal.
     pub lease_ms: u64,
+    /// How long one tick waits for one worker, over all its attempts; then
+    /// again for the submits of that tick, over all workers. What was not
+    /// answered by then is `unknown` and is asked again by the next tick.
+    /// Keep twice this well below `lease_ms`: a tick takes no longer, and
+    /// every tick renews the leases.
+    pub worker_budget_ms: u64,
 }
 
 impl Default for CoordinatorConfig {
@@ -129,6 +148,7 @@ impl Default for CoordinatorConfig {
                 prefetch_per_worker: 1,
             },
             lease_ms: 60_000,
+            worker_budget_ms: 15_000,
         }
     }
 }
@@ -154,6 +174,42 @@ struct Reached {
     draining: bool,
 }
 
+/// What became of an attempt that was just placed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Sent {
+    /// The worker holds it.
+    Taken,
+    /// The worker did not take it (now).
+    NotTaken,
+    /// It was not sent: a cancel or a retire for it was recorded first.
+    Withheld,
+}
+
+type Followed = Result<(Option<Reached>, TickReport)>;
+
+/// Drive every future to its end, side by side on this task.
+async fn join_all<'a, T>(mut all: Vec<Pin<Box<dyn Future<Output = T> + Send + 'a>>>) -> Vec<T> {
+    let mut done: Vec<Option<T>> = all.iter().map(|_| None).collect();
+    std::future::poll_fn(|cx| {
+        let mut pending = false;
+        for (future, slot) in all.iter_mut().zip(done.iter_mut()) {
+            if slot.is_none() {
+                match future.as_mut().poll(cx) {
+                    Poll::Ready(out) => *slot = Some(out),
+                    Poll::Pending => pending = true,
+                }
+            }
+        }
+        if pending {
+            Poll::Pending
+        } else {
+            Poll::Ready(())
+        }
+    })
+    .await;
+    done.into_iter().flatten().collect()
+}
+
 pub struct Coordinator {
     store: Arc<CoordinatorStore>,
     cfg: CoordinatorConfig,
@@ -161,14 +217,13 @@ pub struct Coordinator {
     actor: tokio::sync::Mutex<()>,
     lease_seq: AtomicU64,
     fenced: AtomicBool,
+    /// The queued tasks no payload could be made for, as this process
+    /// already recorded.
+    unplaceable: Mutex<BTreeSet<TaskId>>,
 }
 
 fn cancelled() -> Termination {
     Termination::new(Outcome::Cancelled, None, None).expect("cancelled without an exit is valid")
-}
-
-fn failed() -> Termination {
-    Termination::new(Outcome::Failed, None, None).expect("failed without an exit is valid")
 }
 
 fn seen_of(status: &AttemptStatus) -> Seen {
@@ -192,6 +247,7 @@ impl Coordinator {
             actor: tokio::sync::Mutex::new(()),
             lease_seq: AtomicU64::new(0),
             fenced: AtomicBool::new(false),
+            unplaceable: Mutex::default(),
         })
     }
 
@@ -273,6 +329,7 @@ impl Coordinator {
             }
             let value = serde_json::to_value(&spec)
                 .map_err(|e| CoordinatorError::Invalid(e.to_string()))?;
+            check_spec(&run_id, &source_id, &task, &value, self.cfg.lease_ms)?;
             specs.push((task, value));
         }
         self.db(move |s| s.enqueue(&run_id, Some(&source_id), &json!({}), &specs, wall_ms()))
@@ -311,34 +368,81 @@ impl Coordinator {
                 .map(|(w, l)| (w.clone(), Arc::clone(l)))
                 .collect()
         };
+        let deadline = self.deadline();
+        let follows: Vec<Pin<Box<dyn Future<Output = Followed> + Send + '_>>> = attached
+            .into_iter()
+            .map(|(worker_id, link)| {
+                Box::pin(self.follow(worker_id, link, deadline))
+                    as Pin<Box<dyn Future<Output = Followed> + Send + '_>>
+            })
+            .collect();
         let mut reached = Vec::new();
-        for (worker_id, link) in attached {
-            let inspected = self.inspect(&worker_id, &*link).await;
-            let w = worker_id.clone();
-            let live = self.db(move |s| s.live_attempts(Some(&w))).await?;
-            let Some(inspected) = inspected else {
-                for l in live {
-                    self.observe(&l.record.attempt_id, Observation::Unknown)
-                        .await?;
-                    report.unknown.push(l.record.attempt_id);
+        let mut failed = None;
+        // In the order of the worker ids, whichever answered first.
+        for followed in join_all(follows).await {
+            match followed {
+                Ok((worker, part)) => {
+                    report.placed.extend(part.placed);
+                    report.unknown.extend(part.unknown);
+                    report.retired.extend(part.retired);
+                    report.settled.extend(part.settled);
+                    reached.extend(worker);
                 }
-                continue;
-            };
-            for l in live {
-                self.drive(&*link, l, &mut report).await?;
+                Err(e) => failed = failed.or(Some(e)),
             }
-            reached.push(Reached {
-                worker_id,
-                link,
-                limits: self.cfg.limits.stricter(Limits {
-                    max_active_task: inspected.max_active_task,
-                    prefetch_per_worker: inspected.prefetch_per_worker,
-                }),
-                draining: inspected.draining,
-            });
+        }
+        if let Some(e) = failed {
+            return Err(e);
         }
         self.dispatch(reached, &mut report).await?;
         Ok(report)
+    }
+
+    fn deadline(&self) -> Instant {
+        Instant::now() + Duration::from_millis(self.cfg.worker_budget_ms)
+    }
+
+    /// Look at one worker and at every attempt on it that needs attention.
+    /// Nothing waits for the worker past `deadline`.
+    async fn follow(
+        &self,
+        worker_id: WorkerId,
+        link: Arc<dyn WorkerLink>,
+        deadline: Instant,
+    ) -> Followed {
+        let budgeted = Budgeted {
+            inner: Arc::clone(&link),
+            deadline,
+        };
+        let mut report = TickReport::default();
+        let inspected = self.inspect(&worker_id, &budgeted).await;
+        let w = worker_id.clone();
+        let live = self.db(move |s| s.live_attempts(Some(&w))).await?;
+        let Some(inspected) = inspected else {
+            for l in live {
+                self.unknown(&l.record.attempt_id, &mut report).await?;
+            }
+            return Ok((None, report));
+        };
+        for l in live {
+            // Another worker may have said that this coordinator is replaced.
+            self.check_fenced()?;
+            self.drive(&budgeted, l, &mut report).await?;
+        }
+        if Instant::now() >= deadline {
+            // It used up its time: nothing new goes there in this tick.
+            return Ok((None, report));
+        }
+        let reached = Reached {
+            worker_id,
+            link,
+            limits: self.cfg.limits.stricter(Limits {
+                max_active_task: inspected.max_active_task,
+                prefetch_per_worker: inspected.prefetch_per_worker,
+            }),
+            draining: inspected.draining,
+        };
+        Ok((Some(reached), report))
     }
 
     async fn inspect(
@@ -373,6 +477,24 @@ impl Coordinator {
             Ok(())
         })
         .await
+    }
+
+    /// Record why a worker did not take an attempt, once per error code, so
+    /// that an attempt which waits on its worker shows what it waits for.
+    async fn note_refusal(
+        &self,
+        attempt_id: &AttemptId,
+        kind: &'static str,
+        e: &ApiError,
+    ) -> Result<()> {
+        let a = attempt_id.clone();
+        let code = e.code.to_string();
+        let payload = json!({"code": code, "message": e.message});
+        self.db(move |s| {
+            s.append_events_unseen(None, &a, kind, "code", &[(code, payload)], wall_ms())
+        })
+        .await?;
+        Ok(())
     }
 
     /// Ask the worker for the attempt. A status that is not about this
@@ -517,21 +639,30 @@ impl Coordinator {
                     .await?;
                 Ok(true)
             }
-            Err(LinkError::Remote(e)) => match policy::submit_refusal(e.code) {
-                Refusal::Fenced => Err(self.fence()),
-                Refusal::Later | Refusal::Tombstoned => {
-                    self.observe(&a.attempt_id, Observation::Known).await?;
-                    Ok(false)
+            Err(LinkError::Remote(e)) => {
+                let mismatch = e.conflict_reason == Some(ConflictReason::PayloadMismatch);
+                match policy::submit_refusal(e.code, mismatch) {
+                    Refusal::Fenced => Err(self.fence()),
+                    Refusal::Tombstoned => {
+                        self.observe(&a.attempt_id, Observation::Known).await?;
+                        Ok(false)
+                    }
+                    Refusal::Later => {
+                        self.note_refusal(&a.attempt_id, "submit_deferred", &e)
+                            .await?;
+                        self.observe(&a.attempt_id, Observation::Known).await?;
+                        Ok(false)
+                    }
+                    Refusal::Never => {
+                        self.note_refusal(&a.attempt_id, "submit_refused", &e)
+                            .await?;
+                        self.request_retire(&a.attempt_id, REASON_SUBMIT_REFUSED)
+                            .await?;
+                        self.observe(&a.attempt_id, Observation::Known).await?;
+                        Ok(false)
+                    }
                 }
-                Refusal::Never => {
-                    let payload = json!({"code": e.code.to_string(), "message": e.message});
-                    self.note(&a.attempt_id, "submit_refused", payload).await?;
-                    self.request_retire(&a.attempt_id, REASON_SUBMIT_REFUSED)
-                        .await?;
-                    self.observe(&a.attempt_id, Observation::Known).await?;
-                    Ok(false)
-                }
-            },
+            }
             // Sent or not, accepted or not: nothing is known.
             _ => {
                 self.unknown(&a.attempt_id, report).await?;
@@ -599,31 +730,54 @@ impl Coordinator {
             }
             _ => return self.unknown(&a.attempt_id, report).await,
         };
-        // How it ended there, when the worker says it had ended before.
-        let ended = if status == RetireStatus::AlreadyTerminal {
-            self.ask(link, a).await.1.filter(|s| s.retired)
+        // A worker that says the attempt is over is asked how it ended: the
+        // word of the answer alone never frees the task.
+        let (ended, seen) = if status == RetireStatus::Unconfirmed {
+            (Ended::Unknown, None)
         } else {
-            None
+            self.ended(link, a).await
         };
-        let outcome = ended
-            .as_ref()
-            .and_then(|s| s.termination)
-            .map(|t| t.outcome());
-        match (policy::retire_verdict(status, outcome), ended) {
+        match (policy::retire_verdict(status, ended), seen) {
             (RetireVerdict::Confirmed, _) => {
-                if live.retire_reason.as_deref() == Some(REASON_SUBMIT_REFUSED) {
-                    return self.settle_here(&a.attempt_id, failed(), report).await;
-                }
+                // What the confirmation means (free the task, or settle the
+                // attempt because the task was cancelled or refused) is read
+                // in the commit: a cancel may have come since `live` was read.
                 let id = a.attempt_id.clone();
-                self.db(move |s| s.confirm_retire(&id, wall_ms())).await?;
-                report.retired.push(a.attempt_id.clone());
+                let end = self
+                    .db(move |s| s.finish_retire(&id, REASON_SUBMIT_REFUSED, wall_ms()))
+                    .await?;
+                match end {
+                    RetireEnd::Freed => report.retired.push(a.attempt_id.clone()),
+                    RetireEnd::Settled(_) => report.settled.push(a.attempt_id.clone()),
+                }
                 Ok(())
             }
             (RetireVerdict::Adopt, Some(status)) => self.mirror(&status, report).await,
-            (RetireVerdict::Adopt, None) | (RetireVerdict::Wait, _) => {
+            (RetireVerdict::Wait, _) => {
                 self.observe(&a.attempt_id, Observation::Known).await?;
                 Ok(())
             }
+            (RetireVerdict::Unknown, _) | (RetireVerdict::Adopt, None) => {
+                self.unknown(&a.attempt_id, report).await
+            }
+        }
+    }
+
+    /// How a retired attempt stands on its worker now.
+    async fn ended(
+        &self,
+        link: &dyn WorkerLink,
+        a: &AttemptRecord,
+    ) -> (Ended, Option<AttemptStatus>) {
+        match self.ask(link, a).await {
+            (Answer::Tombstone, _) => (Ended::Never, None),
+            (Answer::Status(AttemptState::Terminal), Some(status)) if status.retired => {
+                match status.termination {
+                    Some(t) => (Ended::With(t.outcome()), Some(status)),
+                    None => (Ended::Unknown, None),
+                }
+            }
+            _ => (Ended::Unknown, None),
         }
     }
 
@@ -659,7 +813,18 @@ impl Coordinator {
     /// counts the worker's load again; the submit follows the commit, and a
     /// worker that does not take it is left alone for the rest of the tick.
     async fn dispatch(&self, reached: Vec<Reached>, report: &mut TickReport) -> Result<()> {
-        let mut open: Vec<Reached> = reached.into_iter().filter(|w| !w.draining).collect();
+        let deadline = self.deadline();
+        let mut open: Vec<Reached> = reached
+            .into_iter()
+            .filter(|w| !w.draining)
+            .map(|mut w| {
+                w.link = Arc::new(Budgeted {
+                    inner: w.link,
+                    deadline,
+                });
+                w
+            })
+            .collect();
         if open.is_empty() {
             return Ok(());
         }
@@ -690,17 +855,17 @@ impl Coordinator {
                         open.remove(0);
                     }
                     PlaceOutcome::NotQueued => break,
+                    PlaceOutcome::Unbuildable(why) => {
+                        // This task only; the ones behind it are placed.
+                        self.note_unplaceable(&task, why).await?;
+                        break;
+                    }
                     PlaceOutcome::Placed(_) => {
                         report.placed.push(attempt_id.clone());
-                        // Read back what was committed, and send that.
-                        let w = worker.worker_id.clone();
-                        let live = self.db(move |s| s.live_attempts(Some(&w))).await?;
-                        let placed = live.into_iter().find(|l| l.record.attempt_id == attempt_id);
-                        let took = match placed {
-                            Some(placed) => self.submit(&*worker.link, &placed, report).await?,
-                            None => false,
-                        };
-                        if !took {
+                        let sent = self
+                            .send_placed(&worker.worker_id, &*worker.link, &attempt_id, report)
+                            .await?;
+                        if sent == Sent::NotTaken {
                             // A worker that did not take this one gets no
                             // more in this tick: what is placed there cannot
                             // move until it answers.
@@ -716,6 +881,78 @@ impl Coordinator {
         }
         Ok(())
     }
+
+    /// Read back what the placement committed, and send that. A cancel or a
+    /// retire that was recorded since goes first: then nothing is sent, and
+    /// the next look at the attempt delivers it.
+    async fn send_placed(
+        &self,
+        worker_id: &WorkerId,
+        link: &dyn WorkerLink,
+        attempt_id: &AttemptId,
+        report: &mut TickReport,
+    ) -> Result<Sent> {
+        let w = worker_id.clone();
+        let live = self.db(move |s| s.live_attempts(Some(&w))).await?;
+        let Some(placed) = live
+            .into_iter()
+            .find(|l| &l.record.attempt_id == attempt_id)
+        else {
+            return Ok(Sent::NotTaken);
+        };
+        let facts = Facts {
+            acked: false,
+            cancel_requested: placed.record.cancel_requested_at_ms.is_some(),
+            retire_requested: placed.retire_reason.is_some(),
+        };
+        if !policy::may_send(facts) {
+            return Ok(Sent::Withheld);
+        }
+        if self.submit(link, &placed, report).await? {
+            Ok(Sent::Taken)
+        } else {
+            Ok(Sent::NotTaken)
+        }
+    }
+
+    /// A queued task no payload can be made for stays queued and is passed
+    /// over; why is recorded once (per process) on its run.
+    async fn note_unplaceable(&self, task: &QueuedTask, why: String) -> Result<()> {
+        let fresh = {
+            let mut seen = self.unplaceable.lock().unwrap_or_else(|e| e.into_inner());
+            seen.insert(task.task_id.clone())
+        };
+        if !fresh {
+            return Ok(());
+        }
+        let run = task.run_id.clone();
+        let payload = json!({"task": task.task_id.to_string(), "error": why});
+        self.db(move |s| s.append_event(Some(&run), None, "task_unplaceable", &payload, wall_ms()))
+            .await?;
+        Ok(())
+    }
+}
+
+/// Whether a payload can be made for a task as it is about to be queued: the
+/// construction every placement of it will use.
+fn check_spec(
+    run_id: &RunId,
+    source_id: &SourceId,
+    task_id: &TaskId,
+    spec: &Value,
+    lease_ms: u64,
+) -> Result<()> {
+    let input = PlaceInput {
+        run_id: run_id.clone(),
+        task_id: task_id.clone(),
+        generation: Generation(1),
+        source_id: Some(source_id.clone()),
+        spec: spec.clone(),
+    };
+    match demand_of(&input, lease_ms) {
+        Ok(_) => Ok(()),
+        Err(e) => Err(CoordinatorError::Invalid(format!("task {task_id}: {e}"))),
+    }
 }
 
 /// The payload hash and the demand recorded with a placement: the payload
@@ -728,7 +965,18 @@ fn demand_of(
         .map_err(|e| StorageError::Invalid(format!("task spec: {e}")))?;
     let payload = build_payload(input, &spec, lease_ms)?;
     let hash = payload_hash(&payload).map_err(|e| StorageError::Invalid(e.to_string()))?;
-    let payload =
+    let stored =
         serde_json::to_value(&payload).map_err(|e| StorageError::Invalid(e.to_string()))?;
-    Ok((hash, json!({ "payload": payload })))
+    // What is recorded is what will be read back and sent.
+    let back: AttemptPayload = serde_json::from_value(stored.clone())
+        .map_err(|e| StorageError::Invalid(format!("payload: {e}")))?;
+    if back != payload {
+        return Err(StorageError::Invalid(
+            "the payload does not read back as it was written".into(),
+        ));
+    }
+    Ok((hash, json!({ "payload": stored })))
 }
+
+#[cfg(test)]
+mod tests;

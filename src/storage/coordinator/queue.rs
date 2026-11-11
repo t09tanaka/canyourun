@@ -11,7 +11,7 @@ use super::{
     CoordinatorStore, Placement, ATTEMPT, ATTEMPT_COLS,
 };
 use crate::ids::{AttemptId, Generation, PayloadHash, RunId, SourceId, TaskId, WorkerId};
-use crate::state::{AttemptState, Observation, Receipt, Receipts, Termination};
+use crate::state::{AttemptState, Observation, Outcome, Receipt, Receipts, Termination};
 use crate::storage::common::{self, from_json, json};
 use crate::storage::policy::state_path;
 use crate::storage::{to_i64, to_u64, Result, StorageError};
@@ -23,6 +23,11 @@ pub const MAX_TASKS_PER_RUN: usize = 10_000;
 
 const QUEUED: &str = "t.cancel_requested_at_ms IS NULL
     AND EXISTS (SELECT 1 FROM run r WHERE r.run_id = t.run_id AND r.closed_at_ms IS NULL)
+    AND NOT EXISTS (SELECT 1 FROM attempt a WHERE a.task_id = t.task_id AND a.retired = 0)";
+
+/// [`QUEUED`] for a step-1 file, which has no cancel of a task.
+const QUEUED_V1: &str =
+    "EXISTS (SELECT 1 FROM run r WHERE r.run_id = t.run_id AND r.closed_at_ms IS NULL)
     AND NOT EXISTS (SELECT 1 FROM attempt a WHERE a.task_id = t.task_id AND a.retired = 0)";
 
 /// A task that may be placed now.
@@ -63,6 +68,19 @@ pub enum PlaceOutcome {
     NotQueued,
     /// The worker has no room; nothing was written.
     WorkerFull(WorkerLoad),
+    /// No payload can be made from what the task holds (the reason);
+    /// nothing was written.
+    Unbuildable(String),
+}
+
+/// What a confirmed retire did to its attempt.
+#[derive(Debug, Clone, PartialEq)]
+pub enum RetireEnd {
+    /// The attempt is retired and its task may be placed again.
+    Freed,
+    /// The task was not to run again: the attempt is terminal with the
+    /// result the parent fixed, and stays the task's last.
+    Settled(Box<AttemptRecord>),
 }
 
 /// An attempt that still needs the coordinator's attention, with the facts
@@ -82,6 +100,13 @@ pub struct Seen {
     pub state: AttemptState,
     pub termination: Option<Termination>,
     pub receipts: Receipts,
+}
+
+fn outcome_word(outcome: Outcome) -> &'static str {
+    match outcome {
+        Outcome::Cancelled => "cancelled",
+        _ => "failed",
+    }
 }
 
 fn load_of(conn: &Connection, worker: &str) -> Result<WorkerLoad> {
@@ -184,10 +209,11 @@ impl CoordinatorStore {
     /// The tasks that may be placed, oldest first (insertion order within
     /// the same millisecond).
     pub fn queued_tasks(&self, limit: u32) -> Result<Vec<QueuedTask>> {
+        let queued = if self.task_cancel { QUEUED } else { QUEUED_V1 };
         self.db.call(move |c| {
             let mut s = c.prepare(&format!(
                 "SELECT t.task_id, t.run_id, t.spec_json, t.created_at_ms FROM task t
-                 WHERE {QUEUED} ORDER BY t.created_at_ms, t.rowid LIMIT ?1"
+                 WHERE {queued} ORDER BY t.created_at_ms, t.rowid LIMIT ?1"
             ))?;
             let rows = s.query_map([limit], |r| {
                 Ok((
@@ -284,7 +310,12 @@ impl CoordinatorStore {
                     .transpose()?,
                 spec: from_json("task spec", &spec)?,
             };
-            let (hash, demand) = build(&input)?;
+            let (hash, demand) = match build(&input) {
+                Ok(built) => built,
+                // A verdict on this task only; a fault still fails the call.
+                Err(StorageError::Invalid(why)) => return Ok(PlaceOutcome::Unbuildable(why)),
+                Err(e) => return Err(e),
+            };
             let mut receipts = Receipts::default();
             receipts.mark(Receipt::CoordinatorAccepted, at_ms);
             tx.execute(
@@ -475,12 +506,102 @@ impl CoordinatorStore {
         })
     }
 
+    /// The retire of an attempt was confirmed by its worker (it never
+    /// started there, or it stopped without completing). One commit decides
+    /// what that means from what is recorded now, not from what the caller
+    /// read before it asked the worker:
+    ///
+    /// * the task was cancelled: the attempt is settled `cancelled`;
+    /// * the retire was asked for with `failed_reason` (the worker will
+    ///   never take the attempt): it is settled `failed`;
+    /// * otherwise the attempt is retired and the task is free again.
+    ///
+    /// A settled attempt keeps `retired = 0`, so its task is not placed
+    /// again; the tombstone is confirmed in every case.
+    pub fn finish_retire(
+        &self,
+        attempt_id: &AttemptId,
+        failed_reason: &str,
+        at_ms: u64,
+    ) -> Result<RetireEnd> {
+        let (aid, failed_reason) = (attempt_id.to_string(), failed_reason.to_string());
+        self.db.write(move |tx| {
+            let reason: String = tx
+                .query_row(
+                    "SELECT reason FROM retire_tombstone WHERE attempt_id = ?1",
+                    [&aid],
+                    |r| r.get(0),
+                )
+                .optional()?
+                .ok_or_else(|| not_found(format!("retire tombstone for {aid}")))?;
+            let cancelled: bool = tx.query_row(
+                "SELECT a.cancel_requested_at_ms IS NOT NULL OR t.cancel_requested_at_ms IS NOT NULL
+                 FROM attempt a JOIN task t USING (task_id) WHERE a.attempt_id = ?1",
+                [&aid],
+                |r| r.get(0),
+            )?;
+            let outcome = if cancelled {
+                Outcome::Cancelled
+            } else if reason == failed_reason {
+                Outcome::Failed
+            } else {
+                super::free_by_retire(tx, &aid, at_ms)?;
+                return Ok(RetireEnd::Freed);
+            };
+            let before =
+                load_attempt(tx, &aid)?.ok_or_else(|| not_found(format!("attempt {aid}")))?;
+            if before.state == AttemptState::Terminal || before.retired {
+                return Err(StorageError::IllegalState {
+                    attempt: aid,
+                    state: before.state,
+                    why: "its retire was already concluded",
+                });
+            }
+            super::confirm_tombstone(tx, &aid, at_ms)?;
+            let run = run_of(tx, &aid)?;
+            let termination = Termination::new(outcome, None, None)
+                .map_err(|e| StorageError::Invalid(e.to_string()))?;
+            for step in state_path(before.state, AttemptState::Terminal).unwrap_or_default() {
+                if step == AttemptState::Terminal {
+                    common::finalize(tx, ATTEMPT, &aid, termination, at_ms, run.as_deref())?;
+                } else {
+                    common::transition(tx, ATTEMPT, &aid, step, at_ms, run.as_deref())?;
+                }
+            }
+            tx.execute(
+                "UPDATE placement SET acked_at_ms = COALESCE(acked_at_ms, ?1)
+                 WHERE attempt_id = ?2",
+                params![to_i64(at_ms)?, aid],
+            )?;
+            tx.execute(
+                "UPDATE attempt SET observation = 'known' WHERE attempt_id = ?1",
+                [&aid],
+            )?;
+            common::append_event(
+                tx,
+                run.as_deref(),
+                Some(&aid),
+                "retire_confirmed",
+                &serde_json::json!({"settled": outcome_word(outcome)}),
+                at_ms,
+            )?;
+            let rec = load_attempt(tx, &aid)?.ok_or_else(|| not_found(format!("attempt {aid}")))?;
+            Ok(RetireEnd::Settled(Box::new(rec)))
+        })
+    }
+
     /// When the cancel of a task was requested, if it was.
     pub fn task_cancel_requested(&self, task_id: &TaskId) -> Result<Option<u64>> {
         let task = task_id.to_string();
+        // A step-1 file has no such request.
+        let column = if self.task_cancel {
+            "cancel_requested_at_ms"
+        } else {
+            "NULL"
+        };
         self.db.call(move |c| {
             c.query_row(
-                "SELECT cancel_requested_at_ms FROM task WHERE task_id = ?1",
+                &format!("SELECT {column} FROM task WHERE task_id = ?1"),
                 [&task],
                 |r| r.get::<_, Option<i64>>(0),
             )

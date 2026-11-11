@@ -129,7 +129,8 @@ fn cancel_delivered(state: AttemptState) -> bool {
 /// What a submit that was answered with an error means.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Refusal {
-    /// Nothing was stored; the same attempt is sent again later.
+    /// Not taken now, and nothing says it never will be: the same attempt is
+    /// sent to the same worker again later.
     Later,
     /// A tombstone answered: the next look at the attempt settles it.
     Tombstoned,
@@ -140,13 +141,33 @@ pub enum Refusal {
     Never,
 }
 
-pub fn submit_refusal(code: ErrorCode) -> Refusal {
+/// Read the error a worker answered a submit with.
+///
+/// Only an answer that is about the attempt itself is final: its input is
+/// invalid, or the worker holds the same attempt with another payload
+/// (`payload_mismatch` says so by its typed reason). Every other code, a
+/// fault of the worker, a conflict with something else it holds, a code
+/// this version does not know, is no verdict on the attempt and never fails
+/// the task.
+pub fn submit_refusal(code: ErrorCode, payload_mismatch: bool) -> Refusal {
     match code {
-        ErrorCode::Overloaded => Refusal::Later,
         ErrorCode::Retired => Refusal::Tombstoned,
         ErrorCode::StaleEpoch => Refusal::Fenced,
-        _ => Refusal::Never,
+        ErrorCode::InvalidInput => Refusal::Never,
+        ErrorCode::Conflict if payload_mismatch => Refusal::Never,
+        _ => Refusal::Later,
     }
+}
+
+/// How the attempt stands on its worker after a retire was answered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Ended {
+    /// The worker holds only the tombstone: the attempt never arrived.
+    Never,
+    /// The attempt is terminal there, with this outcome.
+    With(Outcome),
+    /// No answer, or one that says neither of the above.
+    Unknown,
 }
 
 /// What the answer to a retire means for the parent.
@@ -155,32 +176,37 @@ pub enum RetireVerdict {
     /// Never started, or stopped without completing: the retire is
     /// confirmed and the task may be placed again.
     Confirmed,
-    /// The attempt had ended on its own before the retire: its result
-    /// stands and the task is not placed again.
+    /// The command ran to an end of its own, before the retire or while it
+    /// was carried out: its result stands and the task is not placed again.
     Adopt,
-    /// Not confirmed. The attempt keeps its task and its slot.
+    /// The worker has not stopped it yet. The attempt keeps its task and
+    /// its slot.
     Wait,
+    /// The worker says it is over, and how it ended is not known: the
+    /// attempt is kept as `unknown`.
+    Unknown,
 }
 
-/// `ended` is the outcome the worker reports for the attempt after the
-/// retire, when it is terminal there.
-///
-/// An attempt that was already terminal is told apart by its outcome, not
-/// by which answer said so: a retire whose first answer was lost is answered
-/// `already_terminal` the second time, and must free the task exactly as the
-/// first answer (`stopped`) would have.
-pub fn retire_verdict(status: RetireStatus, ended: Option<Outcome>) -> RetireVerdict {
+/// The attempt is judged by how it ended, not by which word the retire was
+/// answered with. The command may end on its own between the worker's look
+/// and its stop (answered `stopped`), and a retire whose first answer was
+/// lost is answered `already_terminal` the second time: all of these must
+/// come to the conclusion the outcome gives.
+pub fn retire_verdict(status: RetireStatus, ended: Ended) -> RetireVerdict {
     match (status, ended) {
-        (RetireStatus::NotStarted | RetireStatus::Stopped, _) => RetireVerdict::Confirmed,
-        (RetireStatus::Unconfirmed, _) | (RetireStatus::AlreadyTerminal, None) => {
-            RetireVerdict::Wait
-        }
-        (RetireStatus::AlreadyTerminal, Some(outcome)) => {
+        (RetireStatus::Unconfirmed, _) => RetireVerdict::Wait,
+        (_, Ended::Unknown) => RetireVerdict::Unknown,
+        (_, Ended::With(outcome)) => {
             if ended_on_its_own(outcome) {
                 RetireVerdict::Adopt
             } else {
                 RetireVerdict::Confirmed
             }
+        }
+        (RetireStatus::NotStarted, Ended::Never) => RetireVerdict::Confirmed,
+        // Stopped or ended, and yet not there: the two answers contradict.
+        (RetireStatus::Stopped | RetireStatus::AlreadyTerminal, Ended::Never) => {
+            RetireVerdict::Unknown
         }
     }
 }
@@ -192,6 +218,13 @@ pub fn ended_on_its_own(outcome: Outcome) -> bool {
         outcome,
         Outcome::Succeeded | Outcome::Failed | Outcome::TimedOut
     )
+}
+
+/// Whether an attempt that was just placed may be sent: not when a cancel or
+/// a retire for it was recorded in the meantime (those are delivered first,
+/// by the next look at it).
+pub fn may_send(facts: Facts) -> bool {
+    !facts.cancel_requested && !facts.retire_requested
 }
 
 #[cfg(test)]
@@ -343,52 +376,88 @@ mod tests {
     }
 
     #[test]
-    fn a_refused_submit_is_read_by_its_code() {
+    fn only_an_answer_about_the_attempt_itself_refuses_a_submit_for_good() {
         for code in ErrorCode::ALL {
-            let want = match code {
-                ErrorCode::Overloaded => Refusal::Later,
-                ErrorCode::Retired => Refusal::Tombstoned,
-                ErrorCode::StaleEpoch => Refusal::Fenced,
-                _ => Refusal::Never,
-            };
-            assert_eq!(submit_refusal(code), want, "{code:?}");
+            for mismatch in [false, true] {
+                let want = match (code, mismatch) {
+                    (ErrorCode::Retired, _) => Refusal::Tombstoned,
+                    (ErrorCode::StaleEpoch, _) => Refusal::Fenced,
+                    (ErrorCode::InvalidInput, _) => Refusal::Never,
+                    (ErrorCode::Conflict, true) => Refusal::Never,
+                    _ => Refusal::Later,
+                };
+                assert_eq!(submit_refusal(code, mismatch), want, "{code:?} {mismatch}");
+            }
         }
-        assert_eq!(submit_refusal(ErrorCode::InvalidInput), Refusal::Never);
-        assert_eq!(submit_refusal(ErrorCode::Conflict), Refusal::Never);
+        // A fault of the worker, or a conflict with something else it holds
+        // (also one whose reason an older or newer peer did not name), is
+        // not a verdict on the attempt.
+        for code in [
+            ErrorCode::Internal,
+            ErrorCode::CommunicationUnknown,
+            ErrorCode::Blocked,
+            ErrorCode::NotImplemented,
+            ErrorCode::ProtocolIncompatible,
+            ErrorCode::NotFound,
+            ErrorCode::Overloaded,
+            ErrorCode::Conflict,
+        ] {
+            assert_eq!(submit_refusal(code, false), Refusal::Later, "{code:?}");
+        }
+        assert_eq!(submit_refusal(ErrorCode::Conflict, true), Refusal::Never);
+        assert_eq!(submit_refusal(ErrorCode::Internal, true), Refusal::Later);
     }
 
     #[test]
-    fn a_retire_is_confirmed_by_a_stop_and_not_by_an_end_of_its_own() {
+    fn a_retire_is_judged_by_how_the_attempt_ended_whatever_the_answer_was() {
         use Outcome::*;
         use RetireStatus::*;
-        use RetireVerdict::*;
-        let outcomes = [
-            None,
-            Some(Succeeded),
-            Some(Failed),
-            Some(Cancelled),
-            Some(TimedOut),
-            Some(Interrupted),
-        ];
-        for ended in outcomes {
-            assert_eq!(retire_verdict(NotStarted, ended), Confirmed);
-            assert_eq!(retire_verdict(Stopped, ended), Confirmed);
-            assert_eq!(retire_verdict(Unconfirmed, ended), Wait);
+        use RetireVerdict::{Adopt, Confirmed, Wait};
+        let all = [Succeeded, Failed, Cancelled, TimedOut, Interrupted];
+        // Not stopped yet: nothing else matters.
+        assert_eq!(retire_verdict(Unconfirmed, Ended::Never), Wait);
+        assert_eq!(retire_verdict(Unconfirmed, Ended::Unknown), Wait);
+        for o in all {
+            assert_eq!(retire_verdict(Unconfirmed, Ended::With(o)), Wait);
         }
-        assert_eq!(retire_verdict(AlreadyTerminal, None), Wait);
-        assert_eq!(retire_verdict(AlreadyTerminal, Some(Succeeded)), Adopt);
-        assert_eq!(retire_verdict(AlreadyTerminal, Some(Failed)), Adopt);
-        assert_eq!(retire_verdict(AlreadyTerminal, Some(TimedOut)), Adopt);
-        // What a lost first answer (`stopped`) looks like the second time.
-        assert_eq!(retire_verdict(AlreadyTerminal, Some(Cancelled)), Confirmed);
+        for status in [NotStarted, Stopped, AlreadyTerminal] {
+            // How it ended is not known: never a reason to place it again.
+            assert_eq!(
+                retire_verdict(status, Ended::Unknown),
+                RetireVerdict::Unknown
+            );
+            // The same conclusion for every word, also for `stopped` when
+            // the command ended on its own while it was being stopped.
+            assert_eq!(retire_verdict(status, Ended::With(Succeeded)), Adopt);
+            assert_eq!(retire_verdict(status, Ended::With(Failed)), Adopt);
+            assert_eq!(retire_verdict(status, Ended::With(TimedOut)), Adopt);
+            assert_eq!(retire_verdict(status, Ended::With(Cancelled)), Confirmed);
+            assert_eq!(retire_verdict(status, Ended::With(Interrupted)), Confirmed);
+        }
+        // Only a tombstone: it never arrived. Any other word contradicts.
+        assert_eq!(retire_verdict(NotStarted, Ended::Never), Confirmed);
         assert_eq!(
-            retire_verdict(AlreadyTerminal, Some(Interrupted)),
-            Confirmed
+            retire_verdict(Stopped, Ended::Never),
+            RetireVerdict::Unknown
+        );
+        assert_eq!(
+            retire_verdict(AlreadyTerminal, Ended::Never),
+            RetireVerdict::Unknown
         );
         assert!(ended_on_its_own(Succeeded));
         assert!(ended_on_its_own(Failed));
         assert!(ended_on_its_own(TimedOut));
         assert!(!ended_on_its_own(Cancelled));
         assert!(!ended_on_its_own(Interrupted));
+    }
+
+    #[test]
+    fn a_placed_attempt_is_sent_only_without_a_cancel_or_a_retire() {
+        for acked in [false, true] {
+            assert!(may_send(facts(acked, false, false)));
+            assert!(!may_send(facts(acked, true, false)));
+            assert!(!may_send(facts(acked, false, true)));
+            assert!(!may_send(facts(acked, true, true)));
+        }
     }
 }
