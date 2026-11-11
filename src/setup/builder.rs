@@ -979,11 +979,13 @@ fn name_of(ent: &std::fs::DirEntry) -> Result<String, Unkept> {
 /// With `known` (the workspace as it was), a directory that was not there is
 /// listed without what is in it: it is new as a whole.
 ///
-/// A `.git` *directory* at the root is not looked into: only a user's own
-/// worktree has one, and no builder works in that. In a workspace the runner
-/// made, `.git` is a file that names a repository elsewhere; it is an entry
-/// like any other, and what a step does to the repository itself is outside
-/// the workspace, like everything else it does outside.
+/// A `.git` *directory* at the root is listed but not looked into: one that
+/// a step made (`git init`) is new, and is a reason not to keep a template;
+/// one that was there is a user's own worktree, where no builder works. In
+/// a workspace the runner made, `.git` is a file that names a repository
+/// elsewhere; it is an entry like any other, and what a step does to the
+/// repository itself is outside the workspace, like everything else it
+/// does outside.
 fn snapshot(
     root: &Path,
     known: Option<&BTreeMap<String, Sig>>,
@@ -1007,10 +1009,7 @@ fn snapshot(
             };
             let ty = ent.file_type().map_err(unreadable)?;
             let sig = if ty.is_dir() {
-                if rel == ".git" {
-                    continue;
-                }
-                if known.is_none_or(|k| k.get(&rel) == Some(&Sig::Dir)) {
+                if rel != ".git" && known.is_none_or(|k| k.get(&rel) == Some(&Sig::Dir)) {
                     todo.push((rel.clone(), depth + 1));
                 }
                 Sig::Dir

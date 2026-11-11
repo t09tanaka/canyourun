@@ -1019,6 +1019,8 @@ fn a_submodule_link_or_a_link_out_of_the_workspace_keeps_no_template() {
             "mkdir -p sub && echo 'gitdir: ../.git/modules/sub' > sub/.git && echo c > sub/code",
             "Git's own state",
         ),
+        // a repository made in a workspace that had none
+        ("mkdir .git && echo ref > .git/HEAD", "Git's own state"),
         (
             "mkdir node_modules && ln -s /etc/hosts node_modules/hosts",
             "leads out of the workspace",
@@ -1045,6 +1047,7 @@ fn a_submodule_link_or_a_link_out_of_the_workspace_keeps_no_template() {
         );
         assert!(f.template_dirs().is_empty());
         assert!(!wa.root.join("sub").exists() && !wa.root.join("node_modules").exists());
+        assert!(!wa.root.join(".git").exists());
         // the next consumer is told at once: no second builder
         let (b, wb) = f.consumer();
         let (skip, again) = f.done(&b, &p, &wb);
