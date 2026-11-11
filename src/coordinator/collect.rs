@@ -22,7 +22,9 @@ impl Coordinator {
     /// One pass of result collection: continue the collection of every
     /// ended attempt, on every worker, from what is durable. A worker that
     /// is not attached or does not answer is not an error; its attempts
-    /// stay `collecting` and nothing is run again.
+    /// stay `collecting` and nothing is run again. `files` is the one
+    /// result store of this process, the same for every pass (see
+    /// [`ResultStore::open`]).
     pub async fn collect(
         &self,
         files: &Arc<ResultStore>,

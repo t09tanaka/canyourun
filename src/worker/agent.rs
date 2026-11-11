@@ -745,7 +745,9 @@ impl Agent {
             }
             // The lock tells whether any supervisor (ours or an adopted one)
             // lives. Only this thread starts supervisors for the attempt, so
-            // taking it for a moment cannot make a new one give up.
+            // taking it for a moment cannot make a new one give up. (The
+            // acknowledgement of an attempt that ended without a result
+            // takes it too, for an attempt that is terminal already.)
             match SupervisorLock::try_acquire(&self.cfg.state_dir, attempt) {
                 Ok(Some(lock)) => drop(lock),
                 Ok(None) | Err(_) => {

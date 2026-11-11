@@ -233,7 +233,13 @@ fn hex(digest: &Digest) -> &str {
 }
 
 impl ResultStore {
-    /// Open (and make) the store at `root`.
+    /// Open (and make) the store at `root`. One instance (and its clones)
+    /// is to serve a parent process for as long as it lives: which `.part`
+    /// files this process began itself is remembered in it, and bytes
+    /// without their digest count against the worker only then
+    /// ([`Publish::Mismatch`]). A store that is opened anew for every pass
+    /// never holds a mismatch of a transfer that spans passes against the
+    /// worker.
     pub fn open(root: &Path) -> Result<ResultStore> {
         dir_all(root)?;
         Ok(ResultStore {

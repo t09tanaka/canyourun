@@ -2,9 +2,11 @@
 //! (spec chapter 13): the result it read and its digest, how far the logs
 //! and artifacts are, and how the collection was closed.
 //!
-//! One row of `collection` per attempt. It is closed exactly once: after the
-//! worker acknowledged `ack_collected` for the recorded digest, when there
-//! is nothing to ask a worker for, or when the collection was given up.
+//! One row of `collection` per attempt. It is closed after the worker
+//! acknowledged `ack_collected` for the recorded digest, when there is
+//! nothing to ask a worker for, or when the collection was given up. Only a
+//! collection that was given up is ever opened again
+//! ([`CoordinatorStore::reopen_collection`]).
 //! The `collected` receipt of the attempt is set in the commit that closes
 //! a complete collection, never before.
 

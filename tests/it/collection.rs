@@ -1688,3 +1688,52 @@ async fn names_that_are_one_path_on_the_parent_are_each_collected() {
     assert!(!files.root().join(a.as_str()).exists());
     assert!(c.store().pending_deletes().unwrap().is_empty());
 }
+
+#[tokio::test]
+async fn a_worker_that_no_longer_has_the_blob_ends_the_collection_after_three_answers() {
+    let fx = fx();
+    let (c, files) = fx.open();
+    let (_, _, a) = placed(&fx, &c, two()).await;
+    end(&fx, &c, &a, Outcome::Succeeded, full(&fx, &a)).await;
+    // Asking again does not bring back what the worker deleted.
+    fx.w.set(|s| s.fail = Some(("blob", ErrorCode::NotFound, 3)));
+    assert_eq!(collect(&c, &files).await.pending, vec![a.clone()]);
+    assert_eq!(collect(&c, &files).await.pending, vec![a.clone()]);
+    assert_eq!(collect(&c, &files).await.gave_up, vec![a.clone()]);
+    let row = c.store().collection(&a).unwrap().unwrap();
+    assert_eq!((row.verdict, row.strikes), (Some(Verdict::GaveUp), 3));
+    assert!(fx.w.acks(&a).is_empty());
+    assert!(persisted(&c, &a).is_empty());
+    assert_eq!(fx.w.count("blob"), 3);
+}
+
+#[tokio::test]
+async fn a_name_that_is_published_is_not_fetched_over_with_other_bytes() {
+    let fx = fx();
+    let (c, files) = fx.open();
+    let (_, _, a) = placed(&fx, &c, two()).await;
+    end(&fx, &c, &a, Outcome::Succeeded, full(&fx, &a)).await;
+    fx.w.set(|s| s.trip = Some(("ack", 1, Lost::Request)));
+    assert_eq!(collect(&c, &files).await.pending, vec![a.clone()]);
+    // The receipt says `alpha.txt` was published with another digest than
+    // the result records: an artifact never changes, so this is no reason
+    // to fetch, and no state to acknowledge.
+    let other = Digest::of_bytes(b"other");
+    sql(
+        &fx,
+        &format!(
+            "UPDATE artifact_receipt SET digest = '{}' WHERE attempt_id = '{a}' AND name = 'alpha.txt'",
+            other.as_str()
+        ),
+    );
+    fx.w.set(|s| s.offline = false);
+    let blobs = fx.w.count("blob");
+    assert_eq!(collect(&c, &files).await.pending, vec![a.clone()]);
+    assert_eq!(strikes(&c, &a), 1);
+    assert_eq!(collect(&c, &files).await.pending, vec![a.clone()]);
+    assert_eq!(collect(&c, &files).await.gave_up, vec![a.clone()]);
+    assert_eq!(fx.w.count("blob"), blobs);
+    assert!(fx.w.acks(&a).is_empty());
+    assert_eq!(published(&files, &a, "alpha.txt").as_deref(), Some(ALPHA));
+    assert!(!files.artifact_path(&a, &other).exists());
+}
