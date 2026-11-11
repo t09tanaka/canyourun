@@ -470,6 +470,7 @@ fn spec(artifacts: Vec<ArtifactDecl>) -> TaskSpec {
         plan_digest: Digest::of_bytes(b"plan"),
         manifest_digest: Digest::of_bytes(b"manifest"),
         commands: vec![CommandSpec {
+            setup_step: None,
             node_id: NodeId::parse("main").unwrap(),
             argv: vec!["/bin/true".into()],
             cwd: String::new(),
