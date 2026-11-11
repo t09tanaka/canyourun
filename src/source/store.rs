@@ -79,9 +79,10 @@ fn is_hex40(s: &str) -> bool {
 }
 
 /// The Git repository on the receiving side that holds the objects of the
-/// sources it received: the worker's canonical clone of the repository. It has
-/// to have the merge base already (a bundle never carries it; nothing is
-/// fetched from the network).
+/// sources it received: the worker's canonical clone of the repository.
+/// Nothing is fetched from the network: a bundle brings the history the
+/// clone lacks, and what it is built on has to be in the clone already (the
+/// first one is built on nothing).
 #[derive(Debug, Clone)]
 pub struct ObjectsRepo {
     env: BTreeMap<String, String>,

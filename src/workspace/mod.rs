@@ -114,8 +114,9 @@ impl Workspaces {
     }
 
     /// The canonical clone of `repository_id`, made when it is not there yet:
-    /// cloned from `seed` (a path or URL of the repository; the merge base of
-    /// later bundles has to be in it), or empty. An existing clone must have
+    /// empty (what a worker does: its clone has no `origin`, and bundles bring
+    /// all it holds), or cloned from `seed` (a path or URL of the
+    /// repository). An existing clone must have
     /// been made from the same `seed` (`Conflict` otherwise: its objects and
     /// its `origin` would be another repository's). Safe to call from several
     /// threads and processes at once.

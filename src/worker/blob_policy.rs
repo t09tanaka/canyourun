@@ -345,44 +345,46 @@ pub fn check_reservation(
     }
 }
 
-fn is_hex40(s: &str) -> bool {
-    s.len() == 40 && s.bytes().all(|c| matches!(c, b'0'..=b'9' | b'a'..=b'f'))
+fn is_hex40(s: &[u8]) -> bool {
+    s.len() == 40 && s.iter().all(|c| matches!(c, b'0'..=b'9' | b'a'..=b'f'))
 }
 
 /// The commits a Git bundle needs its receiver to hold already, read from
 /// the first bytes of the file (`head`: at most [`MAX_BUNDLE_HEADER`] of
 /// them). An error is about the file: it is not a bundle this worker takes.
+/// The header is read as bytes: a prerequisite line ends with the subject of
+/// its commit, which is in whatever encoding the commit was written.
 pub fn bundle_prerequisites(head: &[u8]) -> Result<Vec<String>, &'static str> {
     let end = head
         .windows(2)
         .position(|w| w == b"\n\n")
         .ok_or("the bundle has no header")?;
-    let text = std::str::from_utf8(&head[..end]).map_err(|_| "the bundle has no header")?;
-    let mut lines = text.split('\n');
+    let mut lines = head[..end].split(|c| *c == b'\n');
     let v3 = match lines.next() {
-        Some("# v2 git bundle") => false,
-        Some("# v3 git bundle") => true,
+        Some(b"# v2 git bundle") => false,
+        Some(b"# v3 git bundle") => true,
         _ => return Err("the file is not a Git bundle"),
     };
     let mut out = vec![];
     for line in lines {
-        if let Some(rest) = line.strip_prefix('-') {
-            let id = rest.split(' ').next().unwrap_or(rest);
+        // `<id>`, or `<id> <the rest>`
+        let (id, rest) = match line.iter().position(|c| *c == b' ') {
+            Some(at) => (&line[..at], Some(&line[at + 1..])),
+            None => (line, None),
+        };
+        if let Some(id) = id.strip_prefix(b"-") {
             if !is_hex40(id) {
                 return Err("the bundle names a prerequisite that is not a commit id");
             }
             if out.len() == MAX_PREREQUISITES {
                 return Err("the bundle has too many prerequisites");
             }
-            out.push(id.to_string());
-        } else if v3 && line.starts_with('@') {
-            if line != "@object-format=sha1" {
+            out.push(String::from_utf8_lossy(id).into_owned());
+        } else if v3 && line.starts_with(b"@") {
+            if line != b"@object-format=sha1" {
                 return Err("the bundle needs something this worker does not do");
             }
-        } else if !line
-            .split_once(' ')
-            .is_some_and(|(id, name)| is_hex40(id) && !name.is_empty())
-        {
+        } else if !(is_hex40(id) && rest.is_some_and(|name| !name.is_empty())) {
             return Err("the bundle has a header line that is not a ref");
         }
     }
@@ -864,8 +866,13 @@ mod tests {
         assert_eq!(bundle_prerequisites(b""), Err("the bundle has no header"));
         assert_eq!(
             bundle_prerequisites(b"# v2 git bundle\n\xff\n\n"),
-            Err("the bundle has no header")
+            Err("the bundle has a header line that is not a ref")
         );
+        // the subject of a prerequisite is bytes in any encoding
+        let mut latin = format!("# v2 git bundle\n-{A} caf").into_bytes();
+        latin.extend(b"\xe9 au lait\n");
+        latin.extend(format!("{B} refs/x\n\nPACK").as_bytes());
+        assert_eq!(bundle_prerequisites(&latin), Ok(vec![A.to_string()]));
         assert_eq!(
             ok("# v4 git bundle\n\n".to_string()),
             Err("the file is not a Git bundle")
