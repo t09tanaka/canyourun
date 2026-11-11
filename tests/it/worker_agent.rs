@@ -57,6 +57,10 @@ struct DirHost {
     secret_paths: Mutex<Option<Vec<String>>>,
     /// The source is here and its secret files cannot be told.
     secret_paths_error: Mutex<Option<ApiError>>,
+    /// `setup_poll` answers `Pending` while this is set; then it is done,
+    /// with the setup steps of `setup_skip` in the workspace.
+    setup_pending: AtomicBool,
+    setup_skip: Mutex<std::collections::BTreeSet<String>>,
 }
 
 type MaskHook = Box<dyn Fn(&AttemptId) + Send + Sync>;
@@ -120,6 +124,25 @@ impl Host for DirHost {
             index_reproduced: true,
             warnings: Vec::new(),
         })
+    }
+    fn setup_poll(
+        &self,
+        a: &AcceptedAttempt,
+        _: &AttemptPayload,
+        _: &Workspace,
+    ) -> Result<remote_task_runner::setup::builder::SetupPoll, ApiError> {
+        use remote_task_runner::setup::builder::SetupPoll;
+        self.log(format!("setup_poll {}", a.attempt_id));
+        if self.setup_pending.load(Ordering::SeqCst) {
+            return Ok(SetupPoll::Pending);
+        }
+        Ok(SetupPoll::Done {
+            skip: self.setup_skip.lock().unwrap().clone(),
+            note: Some("a note".into()),
+        })
+    }
+    fn setup_release(&self, a: &AttemptId) {
+        self.log(format!("setup_release {a}"));
     }
     fn secret_paths(&self, _: &AttemptPayload) -> Result<Option<Vec<String>>, ApiError> {
         if let Some(e) = self.secret_paths_error.lock().unwrap().clone() {
@@ -220,6 +243,8 @@ pub(crate) fn fx() -> Fx {
         on_mask: Mutex::default(),
         secret_paths: Mutex::new(Some(Vec::new())),
         secret_paths_error: Mutex::new(None),
+        setup_pending: AtomicBool::new(false),
+        setup_skip: Mutex::default(),
     });
     Fx {
         dir,
@@ -3282,4 +3307,105 @@ async fn the_real_host_knows_a_worktreeinclude_file_and_a_placed_secret_under_an
         ]
     );
     refused_as_link_and_copy(&f, &b);
+}
+
+// ---------------------------------------------------------------- setup
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_commands_of_a_prepared_setup_are_left_out_and_the_others_run() {
+    let f = fx();
+    let agent = f.start("boot-a");
+    let c = f.connect(&agent).await;
+    f.host.setup_pending.store(true, Ordering::SeqCst);
+    *f.host.setup_skip.lock().unwrap() = ["s1".to_string()].into();
+    let order = f.path("order");
+    let say = |name: &str| format!("echo {name} >> {}", order.display());
+    let step = |c: CommandSpec, id: &str| CommandSpec {
+        setup_step: Some(id.into()),
+        ..c
+    };
+    let mut p = payload("true");
+    p.commands = vec![
+        step(command("install", &say("install"), &[]), "s1"),
+        // a step the template does not hold stays
+        step(command("tools", &say("tools"), &["install"]), "s2"),
+        command("test", &say("test"), &["install", "tools"]),
+    ];
+    let a = AttemptId::generate();
+    submit(&c, &a, &p).await;
+    // while the builder works the attempt waits and nothing starts
+    wait_for("the setup to be asked about", || {
+        f.host.count(&format!("setup_poll {a}")) >= 3
+    });
+    assert_eq!(f.rec(&a).state, AttemptState::Preparing);
+    assert!(!order.exists());
+    f.host.setup_pending.store(false, Ordering::SeqCst);
+    assert_eq!(f.wait_terminal(&a), Outcome::Succeeded);
+    // `install` is in the workspace already: it does not run, and nothing
+    // waits for it
+    assert_eq!(std::fs::read_to_string(&order).unwrap(), "tools\ntest\n");
+    let launched: Vec<String> = f
+        .store()
+        .launches(&a)
+        .unwrap()
+        .into_iter()
+        .map(|l| l.0.to_string())
+        .collect();
+    assert_eq!(launched, ["tools", "test"]);
+    // what the host said about a template it could not have is in the journal
+    let events = f.store().events_of(&a, "agent_setup_unavailable").unwrap();
+    assert_eq!(events.len(), 1);
+    assert!(events[0].payload.to_string().contains("a note"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_attempt_cancelled_while_it_waits_for_its_setup_lets_go_of_the_builder() {
+    let f = fx();
+    let agent = f.start("boot-a");
+    let c = f.connect(&agent).await;
+    f.host.setup_pending.store(true, Ordering::SeqCst);
+    let marker = f.path("starts");
+    let p = payload(&format!("echo start >> {}", marker.display()));
+    let a = AttemptId::generate();
+    submit(&c, &a, &p).await;
+    wait_for("the setup to be asked about", || {
+        f.host.count(&format!("setup_poll {a}")) >= 2
+    });
+    let Response::CancelAttempt(_) = call(&c, cancel_req(&a)).await.unwrap() else {
+        panic!()
+    };
+    assert_eq!(f.wait_terminal(&a), Outcome::Cancelled);
+    assert!(f.host.count(&format!("setup_release {a}")) >= 1);
+    assert_eq!(lines(&marker), 0);
+    assert!(f.store().launches(&a).unwrap().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_attempt_that_waited_too_long_for_its_setup_runs_every_command_itself() {
+    let f = fx();
+    let mut cfg = f.cfg("boot-a");
+    cfg.prepare_timeout_ms = 300;
+    let agent = f.start_with(cfg);
+    let c = f.connect(&agent).await;
+    f.host.setup_pending.store(true, Ordering::SeqCst);
+    *f.host.setup_skip.lock().unwrap() = ["s1".to_string()].into();
+    let marker = f.path("starts");
+    let mut p = payload("true");
+    let mut only = command(
+        "install",
+        &format!("echo start >> {}", marker.display()),
+        &[],
+    );
+    only.setup_step = Some("s1".into());
+    p.commands = vec![only];
+    let a = AttemptId::generate();
+    submit(&c, &a, &p).await;
+    assert_eq!(f.wait_terminal(&a), Outcome::Succeeded);
+    assert_eq!(lines(&marker), 1);
+    assert!(f.host.count(&format!("setup_release {a}")) >= 1);
+    let events = f.store().events_of(&a, "agent_setup_unavailable").unwrap();
+    assert!(events[0]
+        .payload
+        .to_string()
+        .contains("not ready within 300"));
 }

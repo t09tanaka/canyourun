@@ -339,6 +339,15 @@ template keyには、source digest、順序付きsetup recipe、working director
 
 完成templateはimmutableとし、Unitごとにcopyまたはwrite-isolatedなcloneを作る。書込み可能なhardlinkの共有は禁止する。新しいrequirementsを既存templateへ追加実行して上書きせず、別keyで構築する。forecastでは共有builderの負荷を1回だけ数え、各Unitの依存として参照する。
 
+workerでのtemplateとbuilderの実装は次のとおりとする。
+- **templateの中身**: workspace全体ではなく、setup stepが追加したentry（各stepのdir直下で、実行前に無かったもの。`.git` は除く）だけを、receiptに相対pathとtree digestで記録して保存する。consumerのworkspaceはsourceから普通に作ったうえで、これらをcopyする。consumerのworkspaceに同じpathが既にあって内容が違うときは上書きせず、そのattemptが自分でstepを実行する。
+- **keyの算出**: keyはworkerが算出し、wireのkeyは信用しない。os・arch・profileはworker自身の値を使い、実行するstepのid・dir・script・shell・実効env、toolchain、cache schema、scope（run scopeではrun ID）、freshness、secret versionを含める。`--no-cache` と `[ci] no_cache` はscopeをrun scopeにする（他runのtemplateは使われず、同じrun内のsingleflightは残る）。
+- **先に準備するstep**: 先頭から数えて、実行時にだけ値が決まるenvを持つstepと、workerが実行しないshell（bashとsh以外）のstepより前までとする。それ以降のstepはconsumerに残す。
+- **builder**: builderは、template keyごとに1つ、worker内部のattemptとして `<state>/setup/builders/<builder_id>/` の専用DBに記録し、通常のattemptと同じ `supervise` プロセスで動かす。stepはtask-traffic-controllerのadmissionを通り、leaseは専用で、consumer参照が1つ以上ある間だけworkerが更新する。最後の参照が外れると更新をやめてcancelする。停止はsupervisorが行う。builderが失敗・timeout・cancel・消失したときは、待っていた全consumerに理由を返し、consumerは自分でstepを実行する（失敗は記憶せず、次のattemptが作り直す）。
+- **検証と破棄**: consumerへのcopy後に、receiptのtree digestと照合する。一致しないtemplateは使わずに破棄し、次のconsumerが作り直す。templateは完成後に書込み不可にし、hardlinkは使わない。
+- **起動時の掃除**: 途中のtemplate（scratchディレクトリ、receiptの無いディレクトリ）と、前回のbuilderを片付ける。supervisorが生きているbuilderには停止を依頼し、そのworkspaceは掃除から外す。コマンドが起動済みのbuilderはsupervisorのrecoveryで止めてから消す。
+- **`[prepare]`**: `.fast-worktree.toml` が無いときだけ、`commands` の各argvを1つのsetup stepに変換し、同じbuilderの経路で実行する。
+
 cacheはworker内を基本とし、別hostの準備済み依存を無条件には流用しない。source、plan、profile、OS・arch、tool version、env参照version等が一致することを確認する。secretが結果へ影響する場合、値をcache keyに保存せずsecret version等で識別し、それができなければcache対象から除外する。
 
 `--no-cache` は他runのprepared templateと計算結果のreuseを止める。プロジェクト設定 `[ci] no_cache`（`.local-ci.toml` の `no-cache` と同じ書式）に挙げたworkflowまたはjobには、`--no-cache` を付けた場合と同じ扱いを常に適用する。同じrunで必要な同一recipeのsingleflight共有は維持する。検証済みのimmutable source objectsは転送最適化として再利用できる。worker追加直後のcold setupも配置コストに含め、cache hitを前提にETAを表示しない。
