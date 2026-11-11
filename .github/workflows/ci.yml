@@ -94,8 +94,8 @@ jobs:
       - name: install cargo-schemata
         run: |
           # A cached binary of another version is replaced, not reused.
-          if ! cargo schemata --version 2>/dev/null | grep -q '0\.3\.0'; then
-            cargo install cargo-schemata --locked --version 0.3.0 --force
+          if ! cargo schemata --version 2>/dev/null | grep -q '0\.4\.0'; then
+            cargo install cargo-schemata --locked --version 0.4.0 --force
           fi
       - name: mutate this shard
         run: |
@@ -125,8 +125,8 @@ jobs:
           save-if: false
       - name: install cargo-schemata
         run: |
-          if ! cargo schemata --version 2>/dev/null | grep -q '0\.3\.0'; then
-            cargo install cargo-schemata --locked --version 0.3.0 --force
+          if ! cargo schemata --version 2>/dev/null | grep -q '0\.4\.0'; then
+            cargo install cargo-schemata --locked --version 0.4.0 --force
           fi
       - name: every target file has mutants
         run: |
