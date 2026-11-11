@@ -174,8 +174,10 @@ pub fn parse_staged_name(name: &str) -> Option<StagedName<'_>> {
         "part" => false,
         _ => return None,
     };
-    let mut words = stem.split('-');
-    let (word, hex, digits) = (words.next()?, words.next()?, words.next()?);
+    let words: Vec<&str> = stem.split('-').collect();
+    let [word, hex, digits] = words[..] else {
+        return None;
+    };
     let kind = [
         SourceBlobKind::Content,
         SourceBlobKind::Manifest,
@@ -184,8 +186,8 @@ pub fn parse_staged_name(name: &str) -> Option<StagedName<'_>> {
     .into_iter()
     .find(|k| kind_word(*k) == word)?;
     let size: u64 = digits.parse().ok()?;
-    // one spelling per size, and nothing after it
-    (words.next().is_none() && is_hex64(hex) && size.to_string() == digits).then_some(StagedName {
+    // one spelling per size
+    (is_hex64(hex) && size.to_string() == digits).then_some(StagedName {
         kind,
         hex,
         size,
