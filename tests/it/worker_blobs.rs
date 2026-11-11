@@ -2410,3 +2410,100 @@ fn a_bundle_is_asked_of_the_disk_with_what_its_manifest_reserved() {
         }
     );
 }
+
+#[test]
+fn a_commit_with_no_repository_to_hold_it_is_refused_before_the_store_is_written() {
+    use local_ci::source::{seal_manifest, RelPath, SubmoduleRef};
+    use remote_task_runner::source::classify::source_id_of_ci;
+    let f = fx();
+    let repo = f.path("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    git(&repo, &["init", "-q", "-b", "main"]);
+    std::fs::write(repo.join("a.txt"), "committed\n").unwrap();
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-qm", "base"]);
+    std::fs::write(repo.join("a.txt"), noise(4, 3000)).unwrap();
+    let p = f.capture(&SourceRequest::Worktree { dir: repo.clone() });
+    let d = f.directory("d", 90);
+    let m = f.machine();
+    let (sink, l) = (m.blobs().unwrap(), limits());
+    let store = f.state().join("sources");
+    let before = tree_of(&store);
+
+    // A Git source that names no repository.
+    let mut root = p.root.clone();
+    root.repository_id = None;
+    let root = seal_manifest(root);
+    let source = source_id_of_ci(&root.source_id).unwrap();
+    let mut sent = vec![(source, vec![serde_json::to_vec(&root).unwrap()], &p.blobs)];
+    // A directory that names a dirty submodule capture with a commit.
+    let mut top = d.root.clone();
+    top.submodules = vec![SubmoduleRef {
+        path: RelPath::new("vendor/sub"),
+        revision: p.root.execution_commit.clone().unwrap(),
+        source_id: Some(p.root.source_id.clone()),
+        dirty: true,
+    }];
+    let top = seal_manifest(top);
+    let source = source_id_of_ci(&top.source_id).unwrap();
+    let mut both = d.blobs.clone();
+    both.extend(p.blobs.clone());
+    let manifests = vec![serde_json::to_vec(&top).unwrap(), p.manifests[0].clone()];
+    sent.push((source, manifests, &both));
+
+    for (source, manifests, blobs) in &sent {
+        let mut refused = None;
+        for man in manifests {
+            if let Err(e) = put_all(sink, &l, source, Manifest, man) {
+                refused = Some(e);
+            }
+        }
+        for b in blobs.values() {
+            if refused.is_none() {
+                refused = put_all(sink, &l, source, Content, b).err();
+            }
+        }
+        let e = refused.expect("the source is refused");
+        assert_eq!(e.code, ErrorCode::InvalidInput, "{e:?}");
+        assert_eq!(tree_of(&store), before, "{e:?}");
+        assert!(!f.incoming(source).exists(), "{e:?}");
+        assert!(f.clones().is_empty());
+    }
+}
+
+#[test]
+fn the_free_space_of_the_store_and_of_the_clones_counts_too() {
+    let f = fx();
+    let p = f.directory("p", 91);
+    let l = limits();
+    let state = f.state();
+    std::fs::create_dir_all(&state).unwrap();
+    for (full, ok) in [
+        ("clones", false),
+        ("sources", false),
+        ("incoming", false),
+        ("-", true),
+    ] {
+        let ws = Workspaces::new(
+            state.clone(),
+            f.env(),
+            Arc::new(CliFastWorktree::new(f.env())),
+        );
+        let sink = Incoming::new(&state, f.worker_store(), ws, f.env()).with_free_reading(
+            Box::new(move |at| {
+                let hit = at.components().any(|c| c.as_os_str() == full);
+                Ok(if hit { GIB } else { 64 * GIB })
+            }),
+        );
+        let r = put_all(&sink, &l, &p.source, Manifest, &p.manifests[0]);
+        match r {
+            Ok(_) => assert!(ok, "{full}"),
+            Err(e) => {
+                assert!(!ok, "{full}: {e:?}");
+                assert_eq!(e.code, ErrorCode::Overloaded);
+                assert!(e.message.contains("disk"), "{}", e.message);
+                assert!(!f.incoming(&p.source).exists());
+            }
+        }
+    }
+}

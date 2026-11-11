@@ -1175,6 +1175,23 @@ impl Incoming {
             };
             objects = Some(repo);
         }
+        // A commit the bundle would carry (the source's own, a dirty
+        // submodule's) with no repository to hold it: the store refuses
+        // such a manifest, so the source is refused here, before its files
+        // go into the store.
+        let homeless = objects.is_none()
+            && carried.iter().any(|id| {
+                st.manifests
+                    .get(id)
+                    .is_some_and(|m| m.execution_commit.is_some())
+            });
+        if homeless {
+            self.discard(source.as_str());
+            *st = Staged::default();
+            return Err(invalid(
+                "the source is refused: it names a commit and no repository to hold it",
+            ));
+        }
         let store_err = |e: anyhow::Error| internal("source store", format!("{e:#}"));
         for (hash, size) in &st.wanted {
             let path = waiting(hash, *size);
