@@ -19,7 +19,7 @@ use crate::wire::{
     AttemptPayload, CommandSpec, ConcurrencyLimits, Correlation, WorkloadNode, WorkloadPlan,
 };
 use decide::{Costs, Decision, Rules};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -28,23 +28,46 @@ use std::sync::{Arc, Mutex};
 /// confirmed the task is free again, and that worker is left out for it.
 pub const REASON_WORKER_CANNOT_RUN: &str = "worker_cannot_run";
 
-/// The event on an attempt that marks its worker as one the task is not
-/// placed on again. Payload: `{"worker", "code"}`.
+/// The event on an attempt that says why its worker is one the task is not
+/// placed on again. Payload: `{"worker", "code", "reason"}`. It is written
+/// with the tombstone, in one transaction; what excludes the worker is the
+/// tombstone's reason ([`REASON_WORKER_CANNOT_RUN`]), not this event.
 pub const EVENT_WORKER_EXCLUDED: &str = "worker_excluded";
 
 /// The event on a run for a task no worker could be chosen for. Payload:
-/// `{"task", "decision"}`; written again only when the reason changes.
+/// `{"task", "decision"}`; written again only when the outcome or a lasting
+/// exclusion changes ([`decide::same_wait`]).
 pub const EVENT_TASK_WAITING: &str = "task_waiting";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SchedulerConfig {
     pub rules: Rules,
     /// How long one decision waits for a worker's forecast. A worker that
-    /// takes longer is left out for the rest of the tick. Keep it below
-    /// `rules.forecast_ttl_ms`: the answers of the quick workers must still
-    /// be fresh when the slowest one is given up.
+    /// takes longer is left out for the rest of the tick. It must be below
+    /// `rules.forecast_ttl_ms` ([`SchedulerConfig::check`]): the answers of
+    /// the quick workers must still be fresh when the slowest one is given
+    /// up. Not a key of the configuration file: the default is used.
     pub forecast_wait_ms: u64,
 }
+
+impl SchedulerConfig {
+    /// Settings no decision could be made with are refused: a wait as long
+    /// as an answer lives would make every answer too old to use.
+    pub fn check(&self) -> Result<(), String> {
+        if self.forecast_wait_ms < self.rules.forecast_ttl_ms {
+            Ok(())
+        } else {
+            Err(format!(
+                "forecast_wait_ms ({}) must be below forecast_ttl_ms ({})",
+                self.forecast_wait_ms, self.rules.forecast_ttl_ms
+            ))
+        }
+    }
+}
+
+/// The range of a worker's configured priority (spec chapter 9).
+pub const PRIORITY_MIN: i64 = -100;
+pub const PRIORITY_MAX: i64 = 100;
 
 impl Default for SchedulerConfig {
     fn default() -> Self {
@@ -83,19 +106,25 @@ pub struct Scheduler {
     costs: Arc<dyn CostModel>,
     priorities: Mutex<BTreeMap<WorkerId, i64>>,
     seq: AtomicU64,
-    /// The last reason recorded for each task that waits, so that a task
-    /// that waits for the same reason is recorded once.
+    /// The last decision for each task that waits, so that a task that
+    /// waits for the same reason is recorded once.
     waiting: Mutex<BTreeMap<TaskId, Decision>>,
 }
 
 impl Default for Scheduler {
     fn default() -> Self {
-        Scheduler::new(SchedulerConfig::default(), Arc::new(UnknownCosts))
+        Scheduler::unchecked(SchedulerConfig::default(), Arc::new(UnknownCosts))
     }
 }
 
 impl Scheduler {
-    pub fn new(cfg: SchedulerConfig, costs: Arc<dyn CostModel>) -> Scheduler {
+    /// Fails for settings [`SchedulerConfig::check`] refuses.
+    pub fn new(cfg: SchedulerConfig, costs: Arc<dyn CostModel>) -> Result<Scheduler, String> {
+        cfg.check()?;
+        Ok(Scheduler::unchecked(cfg, costs))
+    }
+
+    fn unchecked(cfg: SchedulerConfig, costs: Arc<dyn CostModel>) -> Scheduler {
         Scheduler {
             cfg,
             costs,
@@ -109,9 +138,13 @@ impl Scheduler {
         self.costs.costs(worker_id, task)
     }
 
+    /// A priority outside the range is taken as the nearest end of it.
     pub fn set_priority(&self, worker_id: &WorkerId, priority: i64) {
         let mut all = self.priorities.lock().unwrap_or_else(|e| e.into_inner());
-        all.insert(worker_id.clone(), priority);
+        all.insert(
+            worker_id.clone(),
+            priority.clamp(PRIORITY_MIN, PRIORITY_MAX),
+        );
     }
 
     /// The configured priority; 0 for a worker that was given none.
@@ -120,20 +153,32 @@ impl Scheduler {
         all.get(worker_id).copied().unwrap_or(0)
     }
 
-    /// The number of the next decision of this process, counting from 1.
+    /// The number of the next decision of this process, counting from 1. It
+    /// is local to the process: a restarted coordinator counts from 1 again,
+    /// and a decision whose commit placed nothing uses one up. It orders the
+    /// decisions of one process in a record; it identifies nothing in the
+    /// database (the placement and the attempt have their own ids).
     pub fn next_seq(&self) -> u64 {
         self.seq.fetch_add(1, Ordering::SeqCst) + 1
     }
 
-    /// Remember why a task waits. Returns whether this is news (the first
-    /// reason, or another one than before).
+    /// Remember why a task waits. Returns whether this is news: the first
+    /// reason, or another one than before. What differs only in what one
+    /// tick saw (a worker that was full or silent) is kept, and is not news.
     pub fn note_waiting(&self, task_id: &TaskId, decision: &Decision) -> bool {
         let mut all = self.waiting.lock().unwrap_or_else(|e| e.into_inner());
-        if all.get(task_id) == Some(decision) {
-            return false;
-        }
+        let news = all
+            .get(task_id)
+            .is_none_or(|before| !decide::same_wait(before, decision));
         all.insert(task_id.clone(), decision.clone());
-        true
+        news
+    }
+
+    /// Forget every waiting task that is not among `queued`: it was
+    /// cancelled, its run was closed, or it went another way.
+    pub fn keep_waiting(&self, queued: &BTreeSet<TaskId>) {
+        let mut all = self.waiting.lock().unwrap_or_else(|e| e.into_inner());
+        all.retain(|task_id, _| queued.contains(task_id));
     }
 
     /// The task was placed (or is gone): it waits no more.
@@ -225,7 +270,7 @@ pub fn reason_of(
 }
 
 /// The number of the decision that placed an attempt, within the process
-/// that made it.
+/// that made it ([`Scheduler::next_seq`]): not unique across restarts.
 pub fn decision_seq_of(
     store: &CoordinatorStore,
     attempt_id: &AttemptId,

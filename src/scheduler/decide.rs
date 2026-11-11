@@ -427,24 +427,64 @@ pub fn decide(candidates: Vec<Candidate>, mut excluded: Vec<Excluded>, rules: Ru
 
 /// Whether an attempt whose submit a worker deferred should be taken off
 /// that worker and placed elsewhere. `refused_before` says the worker gave
-/// the same code for this attempt before: one such answer may pass, the
-/// second means the worker keeps refusing.
+/// the same answer (the same [`refusal_key`]) for this attempt before: one
+/// such answer may pass, the second means the worker keeps refusing.
 ///
-/// Only reasons that lie with the worker count: it does not speak the
-/// protocol, or it blocks the task for what it is (environment, capability).
-/// A secret that is unavailable is missing on every worker alike, and an
+/// Only reasons the worker itself named as its own count: it does not speak
+/// the protocol, or it blocks the task for what it is (environment,
+/// capability). A secret that is unavailable is missing on every worker
+/// alike, a `BLOCKED` without a reason says nothing about the worker, and an
 /// overloaded or faulty worker will take the same attempt later.
 pub fn moves_elsewhere(
     code: ErrorCode,
     blocked: Option<BlockedReason>,
     refused_before: bool,
 ) -> bool {
-    let lies_with_worker = match code {
-        ErrorCode::ProtocolIncompatible => true,
-        ErrorCode::Blocked => blocked != Some(BlockedReason::SecretUnavailable),
+    let lies_with_worker = match (code, blocked) {
+        (ErrorCode::ProtocolIncompatible, _) => true,
+        (ErrorCode::Blocked, Some(reason)) => match reason {
+            BlockedReason::EnvironmentMismatch | BlockedReason::NoCompatibleWorker => true,
+            BlockedReason::SecretUnavailable => false,
+        },
         _ => false,
     };
     refused_before && lies_with_worker
+}
+
+/// What makes two refusals of a submit the same answer: the code and, for
+/// `BLOCKED`, its reason. `BLOCKED` for a missing secret followed by
+/// `BLOCKED` for the environment is two first answers, not one repeated.
+pub fn refusal_key(code: ErrorCode, blocked: Option<BlockedReason>) -> String {
+    match blocked {
+        Some(reason) => format!("{code}/{}", word(&reason)),
+        None => code.to_string(),
+    }
+}
+
+impl Exclusion {
+    /// Whether the exclusion holds until something is done about it, as
+    /// opposed to one that describes a single tick (a worker that was full,
+    /// slow or silent just now).
+    pub fn lasts(self) -> bool {
+        match self {
+            Exclusion::RefusedTask | Exclusion::Draining => true,
+            Exclusion::Unreached
+            | Exclusion::Full
+            | Exclusion::NoForecast
+            | Exclusion::NotTaking => false,
+        }
+    }
+}
+
+/// Whether two decisions that placed nothing say the same about why the task
+/// waits: the same outcome and the same lasting exclusions. What changes
+/// from tick to tick (who was full, who did not answer, the numbers) is not
+/// news.
+pub fn same_wait(a: &Decision, b: &Decision) -> bool {
+    fn lasting(d: &Decision) -> Vec<&Excluded> {
+        d.excluded.iter().filter(|e| e.why.lasts()).collect()
+    }
+    a.why == b.why && lasting(a) == lasting(b)
 }
 
 #[cfg(test)]
@@ -1058,7 +1098,6 @@ mod tests {
         use ErrorCode::*;
         let moves = [
             (ProtocolIncompatible, None),
-            (Blocked, None),
             (Blocked, Some(EnvironmentMismatch)),
             (Blocked, Some(NoCompatibleWorker)),
         ];
@@ -1069,6 +1108,10 @@ mod tests {
         }
         let stays = [
             (Blocked, Some(SecretUnavailable)),
+            // No reason given: nothing says it lies with the worker.
+            (Blocked, None),
+            // A reason on another code is not read.
+            (Overloaded, Some(EnvironmentMismatch)),
             (Overloaded, None),
             (Internal, None),
             (CommunicationUnknown, None),
@@ -1079,5 +1122,85 @@ mod tests {
         for (code, reason) in stays {
             assert!(!moves_elsewhere(code, reason, true));
         }
+    }
+
+    #[test]
+    fn two_refusals_are_the_same_answer_only_with_the_same_code_and_reason() {
+        use BlockedReason::*;
+        use ErrorCode::*;
+        assert_eq!(refusal_key(Blocked, None), "BLOCKED");
+        assert_eq!(
+            refusal_key(Blocked, Some(SecretUnavailable)),
+            "BLOCKED/secret_unavailable"
+        );
+        assert_eq!(
+            refusal_key(Blocked, Some(EnvironmentMismatch)),
+            "BLOCKED/environment_mismatch"
+        );
+        assert_eq!(
+            refusal_key(Blocked, Some(NoCompatibleWorker)),
+            "BLOCKED/no_compatible_worker"
+        );
+        assert_eq!(
+            refusal_key(ProtocolIncompatible, None),
+            "PROTOCOL_INCOMPATIBLE"
+        );
+    }
+
+    #[test]
+    fn only_exclusions_that_outlive_a_tick_last() {
+        use Exclusion::*;
+        let lasting = [RefusedTask, Draining];
+        for e in [
+            Unreached,
+            Draining,
+            Full,
+            RefusedTask,
+            NoForecast,
+            NotTaking,
+        ] {
+            assert_eq!(e.lasts(), lasting.contains(&e), "{e:?}");
+        }
+    }
+
+    #[test]
+    fn a_wait_is_the_same_while_its_outcome_and_lasting_exclusions_are() {
+        fn waits(excluded: &[(&str, Exclusion)]) -> Decision {
+            let excluded = excluded
+                .iter()
+                .map(|(w, why)| Excluded {
+                    worker_id: WorkerId::parse(w).unwrap(),
+                    why: *why,
+                })
+                .collect();
+            decide(Vec::new(), excluded, RULES_1S)
+        }
+        use Exclusion::*;
+        let base = waits(&[("w-a", RefusedTask), ("w-b", Full)]);
+        // What describes one tick may come, go and change.
+        for other in [
+            waits(&[("w-a", RefusedTask), ("w-b", NoForecast)]),
+            waits(&[("w-a", RefusedTask), ("w-b", NotTaking)]),
+            waits(&[("w-a", RefusedTask), ("w-b", Unreached)]),
+            waits(&[("w-a", RefusedTask)]),
+            waits(&[("w-a", RefusedTask), ("w-b", Full), ("w-c", Full)]),
+        ] {
+            assert!(same_wait(&base, &other), "{other:?}");
+            assert!(same_wait(&other, &base), "{other:?}");
+        }
+        // A lasting one that comes, goes, changes or names another worker.
+        for other in [
+            waits(&[("w-a", RefusedTask), ("w-b", RefusedTask)]),
+            waits(&[("w-a", RefusedTask), ("w-b", Draining)]),
+            waits(&[("w-b", Full)]),
+            waits(&[("w-a", Draining), ("w-b", Full)]),
+            waits(&[("w-c", RefusedTask), ("w-b", Full)]),
+        ] {
+            assert!(!same_wait(&base, &other), "{other:?}");
+        }
+        // Another outcome with the same exclusions.
+        let mut placed = base.clone();
+        placed.why = Why::OnlyCandidate;
+        assert!(!same_wait(&base, &placed));
     }
 }

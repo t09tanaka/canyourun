@@ -15,7 +15,7 @@ use remote_task_runner::coordinator::ClientLink;
 use remote_task_runner::coordinator::{
     Coordinator, CoordinatorConfig, CoordinatorError, LinkError, TaskSpec, WorkerLink,
 };
-use remote_task_runner::error::{ApiError, ConflictReason, ErrorCode};
+use remote_task_runner::error::{ApiError, BlockedReason, ConflictReason, ErrorCode};
 use remote_task_runner::ids::*;
 use remote_task_runner::protocol::transport::duplex_pair;
 use remote_task_runner::protocol::{connect, ClientConfig};
@@ -146,6 +146,8 @@ pub(crate) struct State {
     pub(crate) forecasting: Forecasting,
     /// Every forecast question that arrived, in order.
     pub(crate) asked: Vec<ForecastRequest>,
+    /// Every request that arrived, answered or not, in order.
+    pub(crate) received: Vec<Op>,
 }
 
 pub(crate) struct FakeWorker {
@@ -196,6 +198,7 @@ impl FakeWorker {
                     delay_ms: 0,
                 },
                 asked: Vec::new(),
+                received: Vec::new(),
             }),
         })
     }
@@ -215,6 +218,12 @@ impl FakeWorker {
     pub(crate) fn count(&self, op: Op) -> usize {
         let s = self.state.lock().unwrap();
         s.log.iter().filter(|(o, _)| *o == op).count()
+    }
+
+    /// How many requests of a kind arrived, answered or not.
+    pub(crate) fn received(&self, op: Op) -> usize {
+        let s = self.state.lock().unwrap();
+        s.received.iter().filter(|o| **o == op).count()
     }
 
     /// The worker starts the command of an accepted attempt.
@@ -555,6 +564,7 @@ impl WorkerLink for FakeWorker {
     ) -> Pin<Box<dyn Future<Output = Result<Response, LinkError>> + Send + '_>> {
         Box::pin(async move {
             let op = op_of(&request);
+            self.state.lock().unwrap().received.push(op);
             let stall = self.state.lock().unwrap().stall;
             if stall && op != Op::Inspect {
                 // Never answered; only the caller's own deadline ends it.
@@ -639,7 +649,7 @@ impl Fx {
                 other => break other.unwrap(),
             }
         };
-        let sched = Scheduler::new(self.sched, Arc::clone(&self.costs));
+        let sched = Scheduler::new(self.sched, Arc::clone(&self.costs)).unwrap();
         let c = Coordinator::start_with(store, self.cfg, sched).unwrap();
         for w in workers {
             c.attach(w.id.clone(), Arc::clone(w) as Arc<dyn WorkerLink>);
@@ -1486,27 +1496,38 @@ async fn the_same_attempt_with_another_payload_is_refused_for_good() {
 #[tokio::test]
 async fn a_fault_of_the_worker_is_not_a_verdict_on_the_attempt() {
     // Every answer that says nothing about the attempt itself, a conflict
-    // without the reason that names the payload included. (A worker that
-    // keeps answering `BLOCKED` or `PROTOCOL_INCOMPATIBLE` is left for
-    // another one: see the scheduler's tests.)
-    for code in [
-        ErrorCode::Internal,
-        ErrorCode::CommunicationUnknown,
-        ErrorCode::NotImplemented,
-        ErrorCode::NotFound,
-        ErrorCode::Conflict,
+    // without the reason that names the payload included, and `BLOCKED`
+    // without a reason or for a secret that is missing (which is missing on
+    // every worker alike). (A worker that keeps answering `BLOCKED` for a
+    // reason of its own, or `PROTOCOL_INCOMPATIBLE`, is left for another
+    // one: see the scheduler's tests.)
+    let secret = ApiError::blocked(BlockedReason::SecretUnavailable, "no bundle");
+    for fault in [
+        err(ErrorCode::Internal),
+        err(ErrorCode::CommunicationUnknown),
+        err(ErrorCode::NotImplemented),
+        err(ErrorCode::NotFound),
+        err(ErrorCode::Conflict),
+        err(ErrorCode::Blocked),
+        secret,
     ] {
+        let code = (fault.code, fault.blocked_reason);
         let f = fx();
         let a = f.worker("w-a", (1, 0));
         let b = f.worker("w-b", (1, 0));
         let c = f.open(&[&a, &b]);
         let tasks = enqueue(&c, 1).await;
-        a.set(|s| s.fault = Some(err(code)));
-        for _ in 0..3 {
+        a.set(|s| s.fault = Some(fault));
+        // However often: the same attempt is sent to the same worker again.
+        for sent in 1..=6 {
             let report = c.tick().await.unwrap();
             assert!(report.settled.is_empty() && report.retired.is_empty());
+            assert_eq!(a.received(Op::Submit), sent, "{code:?}");
         }
+        assert_eq!(a.received(Op::Retire), 0, "{code:?}");
+        assert!(b.holds().is_empty() && b.received(Op::Submit) == 0);
         let first = only(&c, &tasks[0]);
+        assert_eq!(c.store().retire_tombstone(&first.attempt_id).unwrap(), None);
         assert_eq!(first.worker_id, a.id, "{code:?}");
         assert_eq!(first.state, AttemptState::Accepted, "{code:?}");
         assert_eq!(first.termination, None, "{code:?}: the task did not fail");
@@ -1520,7 +1541,7 @@ async fn a_fault_of_the_worker_is_not_a_verdict_on_the_attempt() {
             .events_of(&first.attempt_id, "submit_deferred")
             .unwrap();
         assert_eq!(why.len(), 1, "{code:?}");
-        assert_eq!(why[0].payload["code"], code.to_string());
+        assert_eq!(why[0].payload["code"], code.0.to_string());
         // The fault passes: the same attempt goes to the same worker.
         a.set(|s| s.fault = None);
         c.tick().await.unwrap();

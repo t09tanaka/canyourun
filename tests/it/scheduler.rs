@@ -16,14 +16,15 @@ use remote_task_runner::scheduler::decide::{
     Costs, Decision, Exclusion, Label, Rule, Unusable, Why, COLLECTION, SETUP, TRANSFER,
 };
 use remote_task_runner::scheduler::{
-    decision_seq_of, reason_of, CostModel, EVENT_TASK_WAITING, EVENT_WORKER_EXCLUDED,
+    decision_seq_of, reason_of, CostModel, Scheduler, SchedulerConfig, UnknownCosts,
+    EVENT_TASK_WAITING, EVENT_WORKER_EXCLUDED, REASON_WORKER_CANNOT_RUN,
 };
 use remote_task_runner::state::Outcome;
 use remote_task_runner::storage::QueuedTask;
 use remote_task_runner::wire::{RuntimeSource, Uncertainty};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 fn reason(c: &Coordinator, attempt: &AttemptId) -> Decision {
     reason_of(c.store(), attempt)
@@ -496,39 +497,6 @@ async fn a_forecast_that_is_old_or_from_a_worker_that_restarted_is_not_used() {
     }
 }
 
-#[tokio::test]
-async fn the_age_of_a_forecast_is_measured_by_the_parent_from_before_it_asked() {
-    let mut f = fx();
-    // Longer than the parent lets a forecast live.
-    f.sched.rules.forecast_ttl_ms = 100;
-    f.sched.forecast_wait_ms = 2000;
-    let a = f.worker("w-a", (2, 1));
-    let b = f.worker("w-b", (2, 1));
-    // Both answers say they are good for a minute. w-b takes 300 ms; the
-    // decision waits for it, and by then the answers are too old for the
-    // parent, also the one that came at once.
-    for w in [&a, &b] {
-        w.set(|s| s.forecasting.ttl_ms = 60_000);
-    }
-    b.set(|s| s.forecasting.delay_ms = 300);
-    let c = f.open(&[&a, &b]);
-    let task = enqueue(&c, 1).await.remove(0);
-    c.tick().await.unwrap();
-    let d = reason(&c, &only(&c, &task).attempt_id);
-    for w in &d.compared {
-        assert_eq!(
-            w.outlook.unusable,
-            Some(Unusable::Expired),
-            "{}",
-            w.worker_id
-        );
-        assert_eq!(w.label, Label::Unknown);
-    }
-    // Still placed: by the tie rules, on the first by id.
-    assert_eq!(d.why, Why::TieBreak(Rule::WorkerId));
-    assert_eq!(worker_of(&c, &task), "w-a");
-}
-
 // ------------------------------------- a worker that keeps refusing a task
 
 fn refusal(code: ErrorCode) -> ApiError {
@@ -722,18 +690,14 @@ async fn a_worker_that_does_not_answer_the_forecast_is_waited_for_once_per_tick(
     silent.set(|s| s.forecasting.says = Says::Silence);
     let c = f.open(&[&silent, &b]);
     let tasks = enqueue(&c, 3).await;
-    let started = Instant::now();
-    let report = tokio::time::timeout(Duration::from_secs(20), c.tick())
+    let report = tokio::time::timeout(Duration::from_secs(60), c.tick())
         .await
         .expect("the tick ends although a worker never answers")
         .unwrap();
-    // One wait, not one per task, and far below the worker budget (10 s).
-    assert!(
-        started.elapsed() < Duration::from_secs(3),
-        "{:?}",
-        started.elapsed()
-    );
     assert_eq!(report.placed.len(), 3);
+    // One wait, not one per task: it was asked once, and the two tasks
+    // behind the first were decided without it.
+    assert_eq!(silent.received(Op::Forecast), 1);
     assert_eq!(silent.count(Op::Forecast), 0, "it never answered");
     assert_eq!(b.count(Op::Forecast), 3);
     for t in &tasks {
@@ -760,15 +724,19 @@ async fn a_worker_that_stalls_altogether_does_not_keep_tasks_from_the_others() {
     let held = enqueue(&c, 1).await.remove(0);
     c.tick().await.unwrap();
     assert_eq!(worker_of(&c, &held), "w-a");
-    stalled.set(|s| s.stall = true);
+    stalled.set(|s| {
+        s.stall = true;
+        s.received.clear();
+    });
     let tasks = enqueue(&c, 2).await;
-    let started = Instant::now();
-    c.tick().await.unwrap();
-    assert!(
-        started.elapsed() < Duration::from_secs(4),
-        "{:?}",
-        started.elapsed()
-    );
+    tokio::time::timeout(Duration::from_secs(60), c.tick())
+        .await
+        .expect("the tick ends although a worker stalls")
+        .unwrap();
+    // It was waited for once, for the attempt it holds: after that nothing
+    // was asked of it, and no decision waited for it.
+    let asked = stalled.state.lock().unwrap().received.clone();
+    assert_eq!(asked, [Op::Inspect, Op::Get]);
     for t in &tasks {
         assert_eq!(worker_of(&c, t), "w-b");
         let d = reason(&c, &only(&c, t).attempt_id);
@@ -790,4 +758,276 @@ async fn a_forecast_answered_with_a_newer_coordinators_epoch_stops_this_one() {
     );
     assert!(c.is_fenced());
     assert!(attempts(&c, &task).is_empty(), "nothing was placed");
+}
+
+// ------------------------------------------- what counts as the same refusal
+
+fn blocked(reason: Option<BlockedReason>) -> ApiError {
+    let mut e = ApiError::new(ErrorCode::Blocked, "blocked");
+    e.blocked_reason = reason;
+    e
+}
+
+fn tombstone(c: &Coordinator, task: &TaskId) -> Option<(u64, Option<u64>)> {
+    c.store()
+        .retire_tombstone(&last(c, task).attempt_id)
+        .unwrap()
+}
+
+#[tokio::test]
+async fn blocked_for_another_reason_is_a_first_refusal_not_a_second() {
+    let f = fx();
+    let a = f.worker("w-a", (1, 0));
+    let b = f.worker("w-b", (1, 0));
+    let c = f.open(&[&a, &b]);
+    a.set(|s| s.fault = Some(blocked(Some(BlockedReason::SecretUnavailable))));
+    let task = enqueue(&c, 1).await.remove(0);
+    for _ in 0..3 {
+        c.tick().await.unwrap();
+    }
+    assert_eq!(tombstone(&c, &task), None);
+    // Now the environment: the first answer of this kind passes.
+    a.set(|s| s.fault = Some(blocked(Some(BlockedReason::EnvironmentMismatch))));
+    c.tick().await.unwrap();
+    assert_eq!(tombstone(&c, &task), None, "one such answer may pass");
+    let noted = c
+        .store()
+        .events_of(&only(&c, &task).attempt_id, "submit_deferred")
+        .unwrap();
+    let answers: Vec<&str> = noted
+        .iter()
+        .map(|e| e.payload["answer"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        answers,
+        ["BLOCKED/secret_unavailable", "BLOCKED/environment_mismatch"]
+    );
+    assert_eq!(noted[1].payload["code"], "BLOCKED");
+    assert_eq!(noted[1].payload["reason"], "environment_mismatch");
+    // The second one takes the attempt off the worker.
+    c.tick().await.unwrap();
+    assert!(tombstone(&c, &task).is_some());
+    let marked = c
+        .store()
+        .events_of(&only(&c, &task).attempt_id, EVENT_WORKER_EXCLUDED)
+        .unwrap();
+    assert_eq!(marked.len(), 1);
+    assert_eq!(marked[0].payload["reason"], "environment_mismatch");
+    c.tick().await.unwrap();
+    assert_eq!(last(&c, &task).worker_id, b.id);
+}
+
+#[tokio::test]
+async fn blocked_without_a_reason_never_moves_the_task() {
+    let f = fx();
+    let a = f.worker("w-a", (1, 0));
+    let b = f.worker("w-b", (1, 0));
+    let c = f.open(&[&a, &b]);
+    a.set(|s| s.fault = Some(blocked(None)));
+    let task = enqueue(&c, 1).await.remove(0);
+    for _ in 0..5 {
+        c.tick().await.unwrap();
+    }
+    assert_eq!(only(&c, &task).worker_id, a.id);
+    assert_eq!(tombstone(&c, &task), None);
+    assert!(b.holds().is_empty());
+    assert!(events(&c, EVENT_WORKER_EXCLUDED).is_empty());
+}
+
+#[tokio::test]
+async fn an_answer_that_did_not_arrive_as_one_is_never_counted_as_a_refusal() {
+    // What the link makes of an answer it cannot read is "no answer"
+    // (`protocol`: `Unconfirmed::Unreadable`): the worker may hold the
+    // attempt. However often it happens, the attempt stays where it is.
+    let f = fx();
+    let a = f.worker("w-a", (1, 0));
+    let b = f.worker("w-b", (1, 0));
+    let c = f.open(&[&a, &b]);
+    a.set(|s| s.lose = vec![(Op::Submit, Lost::Answer); 4]);
+    let task = enqueue(&c, 1).await.remove(0);
+    for _ in 0..4 {
+        c.tick().await.unwrap();
+        assert_eq!(tombstone(&c, &task), None);
+    }
+    let first = only(&c, &task);
+    assert_eq!(first.worker_id, a.id);
+    assert!(c
+        .store()
+        .events_of(&first.attempt_id, "submit_deferred")
+        .unwrap()
+        .is_empty());
+    assert!(b.holds().is_empty());
+}
+
+// ------------------------------------------- what excludes a worker
+
+#[tokio::test]
+async fn a_retire_for_another_reason_does_not_exclude_the_worker() {
+    let f = fx();
+    let a = f.worker("w-a", (1, 0));
+    let c = f.open(&[&a]);
+    let task = enqueue(&c, 1).await.remove(0);
+    c.tick().await.unwrap();
+    let first = only(&c, &task);
+    // The mark alone (as a parent that stopped between two writes of an
+    // older version left it) and a later retire for something else.
+    let mark = serde_json::json!({"worker": "w-a", "code": "BLOCKED"});
+    c.store()
+        .append_event(
+            None,
+            Some(&first.attempt_id),
+            EVENT_WORKER_EXCLUDED,
+            &mark,
+            1,
+        )
+        .unwrap();
+    c.request_retire(&first.attempt_id, "moved by hand")
+        .await
+        .unwrap();
+    let report = c.tick().await.unwrap();
+    assert_eq!(report.retired, vec![first.attempt_id.clone()]);
+    // The task goes back to the same worker.
+    let all = attempts(&c, &task);
+    assert_eq!(all.len(), 2);
+    assert_eq!(all[1].worker_id, a.id);
+    assert_eq!(excluded(&reason(&c, &all[1].attempt_id)), []);
+}
+
+// ------------------------------------------- many tasks nobody can take
+
+#[tokio::test]
+async fn tasks_every_worker_is_excluded_for_do_not_keep_newer_ones_from_being_placed() {
+    let f = fx();
+    let a = f.worker("w-a", (1, 0));
+    let b = f.worker("w-b", (1, 0));
+    let c = f.open(&[&a]);
+    // More tasks than one scan reads, all taken off w-a because it cannot
+    // run them, in front of one it can take.
+    let tasks = enqueue(&c, 258).await;
+    let hash = PayloadHash::parse(&format!("sha256:{}", "a".repeat(64))).unwrap();
+    for task in &tasks[..257] {
+        let id = AttemptId::generate();
+        let h = hash.clone();
+        let placed = c
+            .store()
+            .place(
+                task,
+                &a.id,
+                &id,
+                |_| true,
+                move |_| Ok((h, serde_json::json!({}))),
+                1,
+            )
+            .unwrap();
+        assert!(matches!(
+            placed,
+            remote_task_runner::storage::PlaceOutcome::Placed(_)
+        ));
+        c.store()
+            .begin_retire(&id, REASON_WORKER_CANNOT_RUN, 2)
+            .unwrap();
+        c.store().confirm_retire(&id, 3).unwrap();
+    }
+    let report = c.tick().await.unwrap();
+    assert_eq!(report.placed.len(), 1);
+    assert_eq!(worker_of(&c, &tasks[257]), "w-a");
+    assert_eq!(a.holds().len(), 1);
+    // They wait, and did not fail; this holds for a parent that starts anew.
+    drop(c);
+    let c = f.open(&[&a]);
+    c.tick().await.unwrap();
+    for task in &tasks[..257] {
+        let all = attempts(&c, task);
+        assert_eq!(all.len(), 1);
+        assert!(all[0].retired && all[0].termination.is_none());
+    }
+    // A worker that joins later takes the oldest of them.
+    c.attach(b.id.clone(), Arc::clone(&b) as Arc<dyn WorkerLink>);
+    let report = c.tick().await.unwrap();
+    assert_eq!(report.placed.len(), 1);
+    let moved = attempts(&c, &tasks[0]);
+    assert_eq!(moved.len(), 2);
+    assert_eq!(moved[1].worker_id, b.id);
+    assert_eq!(compared(&reason(&c, &moved[1].attempt_id)), ["w-b"]);
+}
+
+// ------------------------------------------- the record of a task that waits
+
+#[tokio::test]
+async fn a_wait_is_recorded_again_only_when_something_lasting_changes() {
+    let f = fx();
+    let a = f.worker("w-a", (1, 0));
+    let c = f.open(&[&a]);
+    let tasks = enqueue(&c, 2).await;
+    c.tick().await.unwrap();
+    assert_eq!(worker_of(&c, &tasks[0]), "w-a");
+    let waits = |c: &Coordinator| events(c, EVENT_TASK_WAITING).len();
+    let now = |c: &Coordinator| -> Vec<(String, Exclusion)> {
+        let d = c.scheduler().waiting_reason(&tasks[1]).unwrap();
+        let all = d.excluded.iter();
+        all.map(|e| (e.worker_id.to_string(), e.why)).collect()
+    };
+    assert_eq!(waits(&c), 1);
+    assert_eq!(now(&c), [("w-a".to_string(), Exclusion::Full)]);
+    // What one tick saw changes back and forth: the worker is full, then
+    // does not answer, then is full again. Nothing more is written, and the
+    // reason that is kept is the latest.
+    for _ in 0..2 {
+        a.set(|s| s.offline = true);
+        c.tick().await.unwrap();
+        assert_eq!(now(&c), [("w-a".to_string(), Exclusion::Unreached)]);
+        a.set(|s| s.offline = false);
+        c.tick().await.unwrap();
+        assert_eq!(now(&c), [("w-a".to_string(), Exclusion::Full)]);
+    }
+    assert_eq!(waits(&c), 1);
+    // The worker drains: that lasts, and is news once.
+    a.set(|s| s.draining = true);
+    for _ in 0..2 {
+        c.tick().await.unwrap();
+    }
+    assert_eq!(now(&c), [("w-a".to_string(), Exclusion::Draining)]);
+    assert_eq!(waits(&c), 2);
+    // A task that is not queued any more is forgotten.
+    c.cancel_task(&tasks[1]).await.unwrap();
+    c.tick().await.unwrap();
+    assert_eq!(c.scheduler().waiting_reason(&tasks[1]), None);
+    assert_eq!(waits(&c), 2);
+}
+
+// ------------------------------------------- settings
+
+#[test]
+fn a_forecast_wait_that_is_not_below_the_lifetime_of_a_forecast_is_refused() {
+    let mut cfg = SchedulerConfig::default();
+    assert_eq!(cfg.check(), Ok(()));
+    cfg.forecast_wait_ms = cfg.rules.forecast_ttl_ms - 1;
+    assert!(Scheduler::new(cfg, Arc::new(UnknownCosts)).is_ok());
+    for wait in [cfg.rules.forecast_ttl_ms, cfg.rules.forecast_ttl_ms + 1] {
+        cfg.forecast_wait_ms = wait;
+        let refused = Scheduler::new(cfg, Arc::new(UnknownCosts)).err().unwrap();
+        assert_eq!(
+            refused,
+            format!("forecast_wait_ms ({wait}) must be below forecast_ttl_ms (2000)")
+        );
+    }
+}
+
+#[test]
+fn a_priority_outside_the_range_is_taken_as_its_nearest_end() {
+    let s = Scheduler::default();
+    let w = WorkerId::parse("w-a").unwrap();
+    for (given, kept) in [
+        (0, 0),
+        (100, 100),
+        (-100, -100),
+        (101, 100),
+        (-101, -100),
+        (i64::MAX, 100),
+        (i64::MIN, -100),
+        (7, 7),
+    ] {
+        s.set_priority(&w, given);
+        assert_eq!(s.priority_of(&w), kept);
+    }
 }

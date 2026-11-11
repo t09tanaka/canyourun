@@ -568,9 +568,10 @@ impl Coordinator {
         .await
     }
 
-    /// Record why a worker did not take an attempt, once per error code, so
-    /// that an attempt which waits on its worker shows what it waits for.
-    /// Returns whether the worker gave this code for the attempt before.
+    /// Record why a worker did not take an attempt, once per answer (the
+    /// error code and, for `BLOCKED`, its reason), so that an attempt which
+    /// waits on its worker shows what it waits for. Returns whether the
+    /// worker gave this answer for the attempt before.
     async fn note_refusal(
         &self,
         attempt_id: &AttemptId,
@@ -578,11 +579,16 @@ impl Coordinator {
         e: &ApiError,
     ) -> Result<bool> {
         let a = attempt_id.clone();
-        let code = e.code.to_string();
-        let payload = json!({"code": code, "message": e.message});
+        let answer = decide::refusal_key(e.code, e.blocked_reason);
+        let payload = json!({
+            "code": e.code.to_string(),
+            "reason": e.blocked_reason,
+            "answer": answer,
+            "message": e.message,
+        });
         let appended = self
             .db(move |s| {
-                s.append_events_unseen(None, &a, kind, "code", &[(code, payload)], wall_ms())
+                s.append_events_unseen(None, &a, kind, "answer", &[(answer, payload)], wall_ms())
             })
             .await?;
         Ok(appended == 0)
@@ -746,15 +752,24 @@ impl Coordinator {
                             // The worker keeps refusing for a reason of its
                             // own: take the attempt off it. The task is free
                             // once the worker confirmed, and is then placed
-                            // on another worker.
+                            // on another worker. The tombstone's reason is
+                            // what leaves this worker out; why is written
+                            // with it, in the same transaction.
                             let excluded = json!({
                                 "worker": a.worker_id.to_string(),
                                 "code": e.code.to_string(),
+                                "reason": e.blocked_reason,
                             });
-                            self.note(&a.attempt_id, scheduler::EVENT_WORKER_EXCLUDED, excluded)
-                                .await?;
-                            self.request_retire(&a.attempt_id, scheduler::REASON_WORKER_CANNOT_RUN)
-                                .await?;
+                            let id = a.attempt_id.clone();
+                            self.db(move |s| {
+                                s.begin_retire_noting(
+                                    &id,
+                                    scheduler::REASON_WORKER_CANNOT_RUN,
+                                    Some((scheduler::EVENT_WORKER_EXCLUDED, &excluded)),
+                                    wall_ms(),
+                                )
+                            })
+                            .await?;
                         }
                         self.observe(&a.attempt_id, Observation::Known).await?;
                         Ok(false)
@@ -940,7 +955,26 @@ impl Coordinator {
         for worker in reached {
             round.admit(worker);
         }
-        let queued = self.db(|s| s.queued_tasks(DISPATCH_SCAN)).await?;
+        // Tasks every attached worker is excluded for come last: however
+        // many of them wait, they do not fill the scan in front of a task
+        // that can be placed. A worker that is attached later is not
+        // excluded for them, which puts them back in their place by age.
+        let attached: Vec<WorkerId> = round.known.iter().cloned().collect();
+        let queued = self
+            .db(move |s| {
+                s.queued_tasks_for(
+                    DISPATCH_SCAN,
+                    &attached,
+                    scheduler::REASON_WORKER_CANNOT_RUN,
+                )
+            })
+            .await?;
+        if queued.len() < DISPATCH_SCAN as usize {
+            // The whole queue was read: a task that is not in it waits no
+            // more.
+            let ids = queued.iter().map(|t| t.task_id.clone()).collect();
+            self.sched.keep_waiting(&ids);
+        }
         for task in queued {
             self.join_newcomers(&mut round, report).await?;
             self.place_one(&task, &mut round, report).await?;
@@ -981,20 +1015,8 @@ impl Coordinator {
     /// taken off because they kept refusing it.
     async fn refused_by(&self, task_id: &TaskId) -> Result<BTreeSet<WorkerId>> {
         let task = task_id.clone();
-        self.db(move |s| {
-            let mut out = BTreeSet::new();
-            for a in s.attempts_of_task(&task)? {
-                if a.retired
-                    && !s
-                        .events_of(&a.attempt_id, scheduler::EVENT_WORKER_EXCLUDED)?
-                        .is_empty()
-                {
-                    out.insert(a.worker_id);
-                }
-            }
-            Ok(out)
-        })
-        .await
+        self.db(move |s| s.excluded_workers(&task, scheduler::REASON_WORKER_CANNOT_RUN))
+            .await
     }
 
     /// Ask one worker what the task would take there, on top of what the
