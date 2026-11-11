@@ -1159,7 +1159,7 @@ mod tests {
             NoForecast,
             NotTaking,
         ] {
-            assert_eq!(e.lasts(), lasting.contains(&e), "{e:?}");
+            assert_eq!(e.lasts(), lasting.contains(&e));
         }
     }
 
@@ -1185,8 +1185,8 @@ mod tests {
             waits(&[("w-a", RefusedTask)]),
             waits(&[("w-a", RefusedTask), ("w-b", Full), ("w-c", Full)]),
         ] {
-            assert!(same_wait(&base, &other), "{other:?}");
-            assert!(same_wait(&other, &base), "{other:?}");
+            assert!(same_wait(&base, &other));
+            assert!(same_wait(&other, &base));
         }
         // A lasting one that comes, goes, changes or names another worker.
         for other in [
@@ -1196,7 +1196,7 @@ mod tests {
             waits(&[("w-a", Draining), ("w-b", Full)]),
             waits(&[("w-c", RefusedTask), ("w-b", Full)]),
         ] {
-            assert!(!same_wait(&base, &other), "{other:?}");
+            assert!(!same_wait(&base, &other));
         }
         // Another outcome with the same exclusions.
         let mut placed = base.clone();

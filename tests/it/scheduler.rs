@@ -497,6 +497,41 @@ async fn a_forecast_that_is_old_or_from_a_worker_that_restarted_is_not_used() {
     }
 }
 
+#[tokio::test]
+async fn the_age_of_a_forecast_is_measured_by_the_parent_from_before_it_asked() {
+    let mut f = fx();
+    // Long enough that w-b is waited for however busy the machine is (and
+    // below the parent's own limit, which the fixture sets far off).
+    f.sched.forecast_wait_ms = 30_000;
+    let a = f.worker("w-a", (2, 1));
+    let b = f.worker("w-b", (2, 1));
+    // Both answers say they are good for 50 ms. w-b takes 200 ms; the
+    // decision waits for it, and by then both answers are too old, also the
+    // one that came at once: its age counts from before the question left,
+    // not from when it arrived. A slower machine only makes them older.
+    for w in [&a, &b] {
+        w.set(|s| s.forecasting.ttl_ms = 50);
+    }
+    b.set(|s| s.forecasting.delay_ms = 200);
+    let c = f.open(&[&a, &b]);
+    let task = enqueue(&c, 1).await.remove(0);
+    c.tick().await.unwrap();
+    let d = reason(&c, &only(&c, &task).attempt_id);
+    assert_eq!(compared(&d), ["w-a", "w-b"]);
+    for w in &d.compared {
+        assert_eq!(
+            w.outlook.unusable,
+            Some(Unusable::Expired),
+            "{}",
+            w.worker_id
+        );
+        assert_eq!(w.label, Label::Unknown);
+    }
+    // Still placed: by the tie rules, on the first by id.
+    assert_eq!(d.why, Why::TieBreak(Rule::WorkerId));
+    assert_eq!(worker_of(&c, &task), "w-a");
+}
+
 // ------------------------------------- a worker that keeps refusing a task
 
 fn refusal(code: ErrorCode) -> ApiError {
