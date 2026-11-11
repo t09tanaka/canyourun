@@ -376,6 +376,17 @@ fn private_dir(dir: &Path) -> std::io::Result<()> {
     fs::set_permissions(dir, fs::Permissions::from_mode(0o700))
 }
 
+/// What an ended attempt answers with: its termination, the stored and the
+/// unstored artifacts, the digest of the result, and whether a result is
+/// stored (otherwise the digest is of the termination alone).
+type Ended = (
+    Termination,
+    Vec<ArtifactRecord>,
+    Vec<ArtifactNotStored>,
+    Digest,
+    bool,
+);
+
 impl Agent {
     /// Run the startup steps in [`policy::STARTUP_ORDER`] and return the
     /// running agent. Any failing step refuses the start.
@@ -1851,23 +1862,12 @@ impl Agent {
         })
     }
 
-    /// The ended attempt's result and its digest. The stored result (written
+    /// The ended attempt's result, its digest, and whether a result is stored.
+    /// The stored result (written
     /// by the supervisor) is the truth when there is one; an attempt that
     /// ended without one (settled by the agent or by recovery) has its
     /// termination and nothing else.
-    fn ended(
-        &self,
-        attempt: &AttemptId,
-        generation: Generation,
-    ) -> Result<
-        (
-            Termination,
-            Vec<ArtifactRecord>,
-            Vec<ArtifactNotStored>,
-            Digest,
-        ),
-        ApiError,
-    > {
+    fn ended(&self, attempt: &AttemptId, generation: Generation) -> Result<Ended, ApiError> {
         let rec = self.known(attempt)?;
         Self::generation(&rec, generation)?;
         let Some(t) = rec.termination else {
@@ -1889,13 +1889,14 @@ impl Agent {
             })?,
             None => Vec::new(),
         };
+        let has_result = stored.is_some();
         let value = stored.unwrap_or_else(|| json!({ "termination": t, "artifacts": [] }));
         let digest = payload_hash(&value).map_err(|e| internal("result digest", e))?;
-        Ok((t, artifacts, not_stored, digest))
+        Ok((t, artifacts, not_stored, digest, has_result))
     }
 
     fn result(&self, r: GetResultRequest) -> Result<GetResultResponse, ApiError> {
-        let (termination, artifacts, artifacts_not_stored, result_digest) =
+        let (termination, artifacts, artifacts_not_stored, result_digest, _) =
             self.ended(&r.attempt_id, r.generation)?;
         Ok(GetResultResponse {
             schema_version: SchemaVersion::CURRENT,
@@ -1914,7 +1915,7 @@ impl Agent {
         session: Session,
         r: AckCollectedRequest,
     ) -> Result<AckCollectedResponse, ApiError> {
-        let (_, _, _, digest) = self.ended(&r.attempt_id, r.generation)?;
+        let (_, _, _, digest, has_result) = self.ended(&r.attempt_id, r.generation)?;
         if digest != r.result_digest {
             // The parent stored something else than what is here: the
             // protection stays.
@@ -1923,8 +1924,11 @@ impl Agent {
                 "result_digest is not the digest of this attempt's result",
             ));
         }
+        // A result that is stored between that read and this write is
+        // another result than the acknowledged one: refused like a digest
+        // that does not match.
         self.store
-            .ack_collected(&r.attempt_id, session.coordinator_epoch, now())
+            .ack_collected_as_read(&r.attempt_id, session.coordinator_epoch, now(), has_result)
             .map_err(api)?;
         Ok(AckCollectedResponse {
             schema_version: SchemaVersion::CURRENT,
