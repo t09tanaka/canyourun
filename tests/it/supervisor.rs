@@ -962,6 +962,16 @@ fn a_dead_leader_with_a_surviving_descendant_is_stopped_by_recovery() {
     assert!(r.unresolved.is_some() && r.identity_unknown, "{r:?}");
     assert_eq!(r.termination, None);
     assert!(alive(bgp), "left alone");
+    // The supervisor process says so with its own exit code, which its
+    // parent does not count as a failure.
+    let spec_path = write_spec(&f, &recover_spec(&f));
+    let mut sup = spawn_detached(&exe(), &spec_path).unwrap();
+    assert_eq!(
+        sup.wait().unwrap().code(),
+        Some(code::IDENTITY_UNKNOWN),
+        "unresolved by identity alone"
+    );
+    assert!(alive(bgp), "left alone");
     // With the descendant recorded while the command ran (as the tracker of
     // a managed command does: PID and start time), it is the command's.
     record_descendant(&f, 0, bgp as u32);

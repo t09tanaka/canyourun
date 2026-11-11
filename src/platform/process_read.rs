@@ -70,7 +70,7 @@ pub enum GroupSignal {
 /// `/proc` every PID would look gone).
 pub fn classify_proc_stat(
     read: Result<&str, Option<i32>>,
-    proc_readable: impl Fn() -> bool,
+    proc_readable: &dyn Fn() -> bool,
 ) -> ProcessRead {
     match read {
         Ok(text) => parse_proc_stat(text),
@@ -248,8 +248,8 @@ mod tests {
 
     #[test]
     fn a_failed_proc_read_is_no_process_only_for_a_missing_entry_under_a_readable_proc() {
-        let yes = || true;
-        let no = || false;
+        let yes: &dyn Fn() -> bool = &|| true;
+        let no: &dyn Fn() -> bool = &|| false;
         assert_eq!(
             classify_proc_stat(Ok(LIVE), no),
             read(id("linux:987654"), 7)

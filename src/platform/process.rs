@@ -30,7 +30,7 @@ pub fn read_process(pid: u32) -> ProcessRead {
         let read = std::fs::read_to_string(format!("/proc/{pid}/stat"));
         super::process_read::classify_proc_stat(
             read.as_deref().map_err(std::io::Error::raw_os_error),
-            || std::fs::metadata("/proc/self/stat").is_ok(),
+            &|| std::fs::metadata("/proc/self/stat").is_ok(),
         )
     }
     #[cfg(target_os = "macos")]
@@ -159,33 +159,6 @@ mod tests {
             ))
         );
         assert_eq!(read.ppid, Some(info.pbi_ppid));
-    }
-
-    #[test]
-    fn a_zombie_keeps_the_identity_it_had_alive_until_it_is_reaped() {
-        // It ends by itself: nothing is signalled here.
-        let mut child = std::process::Command::new("sleep")
-            .arg("0.5")
-            .spawn()
-            .unwrap();
-        let pid = child.id();
-        let live = read_process(pid);
-        let Some(start) = live.start.identity().map(str::to_string) else {
-            panic!("the child could not be read: {live:?}");
-        };
-        assert_eq!(live.ppid, Some(std::process::id()));
-        let ended = std::time::Instant::now();
-        let zombie = loop {
-            let now = read_process(pid);
-            if now != live || ended.elapsed().as_secs() > 20 {
-                break now;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        };
-        assert_eq!(zombie.start, StartIdentity::Zombie(start));
-        assert_eq!(zombie.ppid, Some(std::process::id()));
-        child.wait().unwrap();
-        assert_eq!(process_start_identity(pid), StartIdentity::NoProcess);
     }
 
     #[test]

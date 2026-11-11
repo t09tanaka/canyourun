@@ -241,3 +241,35 @@ fn another_process_differs_and_a_dead_pid_is_no_process() {
         StartIdentity::NoProcess
     );
 }
+
+#[test]
+fn a_zombie_keeps_the_identity_it_had_alive_until_it_is_reaped() {
+    // It ends by itself: nothing is signalled here.
+    let mut child = Command::new("sleep").arg("0.5").spawn().unwrap();
+    let pid = child.id();
+    let live = platform::read_process(pid);
+    let Some(start) = live.start.identity().map(str::to_string) else {
+        panic!("the child could not be read: {live:?}");
+    };
+    assert_eq!(live.ppid, Some(std::process::id()));
+    let ended = std::time::Instant::now();
+    let zombie = loop {
+        let now = platform::read_process(pid);
+        if now != live || ended.elapsed() > Duration::from_secs(20) {
+            break now;
+        }
+        std::thread::sleep(Duration::from_millis(5));
+    };
+    assert_eq!(zombie.start, StartIdentity::Zombie(start.clone()));
+    assert_eq!(zombie.ppid, Some(std::process::id()));
+    // Still our child and still the same process: its identity is known.
+    assert_eq!(
+        Leader::from_read(&zombie, std::process::id()),
+        Leader::Known(start)
+    );
+    child.wait().unwrap();
+    assert_eq!(
+        platform::process_start_identity(pid),
+        StartIdentity::NoProcess
+    );
+}

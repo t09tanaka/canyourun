@@ -192,6 +192,25 @@ pub fn group_state(
     }
 }
 
+/// For a group that cannot be told to be the command's: whether a stop goes
+/// on looking (`Some(true)`: unproven members after a signal of that stop,
+/// which may be what is still ending of the group) or ends at once
+/// (`Some(false)`). `None` for a group that can be told.
+pub fn waits_for(state: GroupState, signalled: bool) -> Option<bool> {
+    match state {
+        GroupState::Alive | GroupState::Gone => None,
+        GroupState::Unproven => Some(signalled),
+        GroupState::Unknown => Some(false),
+    }
+}
+
+/// Whether a stop whose windows have passed leaves members that are known
+/// to be the command's (it could not be confirmed), judged by the last
+/// `state` seen. Otherwise what is left cannot be told to be the command's.
+pub fn stop_was_ours(state: GroupState) -> bool {
+    state == GroupState::Alive
+}
+
 /// Whether a process seen earlier as the command's (`recorded`: its start
 /// time then) proves that the group `pgid` holds a process of the command:
 /// it is in that group now (`group_now`) and, read after that, still has
@@ -498,6 +517,22 @@ mod tests {
                 (GroupState::Unknown, true, false)
             );
         }
+    }
+
+    #[test]
+    fn a_stop_waits_only_for_unproven_members_it_may_have_signalled() {
+        assert_eq!(waits_for(GroupState::Alive, false), None);
+        assert_eq!(waits_for(GroupState::Alive, true), None);
+        assert_eq!(waits_for(GroupState::Gone, false), None);
+        assert_eq!(waits_for(GroupState::Gone, true), None);
+        assert_eq!(waits_for(GroupState::Unproven, true), Some(true));
+        assert_eq!(waits_for(GroupState::Unproven, false), Some(false));
+        assert_eq!(waits_for(GroupState::Unknown, true), Some(false));
+        assert_eq!(waits_for(GroupState::Unknown, false), Some(false));
+        assert!(stop_was_ours(GroupState::Alive));
+        assert!(!stop_was_ours(GroupState::Unproven));
+        assert!(!stop_was_ours(GroupState::Unknown));
+        assert!(!stop_was_ours(GroupState::Gone));
     }
 
     #[test]

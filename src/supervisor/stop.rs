@@ -149,7 +149,7 @@ pub(crate) fn stop_group_on(os: &dyn Os, t: &StopTarget, times: StopTimes) -> St
     let mut signalled = false;
     loop {
         let state = group_state_on(os, t);
-        if waits_for(state, signalled) == Some(false) {
+        if identity::waits_for(state, signalled) == Some(false) {
             return StopResult::IdentityUnknown;
         }
         match esc.step(os.monotonic_ms(), state != GroupState::Gone) {
@@ -157,30 +157,12 @@ pub(crate) fn stop_group_on(os: &dyn Os, t: &StopTarget, times: StopTimes) -> St
             StopStep::Kill => signalled |= send(os, t, libc::SIGKILL),
             StopStep::Wait => {}
             StopStep::Confirmed => return StopResult::Confirmed,
-            StopStep::Unconfirmed => return unconfirmed(state),
+            StopStep::Unconfirmed if identity::stop_was_ours(state) => {
+                return StopResult::Unconfirmed
+            }
+            StopStep::Unconfirmed => return StopResult::IdentityUnknown,
         }
         os.pause(times.poll_ms.max(1));
-    }
-}
-
-/// For a group that cannot be told to be the command's: whether the stop
-/// goes on looking (`Some(true)`: unproven members after a signal of this
-/// stop) or ends at once (`Some(false)`). `None` for a group that can be
-/// told.
-fn waits_for(state: GroupState, signalled: bool) -> Option<bool> {
-    match state {
-        GroupState::Alive | GroupState::Gone => None,
-        GroupState::Unproven => Some(signalled),
-        GroupState::Unknown => Some(false),
-    }
-}
-
-/// What a stop whose windows have passed reports for the last `state` seen.
-fn unconfirmed(state: GroupState) -> StopResult {
-    if state == GroupState::Alive {
-        StopResult::Unconfirmed
-    } else {
-        StopResult::IdentityUnknown
     }
 }
 
@@ -564,27 +546,6 @@ mod tests {
         assert_eq!(stop_group_on(&os, &known(), times()), StopResult::Confirmed);
         assert_eq!(os.0.sent(), vec![(PGID, libc::SIGTERM)]);
         assert!(os.0.now.get() < 100);
-    }
-
-    #[test]
-    fn a_stop_waits_only_for_unproven_members_it_may_have_signalled() {
-        assert_eq!(waits_for(GroupState::Alive, false), None);
-        assert_eq!(waits_for(GroupState::Alive, true), None);
-        assert_eq!(waits_for(GroupState::Gone, false), None);
-        assert_eq!(waits_for(GroupState::Gone, true), None);
-        assert_eq!(waits_for(GroupState::Unproven, true), Some(true));
-        assert_eq!(waits_for(GroupState::Unproven, false), Some(false));
-        assert_eq!(waits_for(GroupState::Unknown, true), Some(false));
-        assert_eq!(waits_for(GroupState::Unknown, false), Some(false));
-        assert_eq!(unconfirmed(GroupState::Alive), StopResult::Unconfirmed);
-        assert_eq!(
-            unconfirmed(GroupState::Unproven),
-            StopResult::IdentityUnknown
-        );
-        assert_eq!(
-            unconfirmed(GroupState::Unknown),
-            StopResult::IdentityUnknown
-        );
     }
 
     #[test]
