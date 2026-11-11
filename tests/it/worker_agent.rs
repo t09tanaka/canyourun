@@ -379,6 +379,10 @@ impl Fx {
     fn supervisors(&self, a: &AttemptId) -> Vec<i32> {
         pgrep(&supervisor_pattern(a))
     }
+    /// The supervisors whose spec is under `dir`.
+    fn supervisors_under(&self, dir: &Path) -> Vec<i32> {
+        pgrep(&dir.to_string_lossy())
+    }
     /// SIGKILL the attempt's supervisors: each only while it still is the
     /// process the search found (its identity and command line are read
     /// again right before the signal).
@@ -2943,6 +2947,17 @@ impl Host for RealButCore {
     fn prepare(&self, a: &AcceptedAttempt, p: &AttemptPayload) -> Result<Workspace, ApiError> {
         self.0.prepare(a, p)
     }
+    fn setup_poll(
+        &self,
+        a: &AcceptedAttempt,
+        p: &AttemptPayload,
+        w: &Workspace,
+    ) -> Result<remote_task_runner::setup::builder::SetupPoll, ApiError> {
+        self.0.setup_poll(a, p, w)
+    }
+    fn setup_release(&self, a: &AttemptId) {
+        self.0.setup_release(a)
+    }
     fn secret_paths(&self, p: &AttemptPayload) -> Result<Option<Vec<String>>, ApiError> {
         self.0.secret_paths(p)
     }
@@ -3408,4 +3423,132 @@ async fn an_attempt_that_waited_too_long_for_its_setup_runs_every_command_itself
         .payload
         .to_string()
         .contains("not ready within 300"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_real_host_prepares_a_setup_once_and_two_attempts_use_it() {
+    use remote_task_runner::setup::builder::SetupConfig;
+    use remote_task_runner::source::{capture_for_run, CaptureParams, SourceRequest, SourceStore};
+    let f = fx();
+    let state = f.state();
+    let env: BTreeMap<String, String> = [
+        ("PATH", "/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin"),
+        ("HOME", f.path("home").to_str().unwrap()),
+        ("GIT_CONFIG_GLOBAL", "/dev/null"),
+        ("GIT_CONFIG_NOSYSTEM", "1"),
+    ]
+    .into_iter()
+    .map(|(k, v)| (k.to_string(), v.to_string()))
+    .collect();
+    std::fs::create_dir_all(f.path("home")).unwrap();
+    let plain = f.path("plain");
+    std::fs::create_dir_all(&plain).unwrap();
+    std::fs::write(plain.join("package.json"), "{}\n").unwrap();
+    let run = RunId::generate();
+    let store = SourceStore::open(&state).unwrap();
+    let captured = capture_for_run(
+        &env,
+        &store,
+        &run,
+        &SourceRequest::Directory { dir: plain.clone() },
+        &CaptureParams::default(),
+    )
+    .unwrap();
+    let machine = remote_task_runner::worker::machine::Machine::open(
+        &state,
+        env.clone(),
+        state.join("cluster.key"),
+    )
+    .unwrap();
+    let mut setup = SetupConfig::new(
+        state.clone(),
+        WorkerId::parse("w-test").unwrap(),
+        PathBuf::from(env!("CARGO_BIN_EXE_remote-task-runner")),
+    );
+    setup.poll_ms = 25;
+    setup.lease_ms = 3_000;
+    setup.term_grace_ms = 1_000;
+    setup.kill_wait_ms = 2_000;
+    setup.env = env;
+    let machine = machine.with_setup(setup).unwrap();
+    let setups = machine.setups().unwrap().clone();
+    let agent = Agent::start(f.cfg("boot-a"), Arc::new(RealButCore(machine))).unwrap();
+    f.agents.lock().unwrap().push(agent.clone());
+    let c = f.connect(&agent).await;
+
+    let (count, installed) = (f.path("count"), f.path("installed"));
+    let setup_spec = SetupSpec {
+        steps: vec![SetupStep {
+            id: "i1".into(),
+            dir: String::new(),
+            run: format!(
+                "echo x >> {}; mkdir -p node_modules; echo dep > node_modules/f; sleep 1",
+                count.display()
+            ),
+            shell: None,
+            env: BTreeMap::new(),
+            unresolved_env: vec![],
+        }],
+        toolchain: vec![],
+        scope: ReuseScope::Persistent,
+        freshness_secs: None,
+        secrets: vec![],
+        no_cache: false,
+        step_timeout_ms: None,
+    };
+    let make = |out: &Path| {
+        let mut p = payload("true");
+        p.run_id = run.clone();
+        p.source_id = captured.manifest.source_id.clone();
+        let digest = &captured.manifest.manifest_digest;
+        p.manifest_digest = Digest::parse(digest)
+            .or_else(|_| Digest::parse(&format!("sha256:{digest}")))
+            .unwrap();
+        let mut install = command(
+            "install",
+            &format!("echo ran >> {}", installed.display()),
+            &[],
+        );
+        install.setup_step = Some("i1".into());
+        let test = command(
+            "test",
+            &format!("cat node_modules/f > {}", out.display()),
+            &["install"],
+        );
+        p.commands = vec![install, test];
+        p.setup = Some(setup_spec.clone());
+        p
+    };
+    let (out_a, out_b) = (f.path("out_a"), f.path("out_b"));
+    let (a, b) = (AttemptId::generate(), AttemptId::generate());
+    submit(&c, &a, &make(&out_a)).await;
+    let mut pb = make(&out_b);
+    pb.task_id = TaskId::generate();
+    submit(&c, &b, &pb).await;
+    assert_eq!(f.wait_terminal(&a), Outcome::Succeeded);
+    assert_eq!(f.wait_terminal(&b), Outcome::Succeeded);
+    // built once, copied into both workspaces; the install command did not run
+    assert_eq!(setups.builds_started(), 1);
+    assert_eq!(lines(&count), 1);
+    assert_eq!(lines(&installed), 0);
+    assert_eq!(std::fs::read_to_string(&out_a).unwrap(), "dep\n");
+    assert_eq!(std::fs::read_to_string(&out_b).unwrap(), "dep\n");
+    for x in [&a, &b] {
+        let launched: Vec<String> = f
+            .store()
+            .launches(x)
+            .unwrap()
+            .into_iter()
+            .map(|l| l.0.to_string())
+            .collect();
+        assert_eq!(launched, ["test"]);
+    }
+    // nothing of the builder is left: its workspace and directory are gone
+    wait_for("the builder to be removed", || {
+        std::fs::read_dir(state.join("setup/builders")).map_or(true, |rd| rd.count() == 0)
+    });
+    wait_for("the workspaces to go", || {
+        std::fs::read_dir(state.join("workspaces")).map_or(true, |rd| rd.count() == 0)
+    });
+    assert!(f.supervisors_under(&state.join("setup")).is_empty());
 }

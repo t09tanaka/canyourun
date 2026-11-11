@@ -235,6 +235,44 @@ impl Fx {
         std::fs::read_dir(self.builders()).map_or(0, |rd| rd.count())
     }
 
+    /// The supervisor has recorded the process of the builder's step (it
+    /// can be told from any other process after that).
+    fn launch_recorded(&self) -> bool {
+        use remote_task_runner::storage::WorkerStore;
+        let Some(dir) = std::fs::read_dir(self.builders())
+            .ok()
+            .and_then(|mut rd| rd.next())
+            .and_then(|e| e.ok())
+            .map(|e| e.path())
+        else {
+            return false;
+        };
+        let Ok(meta) = std::fs::read(dir.join("meta.json")) else {
+            return false;
+        };
+        let meta: serde_json::Value = serde_json::from_slice(&meta).unwrap();
+        let attempt = AttemptId::parse(meta["attempt_id"].as_str().unwrap()).unwrap();
+        let Ok(store) = WorkerStore::open_read_only(&dir) else {
+            return false;
+        };
+        store
+            .launches(&attempt)
+            .is_ok_and(|l| l.iter().any(|(_, _, ident)| ident.is_some()))
+    }
+
+    /// A step that never ends: `bash <dir>/hang.sh`, whose command line
+    /// names this fixture's directory, so that it is found (and killed by
+    /// the fixture's cleanup) and never taken for another test's.
+    fn hang(&self) -> String {
+        let path = self.path("hang.sh");
+        std::fs::write(&path, "while :; do sleep 1; done\n").unwrap();
+        format!("exec bash {}", path.display())
+    }
+
+    fn hanging(&self) -> bool {
+        !gone(&self.path("hang.sh").to_string_lossy())
+    }
+
     fn supervisors(&self) -> Vec<i32> {
         pgrep(&self.builders().to_string_lossy())
     }
@@ -308,9 +346,10 @@ fn a_builder_that_dies_releases_its_waiters_and_a_later_attempt_rebuilds() {
     let (flag, started) = (f.path("flag"), f.path("started"));
     let run = format!(
         "if [ -e {flag} ]; then mkdir -p node_modules; echo ok > node_modules/x; \
-         else touch {flag}; echo go > {started}; exec sleep 600.21; fi",
+         else touch {flag}; echo go > {started}; {hang}; fi",
         flag = flag.display(),
-        started = started.display()
+        started = started.display(),
+        hang = f.hang()
     );
     let s = spec(vec![step("i1", &run)]);
     let p = f.payload(&s);
@@ -319,6 +358,7 @@ fn a_builder_that_dies_releases_its_waiters_and_a_later_attempt_rebuilds() {
     assert_eq!(f.poll(&a, &p, &wa), SetupPoll::Pending);
     assert_eq!(f.poll(&b, &p, &wb), SetupPoll::Pending);
     wait_for("the step to run", || started.exists());
+    wait_for("its process to be recorded", || f.launch_recorded());
     // the supervisor dies, as if killed
     let pids = f.supervisors();
     assert!(!pids.is_empty());
@@ -336,7 +376,7 @@ fn a_builder_that_dies_releases_its_waiters_and_a_later_attempt_rebuilds() {
     }
     assert!(f.template_dirs().is_empty());
     // the step it started does not run on
-    wait_for("the step to be stopped", || gone("sleep 600.21"));
+    wait_for("the step to be stopped", || !f.hanging());
     wait_for("the builder to be removed", || f.builder_dirs() == 0);
     // a later attempt starts a builder of its own, which succeeds now
     let (c, wc) = f.consumer();
@@ -365,14 +405,14 @@ fn a_failed_builder_tells_what_happened_and_nothing_is_kept() {
 #[test]
 fn a_builder_that_times_out_is_stopped() {
     let f = fx();
-    let mut s = spec(vec![step("i1", "exec sleep 600.23")]);
+    let mut s = spec(vec![step("i1", &f.hang())]);
     s.step_timeout_ms = Some(1_000);
     let p = f.payload(&s);
     let (a, wa) = f.consumer();
     let (skip, note) = f.done(&a, &p, &wa);
     assert!(skip.is_empty());
     assert!(note.unwrap().contains("timed out"));
-    wait_for("the step to be stopped", || gone("sleep 600.23"));
+    wait_for("the step to be stopped", || !f.hanging());
     assert!(f.template_dirs().is_empty());
 }
 
@@ -404,8 +444,9 @@ fn the_last_consumer_that_leaves_stops_the_builder() {
     let s = spec(vec![step(
         "i1",
         &format!(
-            "mkdir -p node_modules; echo go > {}; exec sleep 600.22",
-            started.display()
+            "mkdir -p node_modules; echo go > {}; {}",
+            started.display(),
+            f.hang()
         ),
     )]);
     let p = f.payload(&s);
@@ -413,7 +454,7 @@ fn the_last_consumer_that_leaves_stops_the_builder() {
     assert_eq!(f.poll(&a, &p, &wa), SetupPoll::Pending);
     wait_for("the step to run", || started.exists());
     f.setups.release(&a);
-    wait_for("the step to be stopped", || gone("sleep 600.22"));
+    wait_for("the step to be stopped", || !f.hanging());
     wait_for("the builder to be removed", || f.builder_dirs() == 0);
     assert!(f.supervisors().is_empty());
     assert!(f.template_dirs().is_empty());
@@ -425,7 +466,7 @@ fn the_last_consumer_that_leaves_stops_the_builder() {
     assert_eq!(f.poll(&b, &p, &wb), SetupPoll::Pending);
     assert_eq!(f.setups.builds_started(), 2);
     f.setups.release(&b);
-    wait_for("the second builder to be stopped", || gone("sleep 600.22"));
+    wait_for("the second builder to be stopped", || !f.hanging());
 }
 
 #[test]
@@ -434,7 +475,7 @@ fn a_new_consumer_does_not_join_a_builder_that_is_being_stopped() {
     let started = f.path("started");
     let s = spec(vec![step(
         "i1",
-        &format!("echo go >> {}; exec sleep 600.24", started.display()),
+        &format!("echo go >> {}; {}", started.display(), f.hang()),
     )]);
     let p = f.payload(&s);
     let (a, wa) = f.consumer();
@@ -445,7 +486,7 @@ fn a_new_consumer_does_not_join_a_builder_that_is_being_stopped() {
     assert_eq!(f.poll(&b, &p, &wb), SetupPoll::Pending);
     assert_eq!(f.setups.builds_started(), 2);
     f.setups.release(&b);
-    wait_for("both builders to be stopped", || gone("sleep 600.24"));
+    wait_for("both builders to be stopped", || !f.hanging());
 }
 
 #[test]
@@ -752,7 +793,7 @@ fn a_builder_still_alive_at_the_start_is_stopped_and_its_workspace_kept_meanwhil
     let started = f.path("started");
     let s = spec(vec![step(
         "i1",
-        &format!("echo go > {}; exec sleep 600.25", started.display()),
+        &format!("echo go > {}; {}", started.display(), f.hang()),
     )]);
     let p = f.payload(&s);
     let (a, wa) = f.consumer();
@@ -762,10 +803,20 @@ fn a_builder_still_alive_at_the_start_is_stopped_and_its_workspace_kept_meanwhil
     let again = Setups::open(cfg(f.dir.path()), f.ws.clone()).unwrap();
     let left = again.unsettled();
     assert_eq!(left.len(), 1);
+    // the references of the builder are on disk
+    let bdir = std::fs::read_dir(f.builders())
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let refs: Vec<String> =
+        serde_json::from_slice(&std::fs::read(bdir.join("consumers.json")).unwrap()).unwrap();
+    assert_eq!(refs, [a.to_string()]);
     assert!(again.owns_workspace(&left[0]));
     // the supervisor was asked to stop; its builder (the first Setups) sees
     // it end and clears up
-    wait_for("the step to be stopped", || gone("sleep 600.25"));
+    wait_for("the step to be stopped", || !f.hanging());
     let (skip, note) = f.done(&a, &p, &wa);
     assert!(skip.is_empty() && note.is_some());
     wait_for("the builder to be removed", || f.builder_dirs() == 0);
