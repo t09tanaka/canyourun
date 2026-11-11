@@ -12,6 +12,8 @@
 //! Everything here blocks (SQLite, files, child processes): [`super::serve`]
 //! calls it through `spawn_blocking`.
 
+use super::blob_policy::BlobLimits;
+use super::blobs;
 use super::host::Host;
 use super::policy::{self, AttemptFacts, Recovery, Settle, Step, SupervisorExit};
 use crate::error::{ApiError, ErrorCode};
@@ -100,6 +102,8 @@ pub struct AgentConfig {
     /// Journal entries of one attempt a `watch_events` reads; more is an
     /// error.
     pub max_event_scan: u32,
+    /// What a coordinator may send with `blob_put`.
+    pub blobs: BlobLimits,
 }
 
 impl AgentConfig {
@@ -136,6 +140,7 @@ impl AgentConfig {
             max_spawn_failures: policy::DEFAULT_MAX_SPAWN_FAILURES,
             max_list_attempts: policy::MAX_LIST_ATTEMPTS,
             max_event_scan: policy::MAX_EVENT_SCAN,
+            blobs: BlobLimits::default(),
         }
     }
 
@@ -1402,15 +1407,21 @@ impl Agent {
             Request::GetResult(r) => self.result(r).map(Response::GetResult),
             Request::AckCollected(r) => self.ack(session, r).map(Response::AckCollected),
             Request::SecretBundlePut(r) => self.secrets(r).map(Response::SecretBundlePut),
-            Request::Forecast(_)
-            | Request::BlobPut(_)
-            | Request::BlobGet(_)
-            | Request::BlobVerify(_)
-            | Request::EnvReport(_)
-            | Request::EnvSync(_) => Err(ApiError::new(
-                ErrorCode::NotImplemented,
-                "this operation is not implemented by the worker agent yet",
-            )),
+            Request::BlobPut(r) => blobs::put(&self.store, self.host.as_ref(), &self.cfg.blobs, &r)
+                .map(Response::BlobPut),
+            Request::BlobVerify(r) => {
+                blobs::verify(self.host.as_ref(), &self.cfg.blobs, &r).map(Response::BlobVerify)
+            }
+            Request::BlobGet(r) => {
+                self.known(&r.attempt_id)?;
+                blobs::get(&self.store, &self.cfg.attempts_root(), &r).map(Response::BlobGet)
+            }
+            Request::Forecast(_) | Request::EnvReport(_) | Request::EnvSync(_) => {
+                Err(ApiError::new(
+                    ErrorCode::NotImplemented,
+                    "this operation is not implemented by the worker agent yet",
+                ))
+            }
         }
     }
 

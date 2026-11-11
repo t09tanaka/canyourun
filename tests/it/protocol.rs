@@ -281,6 +281,7 @@ async fn a_request_over_the_frame_limit_is_refused_before_sending() {
         request_id: RequestId::generate(),
         coordinator_epoch: CoordinatorEpoch(1),
         source_id: SourceId::generate(),
+        kind: SourceBlobKind::Content,
         digest: Digest::of_bytes(b""),
         total_size: 0,
         offset: 0,
@@ -302,6 +303,7 @@ fn blob_item(i: u32) -> Outgoing {
         request_id: RequestId::generate(),
         coordinator_epoch: CoordinatorEpoch(1),
         source_id: SourceId::generate(),
+        kind: SourceBlobKind::Content,
         digest: Digest::of_bytes(b""),
         total_size: 0,
         offset: 0,
@@ -492,6 +494,7 @@ async fn a_blob_with_the_wrong_digest_is_refused_and_not_completed() {
         request_id: RequestId::generate(),
         coordinator_epoch: CoordinatorEpoch(1),
         source_id: SourceId::generate(),
+        kind: SourceBlobKind::Content,
         digest: Digest::of_bytes(b"not these bytes"),
         total_size: 64,
         offset: 0,
@@ -531,12 +534,22 @@ async fn a_blob_download_resumes_from_a_verified_prefix_and_checks_the_digest() 
             _ => None,
         }),
     );
-    let whole = get_blob(&conn.client, &digest, vec![], 700, 1 << 20, Some(5000), T)
-        .await
-        .unwrap();
+    let whole = get_blob(
+        &conn.client,
+        &AttemptId::generate(),
+        &digest,
+        vec![],
+        700,
+        1 << 20,
+        Some(5000),
+        T,
+    )
+    .await
+    .unwrap();
     assert_eq!(whole, *data);
     let resumed = get_blob(
         &conn.client,
+        &AttemptId::generate(),
         &digest,
         data[..1234].to_vec(),
         700,
@@ -550,9 +563,18 @@ async fn a_blob_download_resumes_from_a_verified_prefix_and_checks_the_digest() 
     // A prefix that is not the start of this blob fails the digest check.
     let mut bad = data[..1234].to_vec();
     bad[0] ^= 1;
-    let err = get_blob(&conn.client, &digest, bad, 700, 1 << 20, None, T)
-        .await
-        .unwrap_err();
+    let err = get_blob(
+        &conn.client,
+        &AttemptId::generate(),
+        &digest,
+        bad,
+        700,
+        1 << 20,
+        None,
+        T,
+    )
+    .await
+    .unwrap_err();
     assert!(matches!(err, TransferError::Chunk(_)), "{err:?}");
 }
 
@@ -649,6 +671,7 @@ fn blob_get_request() -> Request {
     Request::BlobGet(BlobGetRequest {
         schema_version: SchemaVersion::CURRENT,
         request_id: RequestId::generate(),
+        attempt_id: AttemptId::generate(),
         digest: Digest::of_bytes(b"x"),
         offset: 0,
         max_bytes: 1,
@@ -661,6 +684,7 @@ fn blob_put_request(bytes: usize) -> Request {
         request_id: RequestId::generate(),
         coordinator_epoch: CoordinatorEpoch(1),
         source_id: SourceId::generate(),
+        kind: SourceBlobKind::Content,
         digest: Digest::of_bytes(b"x"),
         total_size: bytes as u64,
         offset: 0,
@@ -916,9 +940,18 @@ async fn a_blob_larger_than_allowed_is_refused_before_anything_is_kept() {
     for announced in [(1u64 << 20) + 1, u64::MAX] {
         let (conn, srv) = pair(&cluster).await;
         serve(srv.incoming, lying_size_worker(vec![announced]));
-        let err = get_blob(&conn.client, &digest, vec![], 100, 1 << 20, None, T)
-            .await
-            .unwrap_err();
+        let err = get_blob(
+            &conn.client,
+            &AttemptId::generate(),
+            &digest,
+            vec![],
+            100,
+            1 << 20,
+            None,
+            T,
+        )
+        .await
+        .unwrap_err();
         assert!(
             matches!(err, TransferError::TooLarge { total, max } if total == announced && max == 1 << 20),
             "{err:?}"
@@ -932,9 +965,18 @@ async fn a_blob_whose_size_differs_from_the_expected_one_or_changes_is_refused()
     let digest = Digest::of_bytes(b"whatever");
     let (conn, srv) = pair(&cluster).await;
     serve(srv.incoming, lying_size_worker(vec![5000]));
-    let err = get_blob(&conn.client, &digest, vec![], 100, 1 << 20, Some(4000), T)
-        .await
-        .unwrap_err();
+    let err = get_blob(
+        &conn.client,
+        &AttemptId::generate(),
+        &digest,
+        vec![],
+        100,
+        1 << 20,
+        Some(4000),
+        T,
+    )
+    .await
+    .unwrap_err();
     assert!(
         matches!(
             err,
@@ -948,9 +990,18 @@ async fn a_blob_whose_size_differs_from_the_expected_one_or_changes_is_refused()
     // A size that moves between rounds cannot be trusted either.
     let (conn, srv) = pair(&cluster).await;
     serve(srv.incoming, lying_size_worker(vec![5000, 6000]));
-    let err = get_blob(&conn.client, &digest, vec![], 100, 1 << 20, None, T)
-        .await
-        .unwrap_err();
+    let err = get_blob(
+        &conn.client,
+        &AttemptId::generate(),
+        &digest,
+        vec![],
+        100,
+        1 << 20,
+        None,
+        T,
+    )
+    .await
+    .unwrap_err();
     assert!(matches!(err, TransferError::Unexpected(_)), "{err:?}");
 }
 

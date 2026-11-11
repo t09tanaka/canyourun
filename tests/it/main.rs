@@ -14,4 +14,5 @@ mod source_capture;
 mod stop;
 mod supervisor;
 mod worker_agent;
+mod worker_blobs;
 mod workspace;

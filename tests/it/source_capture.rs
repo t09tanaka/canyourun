@@ -609,8 +609,12 @@ fn send(f: &Fixture, from: &SourceStore, to: &Recv, ci_id: &str) {
     }
     if plan.bundle {
         let m = from.manifest(ci_id).unwrap().unwrap();
-        let bundle = from.export_bundle(&ExecContext::new(f.env()), &m).unwrap();
-        to.objects.receive_bundle(&bundle, &m).unwrap();
+        let bundle = from
+            .export_bundle(&ExecContext::new(f.env()), &m, &[])
+            .unwrap();
+        to.objects
+            .receive_bundle(&bundle, &m, &from.dirty_below(&m).unwrap())
+            .unwrap();
     }
     let ms: Vec<_> = plan
         .manifests
@@ -855,7 +859,7 @@ fn a14_unpushed_commits_travel_in_a_bundle_and_a_worker_never_fetches_origin() {
     );
     let ci = a.manifest(&m.ci_source_id).unwrap().unwrap();
     let ctx = ExecContext::new(f.env());
-    let bundle = a.export_bundle(&ctx, &ci).unwrap();
+    let bundle = a.export_bundle(&ctx, &ci, &[]).unwrap();
 
     // the worker's clone has only what origin has
     git(
@@ -881,7 +885,9 @@ fn a14_unpushed_commits_travel_in_a_bundle_and_a_worker_never_fetches_origin() {
     git(&elsewhere, &["push", "-q", "origin", "main"]);
     // (the worker's clone is not told: nothing below fetches)
     let objects = ObjectsRepo::new(f.env(), worker.clone());
-    objects.receive_bundle(&bundle, &ci).unwrap();
+    objects
+        .receive_bundle(&bundle, &ci, &a.dirty_below(&ci).unwrap())
+        .unwrap();
     let exec = m.execution_commit.clone().unwrap();
     assert!(objects.has_commit(&exec));
     assert!(
@@ -993,8 +999,13 @@ fn a_submodule_capture_that_has_not_arrived_blocks_publication() {
             .unwrap();
     }
     // the bundle (the commits) came, the submodule's capture did not
-    let bundle = a.export_bundle(&ExecContext::new(f.env()), &ci).unwrap();
-    other.objects.receive_bundle(&bundle, &ci).unwrap();
+    let bundle = a
+        .export_bundle(&ExecContext::new(f.env()), &ci, &[])
+        .unwrap();
+    other
+        .objects
+        .receive_bundle(&bundle, &ci, &a.dirty_below(&ci).unwrap())
+        .unwrap();
     let err = b.publish_received(&ci, Some(&other.objects)).unwrap_err();
     assert!(err.to_string().contains("submodule"), "{err}");
     assert!(b.manifest(&ci.source_id).unwrap().is_none());

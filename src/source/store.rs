@@ -3,14 +3,14 @@
 //! (the per-run record, difference planning, and verified receiving).
 
 use super::classify::source_id_of_ci;
-use super::commit::run as git_run;
+use super::commit::{run as git_run, says as git_says};
 use super::diff::{check_blob, is_blob_hash, missing_blobs, BlobWant};
 use super::safety::{check_entries, check_rel_path};
 use crate::ids::RunId;
 use anyhow::{bail, Context, Result};
 use local_ci::source::{
-    export_from, import_objects, materialize_from, seal_manifest, ObjectStore, SourceError,
-    SourceKind, SourceManifest as CiManifest, SCHEMA_VERSION,
+    export_with_basis, import_objects_for, materialize_from, seal_manifest, ObjectStore,
+    SourceError, SourceKind, SourceManifest as CiManifest, MAX_HAVE, SCHEMA_VERSION,
 };
 use local_ci::ExecContext;
 use serde::{Deserialize, Serialize};
@@ -70,14 +70,31 @@ impl Inventory for Peer<'_> {
     }
 }
 
+/// Where the commit of a source is kept (local-ci's names).
+const SNAPSHOTS: &str = "refs/local-ci/snapshots/";
+/// Where the commit around the index tree of a source is kept.
+const INDEXES: &str = "refs/local-ci/index/";
+
+/// A ref an import of a bundle sets.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ImportRef {
+    pub name: String,
+    /// The source whose snapshot it is (`None`: the index ref).
+    pub snapshot_of: Option<String>,
+    /// The commit a manifest names for it (`None`: the index ref, which no
+    /// manifest names by its commit).
+    pub commit: Option<String>,
+}
+
 fn is_hex40(s: &str) -> bool {
     s.len() == 40 && s.bytes().all(|c| matches!(c, b'0'..=b'9' | b'a'..=b'f'))
 }
 
 /// The Git repository on the receiving side that holds the objects of the
-/// sources it received: the worker's canonical clone of the repository. It has
-/// to have the merge base already (a bundle never carries it; nothing is
-/// fetched from the network).
+/// sources it received: the worker's canonical clone of the repository.
+/// Nothing is fetched from the network: a bundle brings the history the
+/// clone lacks, and what it is built on has to be in the clone already (the
+/// first one is built on nothing).
 #[derive(Debug, Clone)]
 pub struct ObjectsRepo {
     env: BTreeMap<String, String>,
@@ -103,49 +120,222 @@ impl ObjectsRepo {
             .is_ok()
     }
 
-    /// Unpack the bundle of `m` into the repository, and check that the
-    /// execution commit is there with the recorded tree (local-ci's
-    /// `import_objects`; the manifest is verified first).
-    pub fn receive_bundle(&self, bundle: &Path, m: &CiManifest) -> Result<()> {
+    /// Unpack the bundle of `m` into the repository, and check what it
+    /// brought against the manifests (local-ci's `import_objects_for`; the
+    /// manifests are verified first). `nested` holds the manifests of the
+    /// dirty submodules below `m`, at every depth, and no other: the
+    /// snapshot ref of each must be the commit its manifest names, with the
+    /// tree it names, and the gitlinks at every level must agree. The store
+    /// of this host is not asked, so a receiver that has published none of
+    /// them yet checks the same as one that has.
+    ///
+    /// A bundle that is refused leaves no ref behind that was not there.
+    /// Imports into one repository must not run at once: the caller holds
+    /// the repository's import lock (`Workspaces::import_lock`).
+    pub fn receive_bundle(
+        &self,
+        bundle: &Path,
+        m: &CiManifest,
+        nested: &[CiManifest],
+    ) -> Result<()> {
         verify_manifest(m)?;
-        import_objects(&ExecContext::new(self.env.clone()), &self.dir, bundle, m)?;
+        for n in nested {
+            verify_manifest(n)?;
+        }
+        import_objects_for(
+            &ExecContext::new(self.env.clone()),
+            &self.dir,
+            bundle,
+            m,
+            nested,
+        )?;
         Ok(())
     }
 
     /// The execution commit of `m` is reachable from the snapshot ref the
     /// bundle was unpacked under, and has the recorded tree.
-    fn check_reachable(&self, m: &CiManifest) -> Result<()> {
+    pub fn check_reachable(&self, m: &CiManifest) -> Result<()> {
         let Some(commit) = &m.execution_commit else {
             return Ok(());
         };
+        self.check_snapshot(&m.source_id, commit, m.worktree_tree.as_deref())
+    }
+
+    /// [`Self::check_reachable`] from the three things it reads of a manifest.
+    ///
+    /// The error is a [`SourceError::Corrupt`] when the answer is "no" (the
+    /// commit or the ref is not here, the one is not below the other, the
+    /// tree is another). A Git that could not be asked is another error.
+    pub fn check_snapshot(
+        &self,
+        ci_source_id: &str,
+        commit: &str,
+        tree: Option<&str>,
+    ) -> Result<()> {
         if !is_hex40(commit) {
             return Err(corrupt(format!("not a commit id: {commit:?}")));
         }
-        let r = format!("refs/local-ci/snapshots/{}", m.source_id);
-        git_run(
+        if source_id_of_ci(ci_source_id).is_none() {
+            return Err(corrupt(format!("not a source id: {ci_source_id:?}")));
+        }
+        let r = format!("{SNAPSHOTS}{ci_source_id}");
+        let unreachable = || {
+            corrupt(format!(
+                "{ci_source_id}: the execution commit {commit} is not reachable in the receiving objects"
+            ))
+        };
+        // Is the commit here, is the ref here, is the one below the other:
+        // each a question Git answers with 0 or 1. Whatever else Git fails
+        // with says nothing about the source.
+        for rev in [commit, r.as_str()] {
+            if self.ref_value(&format!("{rev}^{{commit}}"))?.is_none() {
+                return Err(unreachable());
+            }
+        }
+        let below = git_says(
             &self.env,
             &self.dir,
             &["merge-base", "--is-ancestor", commit, &r],
-        )
-        .map_err(|e| {
-            corrupt(format!(
-                "{}: the execution commit {commit} is not reachable in the receiving objects ({e:#})",
-                m.source_id
-            ))
-        })?;
-        if let Some(tree) = &m.worktree_tree {
+        )?;
+        if below.is_none() {
+            return Err(unreachable());
+        }
+        if let Some(tree) = tree {
             let got = git_run(
                 &self.env,
                 &self.dir,
                 &["rev-parse", &format!("{commit}^{{tree}}")],
             )?;
-            if &got != tree {
+            if got != tree {
                 return Err(corrupt(format!(
                     "commit {commit} has tree {got}, the manifest says {tree}"
                 )));
             }
         }
         Ok(())
+    }
+
+    /// The refs an import of the bundle of `m` sets (see
+    /// [`Self::receive_bundle`]): the snapshot of `m`, those of `nested`,
+    /// and the index ref when `m` has an index tree.
+    pub fn import_refs(m: &CiManifest, nested: &[CiManifest]) -> Vec<ImportRef> {
+        let mut out: Vec<ImportRef> = vec![];
+        for n in std::iter::once(m).chain(nested) {
+            if out
+                .iter()
+                .all(|r| r.snapshot_of.as_deref() != Some(&n.source_id))
+            {
+                out.push(ImportRef {
+                    name: format!("{SNAPSHOTS}{}", n.source_id),
+                    snapshot_of: Some(n.source_id.clone()),
+                    commit: n.execution_commit.clone(),
+                });
+            }
+        }
+        if m.index_tree.is_some() {
+            out.push(ImportRef {
+                name: format!("{INDEXES}{}", m.source_id),
+                snapshot_of: None,
+                commit: None,
+            });
+        }
+        out
+    }
+
+    /// The commit `rev` names, `None` when it names none here. A Git that
+    /// could not be asked is an error.
+    pub fn ref_value(&self, rev: &str) -> Result<Option<String>> {
+        git_says(
+            &self.env,
+            &self.dir,
+            &["rev-parse", "--verify", "--quiet", rev],
+        )
+    }
+
+    /// Remove the ref `name`, and only while it is at `commit`.
+    pub fn drop_ref(&self, name: &str, commit: &str) -> Result<()> {
+        git_run(&self.env, &self.dir, &["update-ref", "-d", name, commit]).map(|_| ())
+    }
+
+    /// The snapshots this repository holds: the source id of each snapshot
+    /// ref, its tip, and the committer time of the tip's first parent (the
+    /// commit the capture was made on; 0 when there is none). At most
+    /// `limit` refs are read. The tip itself says nothing about when: a
+    /// snapshot commit has a fixed date.
+    pub fn snapshot_tips(&self, limit: usize) -> Result<Vec<(String, String, u64)>> {
+        let out = git_run(
+            &self.env,
+            &self.dir,
+            &[
+                "for-each-ref",
+                &format!("--count={limit}"),
+                "--format=%(refname) %(objectname) %(parent)",
+                SNAPSHOTS,
+            ],
+        )?;
+        let mut tips = vec![];
+        for line in out.lines() {
+            let mut words = line.split(' ');
+            let (Some(name), Some(tip)) = (words.next(), words.next()) else {
+                continue;
+            };
+            let Some(id) = name.strip_prefix(SNAPSHOTS) else {
+                continue;
+            };
+            if !is_hex40(tip) {
+                continue;
+            }
+            let parent = words.next().filter(|p| is_hex40(p)).map(str::to_string);
+            tips.push((id.to_string(), tip.to_string(), parent));
+        }
+        let parents: BTreeSet<&str> = tips.iter().filter_map(|t| t.2.as_deref()).collect();
+        let mut when: BTreeMap<String, u64> = BTreeMap::new();
+        if !parents.is_empty() {
+            let mut args = vec!["log", "--no-walk=unsorted", "--format=%H %ct"];
+            args.extend(parents.iter().copied());
+            for line in git_run(&self.env, &self.dir, &args)?.lines() {
+                if let Some((sha, ct)) = line.split_once(' ') {
+                    when.insert(sha.to_string(), ct.trim().parse().unwrap_or(0));
+                }
+            }
+        }
+        Ok(tips
+            .into_iter()
+            .map(|(id, tip, parent)| {
+                let at = parent.and_then(|p| when.get(&p).copied()).unwrap_or(0);
+                (id, tip, at)
+            })
+            .collect())
+    }
+
+    /// Does a bundle with these prerequisites fit this repository: is every
+    /// one of them here, with its whole history, below a ref? (What `git
+    /// bundle verify` asks, apart from the bundle itself.)
+    pub fn holds_base(&self, prerequisites: &[String]) -> bool {
+        if prerequisites.is_empty() {
+            return true;
+        }
+        if prerequisites.iter().any(|p| !is_hex40(p)) {
+            return false;
+        }
+        let mut args = vec!["rev-list", "-n", "1"];
+        args.extend(prerequisites.iter().map(String::as_str));
+        args.extend(["--not", "--all"]);
+        matches!(git_run(&self.env, &self.dir, &args), Ok(out) if out.is_empty())
+    }
+}
+
+/// Bundle files one source keeps in the store at a time (one for each set
+/// of commits a peer said it has). The oldest make room.
+pub const MAX_BUNDLES_PER_SOURCE: usize = 4;
+
+/// Remove a file; one that is gone already (another process removed it) is
+/// not an error. Returns whether this call removed it.
+fn remove_if_there(p: &Path) -> Result<bool> {
+    match std::fs::remove_file(p) {
+        Ok(()) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e.into()),
     }
 }
 
@@ -166,6 +356,17 @@ impl SourceStore {
     /// Is the blob in the store? (Only a well-formed hash can be.)
     pub fn has_blob(&self, hash: &str) -> bool {
         is_blob_hash(hash) && self.inner.has(hash)
+    }
+
+    /// The bytes the store holds under the hash, when it holds the blob.
+    pub fn blob_size(&self, hash: &str) -> Option<u64> {
+        if !is_blob_hash(hash) {
+            return None;
+        }
+        std::fs::metadata(self.inner.object_path(hash))
+            .ok()
+            .filter(|m| m.is_file())
+            .map(|m| m.len())
     }
 
     pub fn object_store(&self) -> &ObjectStore {
@@ -347,6 +548,22 @@ impl SourceStore {
         Ok(())
     }
 
+    /// One step of [`Self::publish_received_all`], for a caller that holds
+    /// one manifest at a time: `carried` says whether the bundle carries the
+    /// commit of `m` (the requested source, or a dirty submodule's capture).
+    pub fn publish_received_one(
+        &self,
+        m: &CiManifest,
+        carried: bool,
+        objects: Option<&ObjectsRepo>,
+    ) -> Result<()> {
+        if carried {
+            self.publish_received(m, objects)
+        } else {
+            self.publish_checked(m)
+        }
+    }
+
     fn publish_checked(&self, m: &CiManifest) -> Result<()> {
         verify_manifest(m)?;
         for e in &m.object_manifest.entries {
@@ -422,11 +639,139 @@ impl SourceStore {
         Ok(())
     }
 
-    /// The `git bundle` that carries the Git objects of `m` (the synthetic
-    /// commit, the unpushed history below it down to the merge base, and
-    /// dirty submodules' commits). A worker never fetches these from origin.
-    pub fn export_bundle(&self, ctx: &ExecContext, m: &CiManifest) -> Result<PathBuf> {
-        export_from(ctx, &self.inner, m)
+    /// The manifests of the dirty submodules below `m`, at every depth, each
+    /// once: what goes with `m` into [`ObjectsRepo::receive_bundle`].
+    pub fn dirty_below(&self, m: &CiManifest) -> Result<Vec<CiManifest>> {
+        let mut out: Vec<CiManifest> = vec![];
+        let mut seen = BTreeSet::new();
+        let mut todo = vec![m.submodules.clone()];
+        while let Some(subs) = todo.pop() {
+            for s in subs.iter().filter(|s| s.dirty) {
+                let Some(id) = &s.source_id else { continue };
+                if !seen.insert(id.clone()) {
+                    continue;
+                }
+                let nested = self.inner.load_manifest(id)?.with_context(|| {
+                    format!(
+                        "submodule {}: manifest {id} is not in the store",
+                        s.path.display()
+                    )
+                })?;
+                verify_manifest(&nested)?;
+                todo.push(nested.submodules.clone());
+                out.push(nested);
+            }
+        }
+        Ok(out)
+    }
+
+    /// The `git bundle` that carries the Git objects of `m` to a peer that
+    /// holds the commits `have` with their whole history (what a worker said
+    /// of its clone; see `blob_verify`): the execution commit, the commit
+    /// around the index tree, the commits of dirty submodules at every
+    /// depth, and all the history below them that is not below a commit of
+    /// `have` (local-ci's `export_with_basis`). With an empty `have` that is
+    /// the whole history: the peer never fetches from origin, so nothing is
+    /// left for it to find elsewhere.
+    ///
+    /// `have` comes from the peer and only makes the bundle smaller: an
+    /// entry that is not a commit id is left out, as are those after the
+    /// first 256, and a commit this store does not know cuts nothing.
+    ///
+    /// The bundle always names every ref the peer will ask it for (a ref
+    /// that a commit of `have` covers is kept by cutting at its parents, or
+    /// in the end by sending the whole history).
+    ///
+    /// Each distinct set of `have` is one file under `bundles/`. A source
+    /// keeps [`MAX_BUNDLES_PER_SOURCE`] of them: after a bundle is written,
+    /// the oldest others of the source are removed. So the file returned
+    /// here may be gone by the time it is read, when more than that many
+    /// exports of the source with other bases ran meanwhile: whoever sends
+    /// it reads it at once and takes a missing file as "export again".
+    /// [`Self::remove_bundles`] removes them all once the peer holds the
+    /// source; nothing in this crate calls it yet (the sending side of the
+    /// coordinator is not written).
+    pub fn export_bundle(
+        &self,
+        ctx: &ExecContext,
+        m: &CiManifest,
+        have: &[String],
+    ) -> Result<PathBuf> {
+        verify_manifest(m)?;
+        let mut basis: Vec<String> = vec![];
+        for c in have.iter().filter(|c| is_hex40(c)) {
+            if basis.len() == MAX_HAVE {
+                break;
+            }
+            if !basis.contains(c) {
+                basis.push(c.clone());
+            }
+        }
+        let dest = export_with_basis(ctx, &self.inner, m, &basis)?;
+        let mut others: Vec<(std::time::SystemTime, PathBuf)> = self
+            .bundles_of(&m.source_id)?
+            .into_iter()
+            .filter(|p| *p != dest)
+            .map(|p| {
+                let at = std::fs::metadata(&p)
+                    .and_then(|meta| meta.modified())
+                    .unwrap_or(std::time::UNIX_EPOCH);
+                (at, p)
+            })
+            .collect();
+        // Oldest first, by the time each was last written; two written in
+        // the same instant go by their names (which say nothing of their
+        // age: a file system that keeps whole seconds cannot tell them
+        // apart).
+        others.sort();
+        let excess = (others.len() + 1).saturating_sub(MAX_BUNDLES_PER_SOURCE);
+        for (_, p) in others.into_iter().take(excess) {
+            // The bundle that was asked for is written: an old one that
+            // does not go is said, and does not fail the export. The next
+            // export of the source tries it again.
+            if let Err(e) = remove_if_there(&p) {
+                eprintln!("cannot remove the old bundle {}: {e:#}", p.display());
+            }
+        }
+        Ok(dest)
+    }
+
+    /// The bundle files of the source in this store (the ones
+    /// [`Self::export_bundle`] wrote: the source id, `-`, 32 hex digits).
+    fn bundles_of(&self, ci_source_id: &str) -> Result<Vec<PathBuf>> {
+        let dir = self.inner.root().join("bundles");
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(vec![]),
+            Err(e) => return Err(e.into()),
+        };
+        let mut out = vec![];
+        for ent in entries {
+            let ent = ent?;
+            let name = ent.file_name();
+            let Some(name) = name.to_str() else { continue };
+            let basis = name
+                .strip_prefix(ci_source_id)
+                .and_then(|rest| rest.strip_prefix('-'))
+                .and_then(|rest| rest.strip_suffix(".bundle"));
+            if basis.is_some_and(|b| b.len() == 32 && b.bytes().all(|c| c.is_ascii_hexdigit())) {
+                out.push(ent.path());
+            }
+        }
+        Ok(out)
+    }
+
+    /// Remove the bundle files of the source: the peer holds it now, or the
+    /// transfer was given up. Returns how many were removed. One that is
+    /// asked for again is written again.
+    pub fn remove_bundles(&self, ci_source_id: &str) -> Result<usize> {
+        let mut n = 0;
+        for p in self.bundles_of(ci_source_id)? {
+            if remove_if_there(&p)? {
+                n += 1;
+            }
+        }
+        Ok(n)
     }
 
     fn run_record_path(&self, run: &RunId) -> PathBuf {
@@ -531,7 +876,7 @@ pub struct RequestSummary {
 
 /// A manifest from outside is not taken for what it says: its schema, its
 /// seal, and every path and mode are checked.
-fn verify_manifest(m: &CiManifest) -> Result<()> {
+pub fn verify_manifest(m: &CiManifest) -> Result<()> {
     if m.schema_version != SCHEMA_VERSION {
         return Err(corrupt(format!(
             "manifest schema version {} is not supported (this is {SCHEMA_VERSION})",

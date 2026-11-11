@@ -2,9 +2,10 @@
 //! secret files of this worker's state directory.
 //!
 //! The source an attempt names has to be in the worker's store before the
-//! attempt is prepared; how it gets there (the blob operations of the
-//! protocol) is not this module's concern.
+//! attempt is prepared; it gets there through the blob operations of the
+//! protocol ([`super::blobs`]).
 
+use super::blobs::{BlobSink, Incoming};
 use super::host::Host;
 use crate::error::{ApiError, ErrorCode};
 use crate::ids::AttemptId;
@@ -31,6 +32,7 @@ pub struct Machine {
     workspaces: Workspaces,
     secrets: WorkerSecrets,
     key_path: PathBuf,
+    incoming: Incoming,
 }
 
 fn internal(what: &str, e: impl std::fmt::Display) -> ApiError {
@@ -40,6 +42,9 @@ fn internal(what: &str, e: impl std::fmt::Display) -> ApiError {
 impl Machine {
     /// `env` is what Git, fast-worktree and the project's hooks run with
     /// (`HOME` and `PATH` at least); `key_path` is the cluster key file.
+    ///
+    /// Refused (`BLOCKED`, `environment_mismatch`) when that Git cannot be
+    /// run or is older than 2.31.
     pub fn open(
         state_dir: &Path,
         env: BTreeMap<String, String>,
@@ -48,10 +53,21 @@ impl Machine {
         let store = SourceStore::open(state_dir).map_err(|e| internal("source store", e))?;
         let secrets = WorkerSecrets::open(state_dir).map_err(|e| e.to_api())?;
         let fw = Arc::new(CliFastWorktree::new(env.clone()));
+        let workspaces = Workspaces::new(state_dir.to_path_buf(), env.clone(), fw.clone());
+        // Before anything is served: a Git that cannot unpack a bundle would
+        // answer for every source as if the source were at fault.
+        workspaces.check_git()?;
+        let incoming = Incoming::new(
+            state_dir,
+            store.clone(),
+            Workspaces::new(state_dir.to_path_buf(), env.clone(), fw.clone()),
+            env.clone(),
+        );
         Ok(Machine {
+            incoming,
             state_dir: state_dir.to_path_buf(),
             store,
-            workspaces: Workspaces::new(state_dir.to_path_buf(), env, fw),
+            workspaces,
             secrets,
             key_path,
         })
@@ -192,6 +208,10 @@ impl Host for Machine {
         self.secrets
             .mask_values(&attempt.attempt_id)
             .map_err(|e| e.to_api())
+    }
+
+    fn blobs(&self) -> Option<&dyn BlobSink> {
+        Some(&self.incoming)
     }
 
     fn cleanup(&self, attempt: &AttemptId, workspace: Option<&Workspace>) -> Result<(), ApiError> {

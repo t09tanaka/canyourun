@@ -89,6 +89,23 @@ pub enum BlockedReason {
     EnvironmentMismatch,
 }
 
+/// Why a request was refused with `CONFLICT`, when the caller can act on
+/// the reason (accompanies `ErrorCode::Conflict`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "reason", rename_all = "snake_case")]
+pub enum ConflictReason {
+    /// The Git bundle of a source is built on commits the worker's clone of
+    /// the repository does not hold. Nothing of the bundle was kept. `have`
+    /// lists commits the clone does hold (see `blob_verify`): a bundle built
+    /// on those is taken.
+    BundleBaseMissing { have: Vec<String> },
+    /// A reason this version does not know (a newer peer sent it). What it
+    /// carried is dropped: the caller treats the error as a plain
+    /// `CONFLICT`.
+    #[serde(other)]
+    Unknown,
+}
+
 impl ErrorCode {
     /// Every code.
     pub const ALL: [ErrorCode; 16] = [
@@ -192,6 +209,9 @@ pub struct ApiError {
     /// Set when `code` is `BLOCKED`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub blocked_reason: Option<BlockedReason>,
+    /// May be set when `code` is `CONFLICT`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conflict_reason: Option<ConflictReason>,
 }
 
 impl ApiError {
@@ -200,6 +220,16 @@ impl ApiError {
             code,
             message: message.into(),
             blocked_reason: None,
+            conflict_reason: None,
+        }
+    }
+
+    pub fn conflict(reason: ConflictReason, message: impl Into<String>) -> Self {
+        ApiError {
+            code: ErrorCode::Conflict,
+            message: message.into(),
+            blocked_reason: None,
+            conflict_reason: Some(reason),
         }
     }
 
@@ -208,6 +238,7 @@ impl ApiError {
             code: ErrorCode::Blocked,
             message: message.into(),
             blocked_reason: Some(reason),
+            conflict_reason: None,
         }
     }
 }
@@ -215,6 +246,7 @@ impl ApiError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
     use std::collections::HashSet;
 
     #[test]
@@ -322,10 +354,59 @@ mod tests {
     }
 
     #[test]
+    fn a_conflict_can_say_why_in_a_form_the_caller_reads() {
+        let have = vec!["0123456789abcdef0123456789abcdef01234567".to_string()];
+        let e = ApiError::conflict(
+            ConflictReason::BundleBaseMissing { have: have.clone() },
+            "send it again",
+        );
+        assert_eq!(e.code, ErrorCode::Conflict);
+        assert_eq!(e.message, "send it again");
+        assert_eq!(e.blocked_reason, None);
+        let v = serde_json::to_value(&e).unwrap();
+        assert_eq!(v["code"], "CONFLICT");
+        assert_eq!(v["conflict_reason"]["reason"], "bundle_base_missing");
+        assert_eq!(v["conflict_reason"]["have"][0], have[0]);
+        assert!(v.get("blocked_reason").is_none());
+        assert_eq!(serde_json::from_value::<ApiError>(v).unwrap(), e);
+        let blocked = ApiError::blocked(BlockedReason::SecretUnavailable, "x");
+        assert_eq!(blocked.conflict_reason, None);
+    }
+
+    #[test]
+    fn a_conflict_reason_of_a_newer_peer_is_read_as_unknown() {
+        for reason in [
+            json!({"reason": "clone_is_being_moved"}),
+            json!({"reason": "clone_is_being_moved", "have": ["x"], "retry_after_ms": 5}),
+        ] {
+            let v = json!({"code": "CONFLICT", "message": "later", "conflict_reason": reason});
+            let e: ApiError = serde_json::from_value(v).unwrap();
+            assert_eq!(e.code, ErrorCode::Conflict);
+            assert_eq!(e.message, "later");
+            assert_eq!(e.conflict_reason, Some(ConflictReason::Unknown));
+        }
+        // a reason that is known keeps what it carries
+        let known: ConflictReason =
+            serde_json::from_value(json!({"reason": "bundle_base_missing", "have": ["a"]}))
+                .unwrap();
+        assert_eq!(
+            known,
+            ConflictReason::BundleBaseMissing {
+                have: vec!["a".into()]
+            }
+        );
+        assert_eq!(
+            serde_json::to_value(ConflictReason::Unknown).unwrap(),
+            json!({"reason": "unknown"})
+        );
+    }
+
+    #[test]
     fn plain_errors_omit_blocked_reason() {
         let e = ApiError::new(ErrorCode::Conflict, "payload differs");
         let v = serde_json::to_value(&e).unwrap();
         assert!(v.get("blocked_reason").is_none());
+        assert!(v.get("conflict_reason").is_none());
         assert_eq!(v["message"], "payload differs");
         assert_eq!(serde_json::from_value::<ApiError>(v).unwrap(), e);
     }

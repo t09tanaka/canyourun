@@ -34,13 +34,13 @@ fn run_scratch(env: &BTreeMap<String, String>, cwd: &Path, args: &[&str]) -> Res
     )
 }
 
-fn run_with(
+fn output_of(
     env: &BTreeMap<String, String>,
     cwd: &Path,
     args: &[&str],
     extra: &[(&str, &str)],
-) -> Result<String> {
-    let out = Command::new("git")
+) -> Result<std::process::Output> {
+    Command::new("git")
         .args(["-c", "protocol.file.allow=always"])
         .args(args)
         .current_dir(cwd)
@@ -49,15 +49,46 @@ fn run_with(
         .envs(extra.iter().copied())
         .env("GIT_TERMINAL_PROMPT", "0")
         .output()
-        .context("cannot run git")?;
+        .context("cannot run git")
+}
+
+fn failed(args: &[&str], out: &std::process::Output) -> anyhow::Error {
+    anyhow::anyhow!(
+        "git {}: {}",
+        args.join(" "),
+        String::from_utf8_lossy(&out.stderr).trim()
+    )
+}
+
+fn run_with(
+    env: &BTreeMap<String, String>,
+    cwd: &Path,
+    args: &[&str],
+    extra: &[(&str, &str)],
+) -> Result<String> {
+    let out = output_of(env, cwd, args, extra)?;
     if !out.status.success() {
-        bail!(
-            "git {}: {}",
-            args.join(" "),
-            String::from_utf8_lossy(&out.stderr).trim()
-        );
+        return Err(failed(args, &out));
     }
     Ok(String::from_utf8_lossy(&out.stdout).trim_end().to_string())
+}
+
+/// Run Git for a question it answers with its exit code: `Some` (what it
+/// printed) for 0, `None` for 1. Anything else (Git could not be run, was
+/// killed, or failed in another way) is an error, never a "no".
+pub(crate) fn says(
+    env: &BTreeMap<String, String>,
+    cwd: &Path,
+    args: &[&str],
+) -> Result<Option<String>> {
+    let out = output_of(env, cwd, args, &[])?;
+    match out.status.code() {
+        Some(0) => Ok(Some(
+            String::from_utf8_lossy(&out.stdout).trim_end().to_string(),
+        )),
+        Some(1) => Ok(None),
+        _ => Err(failed(args, &out)),
+    }
 }
 
 /// `rev` must name a revision, never an option.

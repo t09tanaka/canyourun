@@ -12,7 +12,7 @@ use super::mux::{CallError, Client};
 use crate::ids::{AttemptId, CoordinatorEpoch, Digest, NodeId, RequestId, SourceId};
 use crate::wire::{
     AttemptEvent, BlobGetRequest, BlobPutRequest, BlobPutResponse, Bytes, LogStream,
-    ReadLogRequest, Request, Response, SchemaVersion, WatchEventsRequest,
+    ReadLogRequest, Request, Response, SchemaVersion, SourceBlobKind, WatchEventsRequest,
 };
 use std::time::Duration;
 use thiserror::Error;
@@ -62,6 +62,33 @@ pub async fn put_blob(
     chunk_bytes: usize,
     timeout: Duration,
 ) -> Result<BlobPutResponse, TransferError> {
+    let kind = SourceBlobKind::Content;
+    put_blob_as(
+        client,
+        coordinator_epoch,
+        source_id,
+        kind,
+        data,
+        start,
+        chunk_bytes,
+        timeout,
+    )
+    .await
+}
+
+/// [`put_blob`] for any kind of blob of a source (its manifests and its
+/// bundle go the same way as its files).
+#[allow(clippy::too_many_arguments)]
+pub async fn put_blob_as(
+    client: &Client,
+    coordinator_epoch: CoordinatorEpoch,
+    source_id: &SourceId,
+    kind: SourceBlobKind,
+    data: &[u8],
+    start: u64,
+    chunk_bytes: usize,
+    timeout: Duration,
+) -> Result<BlobPutResponse, TransferError> {
     let digest = Digest::of_bytes(data);
     let total_size = data.len() as u64;
     let chunk_bytes = chunk_bytes.clamp(1, MAX_CHUNK_BYTES);
@@ -76,6 +103,7 @@ pub async fn put_blob(
             request_id: RequestId::generate(),
             coordinator_epoch,
             source_id: source_id.clone(),
+            kind,
             digest: digest.clone(),
             total_size,
             offset,
@@ -108,7 +136,7 @@ pub async fn put_blob(
     }
 }
 
-/// Fetch blob `digest`. `prefix` is what an earlier, interrupted fetch already
+/// Fetch the artifact `digest` of `attempt_id`. `prefix` is what an earlier, interrupted fetch already
 /// verified into place (empty for a fresh one). The result is checked against
 /// the digest before it is returned.
 ///
@@ -116,8 +144,10 @@ pub async fn put_blob(
 /// memory: a size above `max_total` is refused before any byte is kept, and so
 /// is one that differs from `expected_size` when the caller knows it (the
 /// manifest says how big the blob is). The size must not change mid-transfer.
+#[allow(clippy::too_many_arguments)]
 pub async fn get_blob(
     client: &Client,
+    attempt_id: &AttemptId,
     digest: &Digest,
     prefix: Vec<u8>,
     max_bytes: u32,
@@ -133,6 +163,7 @@ pub async fn get_blob(
         let request = Request::BlobGet(BlobGetRequest {
             schema_version: SchemaVersion::CURRENT,
             request_id: RequestId::generate(),
+            attempt_id: attempt_id.clone(),
             digest: digest.clone(),
             offset,
             max_bytes: clamp_chunk(max_bytes) as u32,
