@@ -33,13 +33,14 @@
 //! recorded identity again immediately before sending it.
 
 use super::error::Result;
-use super::identity::{verdict, Leader, Verdict};
+use super::identity::{only_identity_unknown, verdict, Leader, Verdict};
+use super::members::ManagedMembers;
 use super::run::{
     complete_terminal, open_spool, remove_fifos, settle, settle_without_spool, sidecar_child,
     stop_confirmed_on, unresolved_report, Report, Traffic,
 };
 use super::spec::{command_id, SuperviseSpec};
-use super::stop::{group_state_on, GroupState, Os, StopResult, StopTarget, System};
+use super::stop::{group_state_on, GroupState, NoEvidence, Os, StopResult, StopTarget, System};
 use super::termination::{termination, StopReason};
 use crate::platform::{self, StartIdentity};
 use crate::state::AttemptState;
@@ -48,16 +49,24 @@ use serde_json::json;
 use task_traffic_controller::managed;
 
 /// Why a node stays unresolved when what has its PID now cannot be read.
-const IDENTITY_UNKNOWN: &str = "the identity of the recorded process could not be read, so \
-                                nothing was signalled; it is looked at again later";
+const IDENTITY_UNKNOWN: &str = "whose the recorded process or its group is could not be told \
+                                (its identity could not be read, or nothing left in the group \
+                                is known to be the command's), so nothing was signalled; it is \
+                                looked at again later";
 
 pub fn recover(spec: &SuperviseSpec, store: &WorkerStore) -> Result<Report> {
-    recover_on(spec, store, &System)
+    recover_on(spec, store, None)
 }
 
-/// [`recover`] with the system calls that read identities and send signals
-/// given by the caller (a test records them instead of sending).
-pub(crate) fn recover_on(spec: &SuperviseSpec, store: &WorkerStore, os: &dyn Os) -> Result<Report> {
+/// [`recover`]; with `fake`, the system calls that read identities and send
+/// signals are the caller's (a test records them instead of sending).
+/// Without it they are the real ones, with the evidence about each
+/// command's members taken from task-traffic-controller.
+pub(crate) fn recover_on(
+    spec: &SuperviseSpec,
+    store: &WorkerStore,
+    fake: Option<&dyn Os>,
+) -> Result<Report> {
     let attempt = &spec.attempt_id;
     let Some(rec) = store.get(attempt)? else {
         return Err(super::error::SupervisorError::State(format!(
@@ -71,19 +80,29 @@ pub(crate) fn recover_on(spec: &SuperviseSpec, store: &WorkerStore, os: &dyn Os)
             termination: Some(t),
             finalized_here: false,
             unresolved: None,
+            identity_unknown: false,
             sleep_inhibit: "not held".into(),
         });
     }
     let traffic = Traffic::open(spec)?;
     let boot = platform::boot_id();
-    let mut unresolved: Vec<String> = Vec::new();
+    // Each reason, and whether it is only that an identity could not be told.
+    let mut unresolved: Vec<(String, bool)> = Vec::new();
     let mut unresolved_nodes: Vec<String> = Vec::new();
     for (node, _intent_at, ident) in store.launches(attempt)? {
         let index = spec.nodes.iter().position(|n| n.node_id == node);
         let id = index.map(|i| command_id(attempt, i));
+        // What a gone leader left under its group number is signalled only
+        // with evidence that a member is the command's own.
+        let members = id.as_ref().map(|id| ManagedMembers::new(&traffic.ctx, id));
+        let real = System(match &members {
+            Some(m) => m,
+            None => &NoEvidence,
+        });
+        let os: &dyn Os = fake.unwrap_or(&real);
         let start_now = ident
             .as_ref()
-            .map_or(StartIdentity::Unknown, |i| os.start_identity(i.pid));
+            .map_or(StartIdentity::Unknown, |i| os.read(i.pid).start);
         let v = verdict(ident.as_ref(), boot.as_deref(), &start_now);
         // The group number is the one task-traffic-controller recorded, which
         // is what the running supervisor stops too.
@@ -94,6 +113,7 @@ pub(crate) fn recover_on(spec: &SuperviseSpec, store: &WorkerStore, os: &dyn Os)
                 .map_or(pid as i32, |(_, g)| g)
         };
         let mut group_stopped = false;
+        let mut identity_unknown = false;
         match (v, &ident) {
             (Verdict::Same | Verdict::Gone, Some(i)) => {
                 // The recorded identity goes with the target in both cases:
@@ -109,19 +129,23 @@ pub(crate) fn recover_on(spec: &SuperviseSpec, store: &WorkerStore, os: &dyn Os)
                 let problem = match stop_confirmed_on(os, &target, spec) {
                     StopResult::Confirmed => None,
                     StopResult::Unconfirmed => Some("the process could not be stopped"),
-                    StopResult::IdentityUnknown => Some(IDENTITY_UNKNOWN),
+                    StopResult::IdentityUnknown => {
+                        identity_unknown = true;
+                        Some(IDENTITY_UNKNOWN)
+                    }
                 };
                 if let Some(why) = problem {
-                    unresolved.push(format!("node {node}: {why}"));
+                    unresolved.push((format!("node {node}: {why}"), identity_unknown));
                     unresolved_nodes.push(node.to_string());
                 }
             }
             (Verdict::CannotTell, _) => {
-                unresolved.push(format!("node {node}: the boot id is not readable"));
+                unresolved.push((format!("node {node}: the boot id is not readable"), false));
                 unresolved_nodes.push(node.to_string());
             }
             (Verdict::Unknown, _) => {
-                unresolved.push(format!("node {node}: {IDENTITY_UNKNOWN}"));
+                identity_unknown = true;
+                unresolved.push((format!("node {node}: {IDENTITY_UNKNOWN}"), true));
                 unresolved_nodes.push(node.to_string());
             }
             // Rebooted, reused (never signalled) and not recorded are settled
@@ -141,22 +165,27 @@ pub(crate) fn recover_on(spec: &SuperviseSpec, store: &WorkerStore, os: &dyn Os)
         )?;
         if let Some(id) = &id {
             let problem = match managed::resolve_checked(&traffic.ctx, id) {
-                Ok(r) if r.found && !r.released => Some(r.checked.to_string()),
+                // An entry kept for a node whose processes could not be told
+                // is that same reason again, not another one.
+                Ok(r) if r.found && !r.released && !identity_unknown => Some(r.checked.to_string()),
                 Ok(_) => None,
                 Err(e) => Some(e.to_string()),
             };
             if let Some(why) = problem {
-                unresolved.push(format!("node {node}: {why}"));
+                unresolved.push((format!("node {node}: {why}"), false));
                 unresolved_nodes.push(node.to_string());
             }
         }
     }
     if !unresolved.is_empty() {
+        let by_identity = only_identity_unknown(unresolved.iter().map(|(_, by)| *by));
+        let reasons: Vec<&str> = unresolved.iter().map(|(why, _)| why.as_str()).collect();
         return unresolved_report(
             store,
             attempt,
             &unresolved_nodes,
-            unresolved.join("; "),
+            reasons.join("; "),
+            by_identity,
             "not held".into(),
         );
     }
@@ -180,6 +209,7 @@ pub(crate) fn recover_on(spec: &SuperviseSpec, store: &WorkerStore, os: &dyn Os)
         termination: Some(t),
         finalized_here: here,
         unresolved: None,
+        identity_unknown: false,
         sleep_inhibit: "not held".into(),
     })
 }
@@ -294,10 +324,11 @@ mod tests {
     fn assert_unresolved_for_identity(f: &Fx, report: &Report) {
         let why = report.unresolved.as_deref().expect("unresolved");
         assert!(
-            why.contains("node n: the identity of the recorded process"),
+            why.contains("node n: whose the recorded process or its group is"),
             "{why}"
         );
         assert!(why.contains("nothing was signalled"), "{why}");
+        assert!(report.identity_unknown, "no other reason");
         assert_eq!(report.termination, None);
         let rec = f.store.get(&f.spec.attempt_id).unwrap().unwrap();
         assert_eq!(rec.termination, None, "nothing was settled");
@@ -307,13 +338,49 @@ mod tests {
             .unwrap();
         assert_eq!(unresolved.len(), 1);
         assert_eq!(unresolved[0].payload["nodes"], json!(["n"]));
+        assert_eq!(unresolved[0].payload["identity_unknown"], true);
+    }
+
+    #[test]
+    fn what_a_gone_leader_left_is_not_signalled_without_evidence_of_a_member() {
+        let f = fx();
+        // No process has the recorded PID and its number has members, but
+        // none is known to be the command's: the PID may have been taken
+        // and left by a process that started a group of its own.
+        let os = FakeOs::new([StartIdentity::NoProcess]);
+        os.proven.set(false);
+        let report = recover_on(&f.spec, &f.store, Some(&os)).unwrap();
+        assert!(os.sent().is_empty(), "only probes: {:?}", os.signals);
+        assert_unresolved_for_identity(&f, &report);
+        let event = node_event(&f);
+        assert_eq!(event["verdict"], "Gone");
+        assert_eq!(event["group_stopped"], false);
+    }
+
+    #[test]
+    fn a_zombie_with_the_pid_is_judged_by_its_identity() {
+        // Another process's zombie has the PID: nothing is probed or sent.
+        let f = fx();
+        let os = FakeOs::new([StartIdentity::Zombie("linux:2000".into())]);
+        let report = recover_on(&f.spec, &f.store, Some(&os)).unwrap();
+        assert!(os.signals.borrow().is_empty());
+        assert_eq!(report.termination.unwrap().outcome(), Outcome::Interrupted);
+        assert_eq!(node_event(&f)["verdict"], "PidReused");
+        // The recorded process itself, ended and not reaped: what it left
+        // is stopped when a member is known to be the command's.
+        let f = fx();
+        let os = FakeOs::new([StartIdentity::Zombie(START.into())]);
+        let report = recover_on(&f.spec, &f.store, Some(&os)).unwrap();
+        assert_eq!(os.sent(), vec![(NO_SUCH_PID as i32, libc::SIGTERM)]);
+        assert_eq!(report.termination.unwrap().outcome(), Outcome::Interrupted);
+        assert_eq!(node_event(&f)["verdict"], "Gone");
     }
 
     #[test]
     fn an_unreadable_identity_signals_nothing_and_leaves_the_attempt_unresolved() {
         let f = fx();
         let os = FakeOs::new([StartIdentity::Unknown]);
-        let report = recover_on(&f.spec, &f.store, &os).unwrap();
+        let report = recover_on(&f.spec, &f.store, Some(&os)).unwrap();
         assert!(os.signals.borrow().is_empty(), "not even a probe");
         assert_unresolved_for_identity(&f, &report);
         let event = node_event(&f);
@@ -326,7 +393,7 @@ mod tests {
         let f = fx();
         // The verdict sees the same process; every later read fails.
         let os = FakeOs::new([id(START), StartIdentity::Unknown]);
-        let report = recover_on(&f.spec, &f.store, &os).unwrap();
+        let report = recover_on(&f.spec, &f.store, Some(&os)).unwrap();
         assert!(os.signals.borrow().is_empty());
         assert_unresolved_for_identity(&f, &report);
         assert_eq!(node_event(&f)["verdict"], "Same");
@@ -336,7 +403,7 @@ mod tests {
     fn a_later_recovery_that_can_read_the_identity_settles_the_attempt() {
         let f = fx();
         let os = FakeOs::new([StartIdentity::Unknown]);
-        assert!(recover_on(&f.spec, &f.store, &os)
+        assert!(recover_on(&f.spec, &f.store, Some(&os))
             .unwrap()
             .unresolved
             .is_some());
@@ -344,7 +411,7 @@ mod tests {
         // its group is empty.
         let os = FakeOs::new([StartIdentity::NoProcess]);
         os.members.set(false);
-        let report = recover_on(&f.spec, &f.store, &os).unwrap();
+        let report = recover_on(&f.spec, &f.store, Some(&os)).unwrap();
         assert_eq!(report.unresolved, None);
         assert_eq!(report.termination.unwrap().outcome(), Outcome::Interrupted);
         assert!(os.sent().is_empty(), "only probes: {:?}", os.signals);
@@ -355,7 +422,7 @@ mod tests {
     fn a_reused_pid_is_never_signalled_or_probed() {
         let f = fx();
         let os = FakeOs::new([id("linux:2000")]);
-        let report = recover_on(&f.spec, &f.store, &os).unwrap();
+        let report = recover_on(&f.spec, &f.store, Some(&os)).unwrap();
         assert!(os.signals.borrow().is_empty());
         assert_eq!(report.termination.unwrap().outcome(), Outcome::Interrupted);
         assert_eq!(node_event(&f)["verdict"], "PidReused");
@@ -372,7 +439,7 @@ mod tests {
             id(START),
             StartIdentity::NoProcess,
         ]);
-        let report = recover_on(&f.spec, &f.store, &os).unwrap();
+        let report = recover_on(&f.spec, &f.store, Some(&os)).unwrap();
         assert_eq!(os.sent(), vec![(NO_SUCH_PID as i32, libc::SIGTERM)]);
         assert_eq!(report.termination.unwrap().outcome(), Outcome::Interrupted);
         let event = node_event(&f);
@@ -385,7 +452,7 @@ mod tests {
         let f = fx();
         // Gone at the verdict; by the stop another process has the PID.
         let os = FakeOs::new([StartIdentity::NoProcess, id("linux:2000")]);
-        let report = recover_on(&f.spec, &f.store, &os).unwrap();
+        let report = recover_on(&f.spec, &f.store, Some(&os)).unwrap();
         assert!(os.signals.borrow().is_empty());
         assert_eq!(report.termination.unwrap().outcome(), Outcome::Interrupted);
     }

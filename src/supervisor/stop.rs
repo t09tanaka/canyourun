@@ -4,8 +4,9 @@
 //! when to escalate to KILL, when to give up) are in [`super::escalation`].
 
 use super::escalation::{Escalation, StopStep};
-use super::identity::{group_owner, GroupOwner, Leader};
-use crate::platform::{self, GroupSignal, StartIdentity};
+pub use super::identity::GroupState;
+use super::identity::{self, group_owner, Leader};
+use crate::platform::{self, GroupSignal, ProcessRead};
 use std::time::Duration;
 
 /// A recorded command: its leader and process group, and what is known of
@@ -35,41 +36,59 @@ pub enum StopResult {
     /// Members were still there after KILL and the confirmation window.
     Unconfirmed,
     /// Whose the group is could not be told (the leader's identity could
-    /// not be read): nothing was signalled from then on and nothing is
-    /// known. The stop is to be tried again later.
+    /// not be read, or the leader has ended and no member left under its
+    /// group number is known to be the command's): nothing was signalled
+    /// from then on and nothing is known. The stop is to be tried again
+    /// later.
     IdentityUnknown,
 }
 
-/// Whether the target group still has members that are ours.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum GroupState {
-    /// It has members that are the command's.
-    Alive,
-    /// It has none: they ended, or the PID belongs to another process now
-    /// (which is never signalled).
-    Gone,
-    /// It cannot be told. Never signal, never record a stop.
-    Unknown,
+/// Evidence about the members of a process group whose leader has ended.
+///
+/// A group number is the PID of its leader, and a PID is reused: once the
+/// group was empty, the number can be another group's. So what is left under
+/// the number of a leader that is gone is signalled only when a member is
+/// positively known to be the command's.
+pub trait Members {
+    /// True only when a process known to be the command's (by more than its
+    /// PID) is in the group `pgid` right now.
+    fn proven(&self, pgid: i32) -> bool;
+}
+
+/// No evidence about any group: what a gone leader left is never signalled.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NoEvidence;
+
+impl Members for NoEvidence {
+    fn proven(&self, _pgid: i32) -> bool {
+        false
+    }
 }
 
 /// The system calls a stop makes. A test replaces them, so that no test ever
 /// sends a real signal to a made-up PID.
 pub(crate) trait Os {
-    fn start_identity(&self, pid: u32) -> StartIdentity;
+    fn read(&self, pid: u32) -> ProcessRead;
     fn signal_group(&self, pgid: i32, sig: i32) -> GroupSignal;
+    /// Whether a member of the group is known to be the command's.
+    fn member_proven(&self, pgid: i32) -> bool;
     fn monotonic_ms(&self) -> u64;
     fn pause(&self, ms: u64);
 }
 
-/// The real system, through the guarded helpers of [`crate::platform`].
-pub(crate) struct System;
+/// The real system, through the guarded helpers of [`crate::platform`], with
+/// the evidence about the members of the command's group.
+pub(crate) struct System<'a>(pub &'a dyn Members);
 
-impl Os for System {
-    fn start_identity(&self, pid: u32) -> StartIdentity {
-        platform::process_start_identity(pid)
+impl Os for System<'_> {
+    fn read(&self, pid: u32) -> ProcessRead {
+        platform::read_process(pid)
     }
     fn signal_group(&self, pgid: i32, sig: i32) -> GroupSignal {
         platform::signal_process_group(pgid, sig)
+    }
+    fn member_proven(&self, pgid: i32) -> bool {
+        self.0.proven(pgid)
     }
     fn monotonic_ms(&self) -> u64 {
         platform::monotonic_ms()
@@ -81,60 +100,87 @@ impl Os for System {
 
 /// Whether the target group still has members that are ours.
 ///
-/// The leader's PID is read now and judged by [`group_owner`]: only a
-/// leader with the recorded identity, or a leader that is definitely gone
-/// with members left in its group, makes the group alive. A read that fails
+/// The leader's PID is read now and judged by [`group_owner`]: a leader with
+/// the recorded identity makes the group alive. When the leader has ended,
+/// the group is alive only if it has members and `members` proves that one
+/// of them is the command's ([`identity::group_state`]). A read that fails
 /// is `Unknown`, never gone.
-pub fn group_state(t: &StopTarget) -> GroupState {
-    group_state_on(&System, t)
+pub fn group_state(t: &StopTarget, members: &dyn Members) -> GroupState {
+    group_state_on(&System(members), t)
 }
 
 pub(crate) fn group_state_on(os: &dyn Os, t: &StopTarget) -> GroupState {
     let leads = i32::try_from(t.pid) == Ok(t.pgid);
-    match group_owner(&t.leader, &os.start_identity(t.pid), leads) {
-        GroupOwner::Ours => GroupState::Alive,
-        GroupOwner::Foreign => GroupState::Gone,
-        GroupOwner::Unknown => GroupState::Unknown,
-        GroupOwner::Orphaned => {
-            if os.signal_group(t.pgid, 0) == GroupSignal::Empty {
-                GroupState::Gone
-            } else {
-                GroupState::Alive
-            }
-        }
-    }
+    let owner = group_owner(&t.leader, &os.read(t.pid).start, leads);
+    identity::group_state(
+        owner,
+        || os.signal_group(t.pgid, 0),
+        || os.member_proven(t.pgid),
+    )
 }
 
-fn send(os: &dyn Os, t: &StopTarget, sig: i32) {
+/// Signal the group, when it is (still) the command's. True when a signal
+/// was sent.
+fn send(os: &dyn Os, t: &StopTarget, sig: i32) -> bool {
     // Judged again right before signalling: never signal a reused PID or a
     // group whose owner cannot be told.
-    if group_state_on(os, t) == GroupState::Alive {
+    let ours = group_state_on(os, t) == GroupState::Alive;
+    if ours {
         let _ = os.signal_group(t.pgid, sig);
     }
+    ours
 }
 
 /// TERM the group, KILL it after the grace, and report whether it is gone.
 /// The moment the group's owner cannot be told, the stop ends as
 /// [`StopResult::IdentityUnknown`] without another signal.
-pub fn stop_group(t: &StopTarget, times: StopTimes) -> StopResult {
-    stop_group_on(&System, t, times)
+///
+/// Members that are left under the number of a leader that has ended, and
+/// that are not known to be the command's, are never signalled either. When
+/// this stop has signalled the group before, they may be what is still
+/// ending of it, so the stop waits for them (within the same windows)
+/// instead of ending at once; if they stay, it ends as `IdentityUnknown`.
+pub fn stop_group(t: &StopTarget, times: StopTimes, members: &dyn Members) -> StopResult {
+    stop_group_on(&System(members), t, times)
 }
 
 pub(crate) fn stop_group_on(os: &dyn Os, t: &StopTarget, times: StopTimes) -> StopResult {
     let mut esc = Escalation::new(times.grace_ms, times.kill_wait_ms);
+    let mut signalled = false;
     loop {
-        let alive = match group_state_on(os, t) {
-            GroupState::Unknown => return StopResult::IdentityUnknown,
-            state => state == GroupState::Alive,
-        };
-        match esc.step(os.monotonic_ms(), alive) {
-            StopStep::Term => send(os, t, libc::SIGTERM),
-            StopStep::Kill => send(os, t, libc::SIGKILL),
+        let state = group_state_on(os, t);
+        if waits_for(state, signalled) == Some(false) {
+            return StopResult::IdentityUnknown;
+        }
+        match esc.step(os.monotonic_ms(), state != GroupState::Gone) {
+            StopStep::Term => signalled |= send(os, t, libc::SIGTERM),
+            StopStep::Kill => signalled |= send(os, t, libc::SIGKILL),
             StopStep::Wait => {}
             StopStep::Confirmed => return StopResult::Confirmed,
-            StopStep::Unconfirmed => return StopResult::Unconfirmed,
+            StopStep::Unconfirmed => return unconfirmed(state),
         }
         os.pause(times.poll_ms.max(1));
+    }
+}
+
+/// For a group that cannot be told to be the command's: whether the stop
+/// goes on looking (`Some(true)`: unproven members after a signal of this
+/// stop) or ends at once (`Some(false)`). `None` for a group that can be
+/// told.
+fn waits_for(state: GroupState, signalled: bool) -> Option<bool> {
+    match state {
+        GroupState::Alive | GroupState::Gone => None,
+        GroupState::Unproven => Some(signalled),
+        GroupState::Unknown => Some(false),
+    }
+}
+
+/// What a stop whose windows have passed reports for the last `state` seen.
+fn unconfirmed(state: GroupState) -> StopResult {
+    if state == GroupState::Alive {
+        StopResult::Unconfirmed
+    } else {
+        StopResult::IdentityUnknown
     }
 }
 
@@ -151,8 +197,13 @@ pub const RETRY_BUDGET_MS: u64 = 30_000;
 /// [`stop_group`], tried again (KILL at once) when the group could not be
 /// confirmed gone, up to `retries` more times. An unknown identity is not
 /// retried here: the caller looks again later.
-pub fn stop_group_retrying(t: &StopTarget, times: StopTimes, retries: u32) -> StopResult {
-    stop_group_retrying_on(&System, t, times, retries)
+pub fn stop_group_retrying(
+    t: &StopTarget,
+    times: StopTimes,
+    retries: u32,
+    members: &dyn Members,
+) -> StopResult {
+    stop_group_retrying_on(&System(members), t, times, retries)
 }
 
 pub(crate) fn stop_group_retrying_on(
@@ -191,6 +242,7 @@ fn retry(retries: u32, mut f: impl FnMut(u32) -> StopResult) -> StopResult {
 #[cfg(test)]
 pub(crate) mod fake {
     use super::*;
+    use crate::platform::StartIdentity;
     use std::cell::{Cell, RefCell};
     use std::collections::VecDeque;
 
@@ -199,6 +251,8 @@ pub(crate) mod fake {
         reads: RefCell<VecDeque<StartIdentity>>,
         /// Whether the group has members (what a probe with signal 0 finds).
         pub members: Cell<bool>,
+        /// Whether a member is known to be the command's.
+        pub proven: Cell<bool>,
         /// A TERM or KILL empties the group.
         pub dies_when_signalled: bool,
         /// Every `(pgid, signal)` asked for, probes included.
@@ -212,6 +266,7 @@ pub(crate) mod fake {
             FakeOs {
                 reads: RefCell::new(reads.into_iter().collect()),
                 members: Cell::new(true),
+                proven: Cell::new(true),
                 dies_when_signalled: true,
                 signals: RefCell::default(),
                 now: Cell::new(0),
@@ -227,14 +282,17 @@ pub(crate) mod fake {
     }
 
     impl Os for FakeOs {
-        fn start_identity(&self, _pid: u32) -> StartIdentity {
+        fn read(&self, _pid: u32) -> ProcessRead {
             self.read_count.set(self.read_count.get() + 1);
             let mut reads = self.reads.borrow_mut();
-            if reads.len() > 1 {
+            ProcessRead::of(if reads.len() > 1 {
                 reads.pop_front().expect("not empty")
             } else {
                 reads.front().cloned().expect("a scripted read")
-            }
+            })
+        }
+        fn member_proven(&self, _pgid: i32) -> bool {
+            self.proven.get()
         }
         fn signal_group(&self, pgid: i32, sig: i32) -> GroupSignal {
             self.signals.borrow_mut().push((pgid, sig));
@@ -267,6 +325,7 @@ pub(crate) mod fake {
 mod tests {
     use super::fake::{id, FakeOs, NO_SUCH_PID};
     use super::*;
+    use crate::platform::StartIdentity;
 
     const PGID: i32 = NO_SUCH_PID as i32;
 
@@ -426,16 +485,121 @@ mod tests {
     }
 
     #[test]
-    fn the_real_system_reads_and_refuses_as_the_platform_does() {
-        // No signal is sent here: group 0 is refused by the guarded helper.
-        assert_eq!(System.signal_group(0, 0), GroupSignal::Empty);
+    fn what_a_gone_leader_left_is_not_signalled_without_evidence_of_a_member() {
+        // Members under the number, none known to be the command's: the
+        // number may be another group's by now.
+        for leader in [Leader::Known("linux:1000".into()), Leader::Ended] {
+            let os = FakeOs::new([StartIdentity::NoProcess]);
+            os.proven.set(false);
+            let t = target(leader);
+            assert_eq!(group_state_on(&os, &t), GroupState::Unproven);
+            assert_eq!(
+                stop_group_retrying_on(&os, &t, times(), 3),
+                StopResult::IdentityUnknown
+            );
+            assert!(os.sent().is_empty(), "{t:?}");
+            assert_eq!(os.now.get(), 0, "it does not wait either");
+        }
+    }
+
+    #[test]
+    fn the_zombie_of_the_recorded_leader_leaves_the_group_to_the_evidence() {
+        let z = || StartIdentity::Zombie("linux:1000".into());
+        let os = FakeOs::new([z()]);
+        assert_eq!(group_state_on(&os, &known()), GroupState::Alive);
+        os.proven.set(false);
+        assert_eq!(group_state_on(&os, &known()), GroupState::Unproven);
+        // A zombie of another process, or any zombie once ours was reaped.
+        let os = FakeOs::new([StartIdentity::Zombie("linux:2000".into())]);
+        assert_eq!(group_state_on(&os, &known()), GroupState::Gone);
+        let os = FakeOs::new([z()]);
         assert_eq!(
-            System.start_identity(std::process::id()),
-            platform::process_start_identity(std::process::id())
+            group_state_on(&os, &target(Leader::Ended)),
+            GroupState::Gone
         );
-        let before = System.monotonic_ms();
-        System.pause(1);
-        assert!(System.monotonic_ms() >= before);
+        assert!(os.signals.borrow().is_empty());
+    }
+
+    #[test]
+    fn unproven_members_after_a_signal_are_waited_for_and_never_signalled() {
+        // TERM reaches the leader; what is then left under the number (the
+        // leader not reaped yet, members still ending) is not known to be
+        // ours any more. It is waited for, not signalled.
+        let mut os = FakeOs::new([id("linux:1000"), id("linux:1000"), StartIdentity::NoProcess]);
+        os.dies_when_signalled = false;
+        os.proven.set(false);
+        assert_eq!(
+            stop_group_on(&os, &known(), times()),
+            StopResult::IdentityUnknown
+        );
+        assert_eq!(os.sent(), vec![(PGID, libc::SIGTERM)], "no KILL followed");
+        assert!(os.now.get() >= 200, "both windows were waited out");
+
+        // The same, and they end during the wait: confirmed.
+        struct Ends(FakeOs);
+        impl Os for Ends {
+            fn read(&self, pid: u32) -> ProcessRead {
+                self.0.read(pid)
+            }
+            fn signal_group(&self, pgid: i32, sig: i32) -> GroupSignal {
+                self.0.signal_group(pgid, sig)
+            }
+            fn member_proven(&self, pgid: i32) -> bool {
+                self.0.member_proven(pgid)
+            }
+            fn monotonic_ms(&self) -> u64 {
+                self.0.monotonic_ms()
+            }
+            fn pause(&self, ms: u64) {
+                self.0.pause(ms);
+                if self.0.now.get() >= 50 {
+                    self.0.members.set(false);
+                }
+            }
+        }
+        let mut os = FakeOs::new([id("linux:1000"), id("linux:1000"), StartIdentity::NoProcess]);
+        os.dies_when_signalled = false;
+        os.proven.set(false);
+        let os = Ends(os);
+        assert_eq!(stop_group_on(&os, &known(), times()), StopResult::Confirmed);
+        assert_eq!(os.0.sent(), vec![(PGID, libc::SIGTERM)]);
+        assert!(os.0.now.get() < 100);
+    }
+
+    #[test]
+    fn a_stop_waits_only_for_unproven_members_it_may_have_signalled() {
+        assert_eq!(waits_for(GroupState::Alive, false), None);
+        assert_eq!(waits_for(GroupState::Alive, true), None);
+        assert_eq!(waits_for(GroupState::Gone, false), None);
+        assert_eq!(waits_for(GroupState::Gone, true), None);
+        assert_eq!(waits_for(GroupState::Unproven, true), Some(true));
+        assert_eq!(waits_for(GroupState::Unproven, false), Some(false));
+        assert_eq!(waits_for(GroupState::Unknown, true), Some(false));
+        assert_eq!(waits_for(GroupState::Unknown, false), Some(false));
+        assert_eq!(unconfirmed(GroupState::Alive), StopResult::Unconfirmed);
+        assert_eq!(
+            unconfirmed(GroupState::Unproven),
+            StopResult::IdentityUnknown
+        );
+        assert_eq!(
+            unconfirmed(GroupState::Unknown),
+            StopResult::IdentityUnknown
+        );
+    }
+
+    #[test]
+    fn the_real_system_reads_and_refuses_as_the_platform_does() {
+        let os = System(&NoEvidence);
+        // No signal is sent here: group 0 is refused by the guarded helper.
+        assert_eq!(os.signal_group(0, 0), GroupSignal::Empty);
+        assert_eq!(
+            os.read(std::process::id()),
+            platform::read_process(std::process::id())
+        );
+        assert!(!os.member_proven(i32::MAX - 1));
+        let before = os.monotonic_ms();
+        os.pause(1);
+        assert!(os.monotonic_ms() >= before);
     }
 
     #[test]

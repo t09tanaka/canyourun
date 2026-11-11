@@ -2,9 +2,13 @@
 
 #![allow(dead_code)]
 
-use remote_task_runner::platform::{process_start_identity, signal_pid, StartIdentity};
+use remote_task_runner::platform::{
+    process_group_of, process_start_identity, signal_pid, StartIdentity,
+};
 use remote_task_runner::supervisor::identity::Leader;
-use remote_task_runner::supervisor::stop::{stop_group, StopTarget, StopTimes};
+use remote_task_runner::supervisor::stop::{
+    stop_group, Members, NoEvidence, StopTarget, StopTimes,
+};
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
@@ -62,10 +66,54 @@ pub fn kill_recorded(pid: u32, start: &str) {
     }
 }
 
-/// Stop what is left of the group led by `pid`, through the same gate the
-/// supervisor uses: the leader must still have the start identity `start`,
-/// or be definitely gone with members left. A reused PID or an unreadable
-/// identity is never signalled.
+/// The command line of `pid`, as `ps` shows it.
+fn command_line(pid: u32) -> Option<String> {
+    let out = std::process::Command::new("ps")
+        .args(["-ww", "-o", "command=", "-p", &pid.to_string()])
+        .output()
+        .ok()?;
+    out.status
+        .success()
+        .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// SIGKILL `pid` alone, for a PID that a search of the process table gave
+/// (`pgrep`): only when the process whose identity is read first has
+/// `pattern` in its command line, and is still that process right before
+/// the signal. A number that was reused since the search, or whose identity
+/// cannot be read, is left alone.
+pub fn kill_if_command(pid: i32, pattern: &str) {
+    let Ok(pid) = u32::try_from(pid) else {
+        return;
+    };
+    let Some(start) = identity_of(pid) else {
+        return;
+    };
+    if command_line(pid).is_some_and(|c| c.contains(pattern)) {
+        kill_recorded(pid, &start);
+    }
+}
+
+/// Processes a test started itself and read while it held them (PID and
+/// start identity): the evidence that a group whose leader has ended still
+/// holds one of them.
+pub struct RecordedMembers(pub Vec<(u32, String)>);
+
+impl Members for RecordedMembers {
+    fn proven(&self, pgid: i32) -> bool {
+        self.0.iter().any(|(pid, start)| {
+            let same = || process_start_identity(*pid) == StartIdentity::Identity(start.clone());
+            // Read again after the group: the group read was of that process.
+            same() && process_group_of(*pid) == Some(pgid) && same()
+        })
+    }
+}
+
+/// Stop the group led by `pid`, through the same gate the supervisor uses:
+/// the leader must still have the start identity `start`. A reused PID or
+/// an unreadable identity is never signalled, and neither is what a leader
+/// that is gone left under its number (there is no evidence here of whose
+/// that is).
 pub fn kill_recorded_group(pid: u32, start: &str) {
     let Ok(pgid) = i32::try_from(pid) else {
         return;
@@ -80,7 +128,7 @@ pub fn kill_recorded_group(pid: u32, start: &str) {
         kill_wait_ms: 2_000,
         poll_ms: 10,
     };
-    let _ = stop_group(&target, times);
+    let _ = stop_group(&target, times, &NoEvidence);
 }
 
 /// The pid written in a file, if it holds one.

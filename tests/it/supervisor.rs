@@ -955,9 +955,42 @@ fn a_dead_leader_with_a_surviving_descendant_is_stopped_by_recovery() {
     child.wait().unwrap();
     let bgp = read_pid(&bg).unwrap();
     assert!(alive(bgp));
+    // Nothing says that what is left under the dead leader's number is the
+    // command's: the number may be another group's by now. Nothing is
+    // signalled, and the attempt stays unresolved for that reason alone.
+    let r = recover(&recover_spec(&f), &f.store).unwrap();
+    assert!(r.unresolved.is_some() && r.identity_unknown, "{r:?}");
+    assert_eq!(r.termination, None);
+    assert!(alive(bgp), "left alone");
+    // With the descendant recorded while the command ran (as the tracker of
+    // a managed command does: PID and start time), it is the command's.
+    record_descendant(&f, 0, bgp as u32);
     let t = settled(&recover(&recover_spec(&f), &f.store).unwrap());
     assert_eq!(t.outcome(), Outcome::Interrupted);
     wait_for("the descendant to be gone", || !alive(bgp));
+}
+
+/// Write the record a managed command's tracker keeps of a descendant of
+/// node `index`: its PID and start time, read here from the live process.
+fn record_descendant(f: &Fx, index: usize, pid: u32) {
+    use task_traffic_controller::{managed, process, Context, Paths};
+    let id = remote_task_runner::supervisor::spec::command_id(f.attempt(), index);
+    let start = process::start_time(pid).expect("the descendant is running");
+    let sidecar: managed::Sidecar = serde_json::from_value(serde_json::json!({
+        "version": 1,
+        "command_id": id,
+        "spec_digest": "test",
+        // Settled for the controller: only the stop is looked at here.
+        "phase": "terminal",
+        "boot_id": null,
+        "registered_at": "2026-01-01T00:00:00Z",
+        "owner_pid": std::process::id(),
+        "owner_start_time": null,
+        "descendants": [{ "pid": pid, "start_time": start }],
+    }))
+    .unwrap();
+    let paths = Paths::new(&f.spec.traffic_state_dir, f.spec.traffic_config_path());
+    managed::write_sidecar(&Context::new(paths), &sidecar).unwrap();
 }
 
 #[test]

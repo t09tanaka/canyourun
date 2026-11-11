@@ -5,6 +5,7 @@ pub mod escalation;
 pub mod identity;
 pub mod lease;
 pub mod lock;
+mod members;
 pub mod outcome;
 pub mod process;
 mod pump;

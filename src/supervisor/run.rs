@@ -26,10 +26,13 @@
 //! and node). Trying again is the parent's job, not this process's: the
 //! parent's reconcile sees the supervisor lock free and the attempt not
 //! terminal, starts `supervise` again, and [`super::recover::recover`] redoes
-//! the stop of the group (S10/S12 implement that loop).
+//! the stop of the group (S10/S12 implement that loop). When the only reason
+//! is that whose a process or group is could not be told, the exit code is
+//! `IDENTITY_UNKNOWN` instead, which the parent does not count as a failure.
 
 use super::error::{Result, SupervisorError};
 use super::identity::Leader;
+use super::members::ManagedMembers;
 use super::outcome::{add_ref, finish_attempt, sync_log_position, OutcomeError, SpoolEnd};
 use super::pump::{pump, Pipe};
 use super::spec::{command_id, spec_digest, NodeSpec, SuperviseSpec};
@@ -79,6 +82,11 @@ pub struct Report {
     /// by starting the supervisor again (it recovers and redoes the stop);
     /// this process does not wait for that.
     pub unresolved: Option<String>,
+    /// The attempt is unresolved for no other reason than that whose a
+    /// process or group is could not be told (nothing of it was signalled).
+    /// That can clear up by itself, so the parent keeps looking again
+    /// instead of counting it as a failure.
+    pub identity_unknown: bool,
     /// What came of the idle-sleep inhibition ("held via ..." or
     /// "unavailable: ...", "disabled").
     pub sleep_inhibit: String,
@@ -128,10 +136,6 @@ pub(crate) fn stop_times(spec: &SuperviseSpec) -> StopTimes {
 }
 
 /// Stop the group, with the bounded retries when it cannot be confirmed.
-pub(crate) fn stop_confirmed(t: &StopTarget, spec: &SuperviseSpec) -> StopResult {
-    stop_confirmed_on(&System, t, spec)
-}
-
 pub(crate) fn stop_confirmed_on(os: &dyn Os, t: &StopTarget, spec: &SuperviseSpec) -> StopResult {
     stop_group_retrying_on(os, t, stop_times(spec), retries_for(spec.kill_wait_ms))
 }
@@ -151,6 +155,7 @@ pub(crate) fn unresolved_report(
     attempt: &crate::ids::AttemptId,
     nodes: &[String],
     reason: String,
+    identity_unknown: bool,
     sleep_inhibit: String,
 ) -> Result<Report> {
     if let Some(a) = store.get(attempt)? {
@@ -158,7 +163,11 @@ pub(crate) fn unresolved_report(
             Some(&a.run_id),
             Some(attempt),
             "supervisor_unresolved",
-            &json!({ "reason": reason, "nodes": nodes }),
+            &json!({
+                "reason": reason,
+                "nodes": nodes,
+                "identity_unknown": identity_unknown,
+            }),
             platform::wall_ms(),
         )?;
     }
@@ -166,6 +175,7 @@ pub(crate) fn unresolved_report(
         termination: None,
         finalized_here: false,
         unresolved: Some(reason),
+        identity_unknown,
         sleep_inhibit,
     })
 }
@@ -768,6 +778,10 @@ impl Control<'_> {
         let run_since = platform::monotonic_ms();
         let ctx = self.traffic.ctx.clone();
         let mut watch = Watch::default();
+        // What the command leaves under its group number once its leader has
+        // ended is signalled only with evidence that a member is its own.
+        let members = ManagedMembers::new(&ctx, id);
+        let os = System(&members);
         let ran = std::thread::scope(|s| {
             let handle = s.spawn(|| managed::run_command(&ctx, &guard, opts, limits));
             while !handle.is_finished() {
@@ -780,7 +794,7 @@ impl Control<'_> {
                     }
                 }
                 if let (Some(_), Some(t), false) = (watch.reason, &watch.target, watch.stopped) {
-                    let (pid, result) = (t.pid, stop_confirmed(t, self.spec));
+                    let (pid, result) = (t.pid, stop_confirmed_on(&os, t, self.spec));
                     if watch.after_stop(result) {
                         // Nothing was signalled; the stop is tried again on
                         // the next look. Said once in the event log.
@@ -811,7 +825,7 @@ impl Control<'_> {
             self.note_not_recorded(&node.node_id, t.pid)?;
         }
         if let Some(t) = &leftover {
-            let result = stop_confirmed(t, self.spec);
+            let result = stop_confirmed_on(&os, t, self.spec);
             if watch.after_leftover_stop(result) && !watch.deferred_noted {
                 self.note_identity_unknown(&node.node_id, t.pid);
             }
@@ -923,7 +937,9 @@ impl Control<'_> {
     fn note_not_recorded(&self, node: &NodeId, pid: u32) -> Result<()> {
         let attempt = &self.spec.attempt_id;
         let why = match platform::process_start_identity(pid) {
-            StartIdentity::NoProcess => "the command ended before its identity could be read",
+            StartIdentity::NoProcess | StartIdentity::Zombie(_) => {
+                "the command ended before its identity could be read"
+            }
             StartIdentity::Identity(_) | StartIdentity::Unknown => {
                 "the start identity of the command could not be read"
             }
@@ -1057,12 +1073,17 @@ pub(crate) fn sidecar_child(ctx: &Context, id: &str) -> Option<(u32, i32)> {
 /// read of its PID says about it now: its identity, that it has ended, or
 /// that it could not be read (and then nothing of it is signalled until a
 /// later look can read it).
+///
+/// The command is a child of this process, and is reaped by the thread that
+/// runs it. A read after that may find another process with the PID, so an
+/// identity is taken only from a process whose parent (from the same read)
+/// is this process ([`Leader::from_read`]).
 fn child_target(ctx: &Context, id: &str) -> Option<StopTarget> {
     let (pid, pgid) = sidecar_child(ctx, id)?;
     Some(StopTarget {
         pid,
         pgid,
-        leader: Leader::from_read(platform::process_start_identity(pid)),
+        leader: Leader::from_read(&platform::read_process(pid), std::process::id()),
     })
 }
 
@@ -1085,6 +1106,7 @@ pub fn run(spec: &SuperviseSpec) -> Result<Report> {
             termination: Some(t),
             finalized_here: false,
             unresolved: None,
+            identity_unknown: false,
             sleep_inhibit: "not needed".into(),
         });
     }
@@ -1165,6 +1187,7 @@ pub fn run(spec: &SuperviseSpec) -> Result<Report> {
                 termination: Some(termination),
                 finalized_here,
                 unresolved: None,
+                identity_unknown: false,
                 sleep_inhibit,
             });
         }
@@ -1199,8 +1222,9 @@ pub fn run(spec: &SuperviseSpec) -> Result<Report> {
     }
     if end.unconfirmed {
         let why = if end.identity_unknown {
-            "the identity of the command's process could not be read, so nothing was \
-             signalled and its processes could not be confirmed stopped"
+            "whose the command's processes are could not be told (an identity could not be \
+             read, or nothing left in its group is known to be its own), so nothing was \
+             signalled and they could not be confirmed stopped"
         } else {
             "the command's processes could not be confirmed stopped"
         };
@@ -1209,6 +1233,7 @@ pub fn run(spec: &SuperviseSpec) -> Result<Report> {
             attempt,
             &[last_node.clone()],
             format!("node {last_node}: {why}; the attempt stays unresolved"),
+            end.identity_unknown,
             sleep_inhibit,
         );
     }
@@ -1221,6 +1246,7 @@ pub fn run(spec: &SuperviseSpec) -> Result<Report> {
         termination: Some(termination),
         finalized_here,
         unresolved: None,
+        identity_unknown: false,
         sleep_inhibit,
     })
 }
