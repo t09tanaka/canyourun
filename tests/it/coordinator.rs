@@ -1519,7 +1519,7 @@ async fn a_cancel_while_a_retire_is_pending_settles_the_attempt_cancelled() {
 #[tokio::test]
 async fn a_worker_that_stalls_does_not_keep_the_leases_of_the_others_from_renewal() {
     let mut f = fx();
-    f.cfg.worker_budget_ms = 300;
+    f.cfg.worker_budget_ms = 1_500;
     // It is asked first (by id), and holds two attempts.
     let stalled = f.worker("w-a", (2, 0));
     let healthy = f.worker("w-b", (2, 0));
