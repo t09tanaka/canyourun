@@ -10,7 +10,7 @@
 use crate::ids::{AttemptId, Digest};
 use crate::source::safety::fold_path;
 use crate::state::Termination;
-use crate::wire::ArtifactRecord;
+use crate::wire::{ArtifactNotStored, ArtifactRecord};
 use serde_json::{json, Value};
 use std::collections::BTreeSet;
 use std::ffi::OsString;
@@ -337,8 +337,71 @@ pub fn check_artifact_plan(
 /// before the attempt is settled: whoever settles it (this supervisor, or a
 /// later one after a crash, when the workspace may be gone) stores the same
 /// list in the result.
-pub fn artifacts_event(artifacts: &[ArtifactRecord]) -> Value {
-    json!({ "set": ARTIFACTS_EVENT_KEY, "artifacts": artifacts_json(artifacts) })
+///
+/// The same entry fixes the declared artifacts that were *not* stored
+/// (`not_stored`), with the policy of each declaration, so the result says
+/// which of them were required whoever settles the attempt.
+pub fn artifacts_event(artifacts: &[ArtifactRecord], not_stored: &[ArtifactNotStored]) -> Value {
+    json!({
+        "set": ARTIFACTS_EVENT_KEY,
+        "artifacts": artifacts_json(artifacts),
+        "not_stored": not_stored_json(not_stored),
+    })
+}
+
+/// The declared artifacts that were not stored as the journal and the result
+/// hold them: by name, so the same set is the same value.
+pub fn not_stored_json(not_stored: &[ArtifactNotStored]) -> Value {
+    let mut sorted: Vec<&ArtifactNotStored> = not_stored.iter().collect();
+    sorted.sort_by(|a, b| a.name.cmp(&b.name));
+    json!(sorted)
+}
+
+/// The key of the stored result that lists the declared artifacts that were
+/// not stored. Absent when there is none.
+pub const NOT_STORED_KEY: &str = "artifacts_not_stored";
+
+/// The list under `key` of `holder`: none when the key is absent, `None`
+/// when what is there cannot be read (never taken for "none").
+fn not_stored_at(holder: &Value, key: &str) -> Option<Vec<ArtifactNotStored>> {
+    match holder.get(key) {
+        None => Some(Vec::new()),
+        Some(v) => serde_json::from_value(v.clone()).ok(),
+    }
+}
+
+/// The declared artifacts an attempt's journal fixed as not stored, from the
+/// payloads of its `artifacts_stored` entries (the first holds, like
+/// [`journaled_artifacts`]): none without an entry, `None` when the entry
+/// cannot be read.
+pub fn journaled_not_stored(payloads: &[&Value]) -> Option<Vec<ArtifactNotStored>> {
+    let Some(first) = payloads.first() else {
+        return Some(Vec::new());
+    };
+    not_stored_at(first, "not_stored")
+}
+
+/// The stored result with the declared artifacts that were not stored. A
+/// result without any is the same bytes as before the list existed.
+pub fn with_not_stored(mut result: Value, not_stored: &[ArtifactNotStored]) -> Value {
+    if !not_stored.is_empty() {
+        result[NOT_STORED_KEY] = not_stored_json(not_stored);
+    }
+    result
+}
+
+/// The declared artifacts a stored result says were not stored; `None` when
+/// the list cannot be read.
+pub fn result_not_stored(result: &Value) -> Option<Vec<ArtifactNotStored>> {
+    not_stored_at(result, NOT_STORED_KEY)
+}
+
+/// Whether a stored result lists exactly these artifacts as not stored.
+pub fn result_has_not_stored(result: &Value, not_stored: &[ArtifactNotStored]) -> bool {
+    match result.get(NOT_STORED_KEY) {
+        None => not_stored.is_empty(),
+        Some(v) => !not_stored.is_empty() && *v == not_stored_json(not_stored),
+    }
 }
 
 /// The one key of the `artifacts_stored` entry: an attempt has one set.
@@ -463,6 +526,7 @@ mod tests {
     use super::*;
     use crate::ids::SourceId;
     use crate::state::Outcome;
+    use crate::wire::{MissingPolicy, NotStoredReason};
     use serde_json::json;
 
     fn rec(end: u64, dropped: u64) -> [u8; RECORD_LEN] {
@@ -847,14 +911,109 @@ mod tests {
         );
     }
 
+    fn unstored(
+        name: &str,
+        if_missing: MissingPolicy,
+        reason: NotStoredReason,
+    ) -> ArtifactNotStored {
+        ArtifactNotStored {
+            name: name.into(),
+            path: format!("out/{name}"),
+            if_missing,
+            reason,
+        }
+    }
+
+    #[test]
+    fn the_journal_and_the_result_fix_the_declared_artifacts_that_were_not_stored() {
+        let req = unstored("b", MissingPolicy::Required, NotStoredReason::Missing);
+        let opt = unstored("a", MissingPolicy::Optional, NotStoredReason::Missing);
+        let kept = record("kept.txt");
+        let event = artifacts_event(std::slice::from_ref(&kept), &[req.clone(), opt.clone()]);
+        // By name, whatever order they came in; the stored ones are untouched.
+        assert_eq!(
+            event,
+            artifacts_event(std::slice::from_ref(&kept), &[opt.clone(), req.clone()])
+        );
+        assert_eq!(
+            event["not_stored"],
+            json!([
+                {"name": "a", "path": "out/a", "if_missing": "optional", "reason": "missing"},
+                {"name": "b", "path": "out/b", "if_missing": "required", "reason": "missing"},
+            ])
+        );
+        assert_eq!(journaled_artifacts(&[&event]), Some(vec![kept.clone()]));
+        assert_eq!(
+            journaled_not_stored(&[&event]),
+            Some(vec![opt.clone(), req.clone()])
+        );
+        // No entry, an entry that lists none, and an entry written before
+        // the list existed: none. The first entry holds.
+        assert_eq!(journaled_not_stored(&[]), Some(vec![]));
+        assert_eq!(
+            journaled_not_stored(&[&artifacts_event(&[], &[])]),
+            Some(vec![])
+        );
+        assert_eq!(
+            journaled_not_stored(&[&json!({"set": "attempt", "artifacts": []})]),
+            Some(vec![])
+        );
+        assert_eq!(
+            journaled_not_stored(&[&artifacts_event(&[], &[]), &event]),
+            Some(vec![])
+        );
+        // Unreadable is not "none".
+        assert_eq!(journaled_not_stored(&[&json!({"not_stored": "x"})]), None);
+        assert_eq!(
+            journaled_not_stored(&[&json!({"not_stored": [{"name": "a"}]})]),
+            None
+        );
+
+        // The result: the key is there only when something was not stored.
+        assert_eq!(NOT_STORED_KEY, "artifacts_not_stored");
+        let s = StreamSummary {
+            bytes: 0,
+            dropped_bytes: 0,
+            last_seq: 0,
+        };
+        let t =
+            Termination::new(Outcome::Succeeded, Some(crate::state::Exit::Code(0)), None).unwrap();
+        let plain = result_json(&t, std::slice::from_ref(&kept), s, s);
+        assert_eq!(with_not_stored(plain.clone(), &[]), plain);
+        assert!(plain.get(NOT_STORED_KEY).is_none());
+        assert_eq!(result_not_stored(&plain), Some(vec![]));
+        assert!(result_has_not_stored(&plain, &[]));
+        assert!(!result_has_not_stored(&plain, std::slice::from_ref(&req)));
+
+        let full = with_not_stored(plain.clone(), &[req.clone(), opt.clone()]);
+        assert_eq!(full[NOT_STORED_KEY], event["not_stored"]);
+        assert_eq!(full["artifacts"], plain["artifacts"]);
+        assert_eq!(
+            result_not_stored(&full),
+            Some(vec![opt.clone(), req.clone()])
+        );
+        assert!(result_has_not_stored(&full, &[opt.clone(), req.clone()]));
+        assert!(result_has_not_stored(&full, &[req.clone(), opt.clone()]));
+        assert!(!result_has_not_stored(&full, &[]));
+        assert!(!result_has_not_stored(&full, std::slice::from_ref(&req)));
+        // The policy and the reason are part of what is fixed.
+        let as_optional = unstored("b", MissingPolicy::Optional, NotStoredReason::Missing);
+        assert!(!result_has_not_stored(&full, &[opt.clone(), as_optional]));
+        let as_refused = unstored("b", MissingPolicy::Required, NotStoredReason::Refused);
+        assert!(!result_has_not_stored(&full, &[opt.clone(), as_refused]));
+        // A stored key that lists none is not what an empty list is stored as.
+        assert!(!result_has_not_stored(&json!({NOT_STORED_KEY: []}), &[]));
+        assert_eq!(result_not_stored(&json!({NOT_STORED_KEY: "x"})), None);
+    }
+
     #[test]
     fn the_journal_fixes_the_artifacts_of_an_attempt() {
         let (a, b) = (record("b.txt"), record("a.txt"));
-        let event = artifacts_event(&[a.clone(), b.clone()]);
+        let event = artifacts_event(&[a.clone(), b.clone()], &[]);
         assert_eq!(event["set"], ARTIFACTS_EVENT_KEY);
         assert_eq!(ARTIFACTS_EVENT_KEY, "attempt");
         // By name, like the result: the same set is the same entry.
-        assert_eq!(event, artifacts_event(&[b.clone(), a.clone()]));
+        assert_eq!(event, artifacts_event(&[b.clone(), a.clone()], &[]));
         assert_eq!(
             journaled_artifacts(&[&event]),
             Some(vec![b.clone(), a.clone()])
@@ -874,9 +1033,12 @@ mod tests {
         assert!(result_has_artifacts(&stored, &[a.clone(), b.clone()]));
         // No entry: nothing was kept. An entry that fixed none: none.
         assert_eq!(journaled_artifacts(&[]), Some(vec![]));
-        assert_eq!(journaled_artifacts(&[&artifacts_event(&[])]), Some(vec![]));
+        assert_eq!(
+            journaled_artifacts(&[&artifacts_event(&[], &[])]),
+            Some(vec![])
+        );
         // The first entry is the one that holds (there is only ever one).
-        let other = artifacts_event(std::slice::from_ref(&a));
+        let other = artifacts_event(std::slice::from_ref(&a), &[]);
         assert_eq!(
             journaled_artifacts(&[&other, &event]),
             Some(vec![a.clone()])

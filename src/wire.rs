@@ -618,6 +618,29 @@ pub struct CommandSpec {
     pub timeout_ms: Option<u64>,
 }
 
+/// What to make of a declared artifact the commands did not leave behind.
+/// The worker only records it; whether a missing `required` artifact fails
+/// the run is the coordinator's judgement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MissingPolicy {
+    #[default]
+    Required,
+    Optional,
+}
+
+/// One file the commands of an attempt leave in the workspace, to be kept
+/// as an artifact (spec chapter 13).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ArtifactDecl {
+    /// The artifact's name: a plain relative path, and where it is kept in
+    /// the attempt's artifact store.
+    pub name: String,
+    /// Where the commands leave the file, relative to the workspace root.
+    pub path: String,
+    pub if_missing: MissingPolicy,
+}
+
 /// What a worker persists on acceptance. Its canonical JSON is hashed into
 /// `payload_hash`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -645,6 +668,12 @@ pub struct AttemptPayload {
     pub resource_wait_timeout_ms: Option<u64>,
     #[serde(default)]
     pub has_secret_bundle: bool,
+    /// The files to keep as artifacts. Part of the hash like every other
+    /// field: the same attempt with another list is another payload. An
+    /// empty list is not written, so a payload that declares none has the
+    /// canonical JSON, and the hash, it had before this field existed.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub artifacts: Vec<ArtifactDecl>,
 }
 
 /// Submit an attempt. If the attempt was retired, or cancelled before this
@@ -1027,6 +1056,29 @@ pub struct ArtifactRecord {
     pub profile_fingerprint: Digest,
 }
 
+/// Why a declared artifact is not among the stored ones.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NotStoredReason {
+    /// The commands left no file at the declared path.
+    Missing,
+    /// Something is there but was not kept: not a regular file, reached
+    /// through a symlink, too large, or clashing with a stored artifact.
+    Refused,
+}
+
+/// A declared artifact the worker did not store, with the policy of its
+/// declaration: a missing `required` one and a missing `optional` one are
+/// told apart in the result itself.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ArtifactNotStored {
+    pub name: String,
+    /// The declared path, relative to the workspace root.
+    pub path: String,
+    pub if_missing: MissingPolicy,
+    pub reason: NotStoredReason,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GetResultRequest {
     pub schema_version: SchemaVersion,
@@ -1044,6 +1096,10 @@ pub struct GetResultResponse {
     #[serde(default)]
     pub nodes: Vec<NodeResult>,
     pub artifacts: Vec<ArtifactRecord>,
+    /// Declared artifacts that were not stored; empty when all were, and
+    /// when the attempt started no command (nothing was looked for).
+    #[serde(default)]
+    pub artifacts_not_stored: Vec<ArtifactNotStored>,
     /// Digest over the whole result; echoed back in `ack_collected`.
     pub result_digest: Digest,
 }
@@ -1365,6 +1421,9 @@ macro_rules! operations {
         /// Any request, tagged by `op`.
         #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
         #[serde(tag = "op", rename_all = "snake_case")]
+        // A submit carries the whole payload; the others are small. Requests
+        // are made and consumed one at a time, never stored in bulk.
+        #[allow(clippy::large_enum_variant)]
         pub enum Request { $($variant($req)),* }
 
         /// Any successful response, tagged by `op`.
@@ -1542,6 +1601,11 @@ mod tests {
             deadline_ms: Some(3_600_000),
             resource_wait_timeout_ms: Some(120_000),
             has_secret_bundle: true,
+            artifacts: vec![ArtifactDecl {
+                name: "report".into(),
+                path: "out/report.xml".into(),
+                if_missing: MissingPolicy::Required,
+            }],
         }
     }
 
@@ -1916,6 +1980,12 @@ mod tests {
                 termination: timed_out(),
                 nodes: terminal_status().nodes,
                 artifacts: vec![artifact()],
+                artifacts_not_stored: vec![ArtifactNotStored {
+                    name: "coverage".into(),
+                    path: "out/coverage.xml".into(),
+                    if_missing: MissingPolicy::Required,
+                    reason: NotStoredReason::Missing,
+                }],
                 result_digest: dg("r"),
             }),
             Response::AckCollected(AckCollectedResponse {
@@ -2625,9 +2695,128 @@ mod tests {
         o.remove("command_timeout_ms");
         o.remove("resource_wait_timeout_ms");
         o.remove("has_secret_bundle");
+        o.remove("artifacts");
         let p: AttemptPayload = serde_json::from_value(v).unwrap();
         assert!(p.permit_id.is_none() && p.deadline_ms.is_none() && !p.has_secret_bundle);
+        assert!(p.artifacts.is_empty());
         assert!(p.command_timeout_ms.is_none() && p.resource_wait_timeout_ms.is_none());
+    }
+
+    #[test]
+    fn a_payload_that_declares_no_artifact_hashes_as_it_did_before_the_field_existed() {
+        // The canonical JSON of a payload as it was written before
+        // `artifacts` existed, and its sha256 as `shasum -a 256` gives it for
+        // this text: neither is made by the code under test.
+        const BEFORE: &str = concat!(
+            r#"{"command_timeout_ms":900000,"commands":[{"argv":["cargo","test"],"cwd":".","#,
+            r#""depends_on":[],"env":{"A":"1"},"node_id":"test","timeout_ms":1000}],"#,
+            r#""deadline_ms":3600000,"generation":1,"has_secret_bundle":true,"lease_ms":60000,"#,
+            r#""manifest_digest":"sha256:05b3abf2579a5eb66403cd78be557fd860633a1fe2103c7642030defe32c657f","#,
+            r#""permit_id":"prm_01M7504XASTK1991EQX42PKD7Z","#,
+            r#""plan_digest":"sha256:64879f7d6b960a01909762d911a32d4582c20010c5641ee90278b644a9e3b525","#,
+            r#""resource_wait_timeout_ms":120000,"run_id":"run_01M7504XAQM2RZM2XYFW5CMF0K","#,
+            r#""source_id":"src_01M7504XARC37Y0Q3RZKMHWV1M","task_id":"task_01M7504XARCRQ0DSP7KFQH1VYM"}"#,
+        );
+        const HASH: &str =
+            "sha256:9b76c5e57787b5f8d9c047613dd4986ccafc47d3bc9b65b50be0fd84c80be3b0";
+        // Without the field, and with an empty list: the same payload.
+        let absent: AttemptPayload = serde_json::from_str(BEFORE).unwrap();
+        let mut with_empty: Value = serde_json::from_str(BEFORE).unwrap();
+        with_empty["artifacts"] = json!([]);
+        let empty: AttemptPayload = serde_json::from_value(with_empty).unwrap();
+        assert!(absent.artifacts.is_empty());
+        assert_eq!(absent, empty);
+        for p in [&absent, &empty] {
+            let v = serde_json::to_value(p).unwrap();
+            assert!(v.get("artifacts").is_none());
+            assert_eq!(canonical_json(&v).unwrap(), BEFORE);
+            assert_eq!(payload_hash(p).unwrap().to_string(), HASH);
+        }
+        // A declaration is written, and is another payload.
+        let mut declared = absent.clone();
+        declared.artifacts = payload().artifacts;
+        let v = serde_json::to_value(&declared).unwrap();
+        assert_eq!(v["artifacts"].as_array().unwrap().len(), 1);
+        assert_ne!(payload_hash(&declared).unwrap().to_string(), HASH);
+        assert_eq!(
+            serde_json::from_value::<AttemptPayload>(v).unwrap(),
+            declared
+        );
+    }
+
+    #[test]
+    fn the_declared_artifacts_are_part_of_the_payload_hash() {
+        let base = payload();
+        let h = payload_hash(&base).unwrap();
+        assert_eq!(h, payload_hash(&base.clone()).unwrap());
+        let differs = |f: &dyn Fn(&mut AttemptPayload)| {
+            let mut p = base.clone();
+            f(&mut p);
+            assert_ne!(h, payload_hash(&p).unwrap());
+        };
+        differs(&|p| p.artifacts.clear());
+        differs(&|p| p.artifacts[0].name = "other".into());
+        differs(&|p| p.artifacts[0].path = "out/other.xml".into());
+        differs(&|p| p.artifacts[0].if_missing = MissingPolicy::Optional);
+        differs(&|p| {
+            let mut second = p.artifacts[0].clone();
+            second.name = "second".into();
+            p.artifacts.push(second);
+        });
+        // The order is the sender's: another order is another payload.
+        let mut two = base.clone();
+        two.artifacts.push(ArtifactDecl {
+            name: "b".into(),
+            path: "b".into(),
+            if_missing: MissingPolicy::Optional,
+        });
+        let mut swapped = two.clone();
+        swapped.artifacts.swap(0, 1);
+        assert_ne!(payload_hash(&two).unwrap(), payload_hash(&swapped).unwrap());
+        // A request built from the payload carries the hash that covers them.
+        let mut req = SubmitAttemptRequest::new(
+            RequestId::generate(),
+            CoordinatorEpoch(1),
+            AttemptId::generate(),
+            base.clone(),
+        )
+        .unwrap();
+        assert!(req.hash_matches().unwrap());
+        req.payload.artifacts[0].if_missing = MissingPolicy::Optional;
+        assert!(!req.hash_matches().unwrap());
+    }
+
+    #[test]
+    fn an_artifact_declaration_names_its_policy_in_snake_case() {
+        let v = serde_json::to_value(&payload().artifacts[0]).unwrap();
+        assert_eq!(
+            v,
+            serde_json::json!({"name": "report", "path": "out/report.xml", "if_missing": "required"})
+        );
+        assert_eq!(MissingPolicy::default(), MissingPolicy::Required);
+        assert_eq!(
+            serde_json::to_value(MissingPolicy::Optional).unwrap(),
+            "optional"
+        );
+        // The policy is always said: a declaration without it is refused.
+        assert!(serde_json::from_value::<ArtifactDecl>(
+            serde_json::json!({"name": "a", "path": "a"})
+        )
+        .is_err());
+        let n = ArtifactNotStored {
+            name: "a".into(),
+            path: "out/a".into(),
+            if_missing: MissingPolicy::Optional,
+            reason: NotStoredReason::Missing,
+        };
+        assert_eq!(
+            serde_json::to_value(&n).unwrap(),
+            serde_json::json!({"name": "a", "path": "out/a", "if_missing": "optional", "reason": "missing"})
+        );
+        assert_eq!(
+            serde_json::to_value(NotStoredReason::Refused).unwrap(),
+            "refused"
+        );
     }
 
     #[test]

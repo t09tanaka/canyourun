@@ -12,7 +12,8 @@ use remote_task_runner::error::{ApiError, ConflictReason, ErrorCode};
 use remote_task_runner::ids::*;
 use remote_task_runner::protocol::transport::duplex_pair;
 use remote_task_runner::protocol::{connect, CallError, Client};
-use remote_task_runner::secrets::envfile::{secret_values, Values};
+use remote_task_runner::secrets::envfile::secret_values;
+use remote_task_runner::secrets::place::{FileIdentity, Placed};
 use remote_task_runner::state::{AttemptState, Outcome, Receipt};
 use remote_task_runner::storage::{AcceptedAttempt, BlobKind, NewBlobRef, WorkerStore};
 use remote_task_runner::wire::*;
@@ -50,8 +51,12 @@ struct DirHost {
     /// The attempts being cleaned right now, and whether one ever was twice.
     cleaning: Mutex<Vec<String>>,
     overlap: AtomicBool,
-    /// Called by `mask_values` once it has read the values.
+    /// Called by `placed_secrets` once it has read the values.
     on_mask: Mutex<Option<MaskHook>>,
+    /// The secret files of every source; `None`: the source is not here.
+    secret_paths: Mutex<Option<Vec<String>>>,
+    /// The source is here and its secret files cannot be told.
+    secret_paths_error: Mutex<Option<ApiError>>,
 }
 
 type MaskHook = Box<dyn Fn(&AttemptId) + Send + Sync>;
@@ -116,6 +121,12 @@ impl Host for DirHost {
             warnings: Vec::new(),
         })
     }
+    fn secret_paths(&self, _: &AttemptPayload) -> Result<Option<Vec<String>>, ApiError> {
+        if let Some(e) = self.secret_paths_error.lock().unwrap().clone() {
+            return Err(e);
+        }
+        Ok(self.secret_paths.lock().unwrap().clone())
+    }
     fn place_secrets(
         &self,
         a: &AcceptedAttempt,
@@ -137,8 +148,13 @@ impl Host for DirHost {
     }
     /// From the file in the workspace, like the real host: nothing is kept
     /// in memory between the bundle's arrival and the start.
-    fn mask_values(&self, a: &AcceptedAttempt) -> Result<Values, ApiError> {
-        let content = std::fs::read(self.ws_dir(&a.attempt_id).join(".env")).unwrap_or_default();
+    fn placed_secrets(&self, a: &AcceptedAttempt) -> Result<Placed, ApiError> {
+        let env = self.ws_dir(&a.attempt_id).join(".env");
+        let files = std::fs::symlink_metadata(&env)
+            .iter()
+            .map(FileIdentity::of)
+            .collect();
+        let content = std::fs::read(&env).unwrap_or_default();
         let mut values = secret_values(&content);
         if self.binary_secret.load(Ordering::SeqCst) {
             values
@@ -148,7 +164,7 @@ impl Host for DirHost {
         if let Some(hook) = self.on_mask.lock().unwrap().as_ref() {
             hook(&a.attempt_id);
         }
-        Ok(values)
+        Ok(Placed { values, files })
     }
     fn cleanup(&self, a: &AttemptId, ws: Option<&Workspace>) -> Result<(), ApiError> {
         self.log(format!("cleanup {a}"));
@@ -202,6 +218,8 @@ pub(crate) fn fx() -> Fx {
         cleaning: Mutex::default(),
         overlap: AtomicBool::new(false),
         on_mask: Mutex::default(),
+        secret_paths: Mutex::new(Some(Vec::new())),
+        secret_paths_error: Mutex::new(None),
     });
     Fx {
         dir,
@@ -372,6 +390,15 @@ fn payload(script: &str) -> AttemptPayload {
         deadline_ms: None,
         resource_wait_timeout_ms: None,
         has_secret_bundle: false,
+        artifacts: Vec::new(),
+    }
+}
+
+fn decl(name: &str, path: &str, if_missing: MissingPolicy) -> ArtifactDecl {
+    ArtifactDecl {
+        name: name.into(),
+        path: path.into(),
+        if_missing,
     }
 }
 
@@ -1640,6 +1667,338 @@ async fn a_submit_that_no_supervisor_could_honour_is_refused_before_it_is_stored
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_submit_with_a_refused_artifact_declaration_is_refused_before_it_is_stored() {
+    use MissingPolicy::{Optional, Required};
+    let f = fx();
+    let agent = f.start("boot-a");
+    let c = f.connect(&agent).await;
+    *f.host.secret_paths.lock().unwrap() =
+        Some(vec![".env".to_string(), "config/local.json".to_string()]);
+    let a = AttemptId::generate();
+    let refused = |artifacts: Vec<ArtifactDecl>| {
+        let mut p = payload("true");
+        p.artifacts = artifacts;
+        submit_req(&a, &p)
+    };
+    let cases: Vec<(&str, Vec<ArtifactDecl>)> = vec![
+        (
+            "too many",
+            (0..1025)
+                .map(|i| decl(&format!("n{i}"), &format!("p{i}"), Optional))
+                .collect(),
+        ),
+        ("no name", vec![decl("", "a", Required)]),
+        ("long name", vec![decl(&"n".repeat(256), "a", Required)]),
+        ("long path", vec![decl("a", &"p".repeat(1025), Required)]),
+        ("absolute", vec![decl("a", "/etc/hosts", Required)]),
+        ("dot dot", vec![decl("a", "out/../../a", Required)]),
+        ("name leaves the store", vec![decl("../a", "a", Required)]),
+        (
+            "same name",
+            vec![decl("a", "x", Required), decl("a", "y", Optional)],
+        ),
+        (
+            "same path",
+            vec![decl("a", "x", Required), decl("b", "x", Optional)],
+        ),
+        (
+            "a secret file",
+            vec![decl("a", "out/a", Required), decl("env", ".env", Optional)],
+        ),
+        (
+            "a secret file spelled in another case",
+            vec![decl("a", "Config/Local.json", Required)],
+        ),
+    ];
+    for (what, artifacts) in cases {
+        let e = call(&c, refused(artifacts)).await.expect_err(what);
+        assert_eq!(e.code, ErrorCode::InvalidInput, "{what}: {e:?}");
+    }
+    assert!(f.store().get(&a).unwrap().is_none());
+    assert_eq!(f.host.count(&format!("prepare {a}")), 0);
+
+    // The same declarations without the fault are accepted, and the stored
+    // payload holds them.
+    let mut p = payload("true");
+    p.artifacts = vec![decl("a", "out/a", Required), decl("b", "out/b", Optional)];
+    assert!(!submit(&c, &a, &p).await.duplicate);
+    let stored: AttemptPayload = serde_json::from_value(f.rec(&a).spec).unwrap();
+    assert_eq!(stored.artifacts, p.artifacts);
+    // A resend is the same attempt; the same attempt declaring otherwise is
+    // another payload (the declarations are part of the hash).
+    assert!(submit(&c, &a, &p).await.duplicate);
+    p.artifacts[1].if_missing = Required;
+    let e = call(&c, submit_req(&a, &p)).await.unwrap_err();
+    assert_eq!(e.code, ErrorCode::Conflict);
+    f.wait_terminal(&a);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_secret_file_declared_as_an_artifact_starts_no_command_when_the_source_came_late() {
+    let f = fx();
+    let agent = f.start("boot-a");
+    let c = f.connect(&agent).await;
+    // The source is not on the worker at the acceptance, so nothing can be
+    // compared yet; it is there when the workspace has been made.
+    *f.host.secret_paths.lock().unwrap() = None;
+    f.host.block_prepare.store(true, Ordering::SeqCst);
+    let marker = f.path("ran");
+    let a = AttemptId::generate();
+    let mut p = payload(&format!("touch {}", marker.display()));
+    p.artifacts = vec![decl("env", ".env", MissingPolicy::Optional)];
+    submit(&c, &a, &p).await;
+    *f.host.secret_paths.lock().unwrap() = Some(vec![".env".to_string()]);
+    f.host.block_prepare.store(false, Ordering::SeqCst);
+    assert_eq!(f.wait_terminal(&a), Outcome::Failed);
+    assert!(!marker.exists());
+    assert!(f.store().launches(&a).unwrap().is_empty());
+    let failed = f.store().events_of(&a, "agent_prepare_failed").unwrap();
+    assert_eq!(failed.len(), 1);
+    assert_eq!(failed[0].payload["code"], "INVALID_INPUT");
+
+    // A source that never came: the declarations cannot be told from its
+    // secret files, and nothing is started either.
+    *f.host.secret_paths.lock().unwrap() = None;
+    let b = AttemptId::generate();
+    let mut p = payload(&format!("touch {}", marker.display()));
+    p.artifacts = vec![decl("out", "out.txt", MissingPolicy::Optional)];
+    submit(&c, &b, &p).await;
+    assert_eq!(f.wait_terminal(&b), Outcome::Failed);
+    assert!(!marker.exists());
+    assert!(f.store().launches(&b).unwrap().is_empty());
+    assert_eq!(events(&f, &b, "agent_prepare_failed"), 1);
+
+    // An attempt that declares nothing does not need the list.
+    let d = AttemptId::generate();
+    submit(&c, &d, &payload("true")).await;
+    assert_eq!(f.wait_terminal(&d), Outcome::Succeeded);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_source_whose_secret_files_cannot_be_told_refuses_the_submit_that_declares_artifacts() {
+    let f = fx();
+    let agent = f.start("boot-a");
+    let c = f.connect(&agent).await;
+    // The source is here, and it is not the one the payload names; or the
+    // store cannot be read. Neither is "not here yet": the answer is the
+    // error, and nothing is accepted.
+    for code in [ErrorCode::Conflict, ErrorCode::Internal] {
+        *f.host.secret_paths_error.lock().unwrap() = Some(ApiError::new(code, "the manifest"));
+        let a = AttemptId::generate();
+        let mut p = payload("true");
+        p.artifacts = vec![decl("out", "out.txt", MissingPolicy::Optional)];
+        let e = call(&c, submit_req(&a, &p)).await.unwrap_err();
+        assert_eq!(e.code, code, "{e:?}");
+        assert!(f.store().get(&a).unwrap().is_none());
+        assert_eq!(f.host.count(&format!("prepare {a}")), 0);
+    }
+    // An attempt that declares nothing does not ask.
+    let b = AttemptId::generate();
+    submit(&c, &b, &payload("true")).await;
+    assert_eq!(f.wait_terminal(&b), Outcome::Succeeded);
+}
+
+async fn result_of(c: &Client, a: &AttemptId) -> GetResultResponse {
+    match call(
+        c,
+        Request::GetResult(GetResultRequest {
+            schema_version: SchemaVersion::CURRENT,
+            request_id: RequestId::generate(),
+            attempt_id: a.clone(),
+            generation: Generation(1),
+        }),
+    )
+    .await
+    .unwrap()
+    {
+        Response::GetResult(r) => r,
+        other => panic!("{other:?}"),
+    }
+}
+
+/// Why the journal says the artifact `name` of `a` was not stored.
+fn why_not_stored(f: &Fx, a: &AttemptId, name: &str) -> String {
+    let said = f.store().events_of(a, "artifact_not_stored").unwrap();
+    let of_name: Vec<_> = said.iter().filter(|e| e.payload["name"] == name).collect();
+    assert_eq!(of_name.len(), 1, "{name}");
+    of_name[0].payload["why"].as_str().unwrap().to_string()
+}
+
+/// The link is refused for the file it is and the copy for what it holds.
+fn refused_as_link_and_copy(f: &Fx, a: &AttemptId) {
+    let (leak, copy) = (why_not_stored(f, a, "leak"), why_not_stored(f, a, "copy"));
+    assert!(
+        leak.contains("is one of the attempt's secret files"),
+        "{leak}"
+    );
+    assert!(copy.contains("contains a secret value"), "{copy}");
+    assert!(!format!("{leak}{copy}").contains("s3cr3t"));
+}
+
+/// `(name, reason)` of what the result says was not stored, by name.
+fn not_stored(r: &GetResultResponse) -> Vec<(String, NotStoredReason)> {
+    let mut v: Vec<_> = r
+        .artifacts_not_stored
+        .iter()
+        .map(|n| (n.name.clone(), n.reason))
+        .collect();
+    v.sort_by(|a, b| a.0.cmp(&b.0));
+    v
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_link_to_a_placed_secret_file_and_a_copy_of_its_value_are_not_kept_as_artifacts() {
+    const SECRET: &str = "s3cr3t-Value-0123456789";
+    let f = fx();
+    let agent = f.start("boot-a");
+    let c = f.connect(&agent).await;
+    f.host.secrets_ready.store(false, Ordering::SeqCst);
+    // Neither declared path is a secret file's path: the acceptance has
+    // nothing to refuse. What the names lead to is known only at the end.
+    let mut p = payload("ln .env leak.txt && cp .env copy.txt && printf fine > fine.txt");
+    p.has_secret_bundle = true;
+    p.artifacts = vec![
+        decl("leak", "leak.txt", MissingPolicy::Required),
+        decl("copy", "copy.txt", MissingPolicy::Required),
+        decl("fine", "fine.txt", MissingPolicy::Required),
+    ];
+    let a = AttemptId::generate();
+    submit(&c, &a, &p).await;
+    wait_for("the workspace record", || workspace_record(&f, &a).exists());
+    let put = Request::SecretBundlePut(SecretBundlePutRequest {
+        schema_version: SchemaVersion::CURRENT,
+        request_id: RequestId::generate(),
+        coordinator_epoch: CoordinatorEpoch(1),
+        attempt_id: a.clone(),
+        generation: Generation(1),
+        files: vec![SecretFile {
+            path: ".env".into(),
+            hmac_digest: HmacDigest::parse(&format!("hmac-sha256:{}", "a".repeat(64))).unwrap(),
+            content: Bytes(format!("API_TOKEN={SECRET}\n").into_bytes()),
+        }],
+    });
+    call(&c, put).await.unwrap();
+    assert_eq!(f.wait_terminal(&a), Outcome::Succeeded);
+    let result = result_of(&c, &a).await;
+    let names: Vec<&str> = result.artifacts.iter().map(|r| r.name.as_str()).collect();
+    assert_eq!(names, ["fine"]);
+    assert_eq!(
+        not_stored(&result),
+        [
+            ("copy".to_string(), NotStoredReason::Refused),
+            ("leak".to_string(), NotStoredReason::Refused),
+        ]
+    );
+    refused_as_link_and_copy(&f, &a);
+    let kept = f
+        .state()
+        .join("attempts")
+        .join(a.as_str())
+        .join("artifacts");
+    let files: Vec<_> = std::fs::read_dir(&kept)
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    assert_eq!(files, ["fine"]);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn declared_artifacts_reach_the_supervisor_and_the_result_tells_required_from_optional() {
+    use MissingPolicy::{Optional, Required};
+    let f = fx();
+    let mut cfg = f.cfg("boot-a");
+    cfg.profile_fingerprint = Digest::of_bytes(b"the profile of this worker");
+    let agent = f.start_with(cfg.clone());
+    let c = f.connect(&agent).await;
+    let a = AttemptId::generate();
+    let mut p = payload("mkdir out && printf abc > out/report.txt && printf x > note.txt");
+    p.source_id = SourceId::generate();
+    p.plan_digest = Digest::of_bytes(b"the plan");
+    p.artifacts = vec![
+        decl("reports/unit.txt", "out/report.txt", Required),
+        decl("note", "note.txt", Optional),
+        decl("needed", "out/never.txt", Required),
+        decl("nice", "nowhere/nice.txt", Optional),
+        decl("dir", "out", Required),
+    ];
+    submit(&c, &a, &p).await;
+    assert_eq!(f.wait_terminal(&a), Outcome::Succeeded);
+
+    let Response::GetResult(result) = call(
+        &c,
+        Request::GetResult(GetResultRequest {
+            schema_version: SchemaVersion::CURRENT,
+            request_id: RequestId::generate(),
+            attempt_id: a.clone(),
+            generation: Generation(1),
+        }),
+    )
+    .await
+    .unwrap() else {
+        panic!()
+    };
+    // Everything chapter 13 lists, per artifact.
+    let record = |name: &str, content: &[u8]| ArtifactRecord {
+        name: name.to_string(),
+        path: name.to_string(),
+        size: content.len() as u64,
+        digest: Digest::of_bytes(content),
+        source_id: p.source_id.clone(),
+        plan_digest: p.plan_digest.clone(),
+        attempt_id: a.clone(),
+        profile_fingerprint: cfg.profile_fingerprint.clone(),
+    };
+    assert_eq!(
+        result.artifacts,
+        vec![record("note", b"x"), record("reports/unit.txt", b"abc")]
+    );
+    let unstored = |name: &str, path: &str, if_missing, reason| ArtifactNotStored {
+        name: name.to_string(),
+        path: path.to_string(),
+        if_missing,
+        reason,
+    };
+    assert_eq!(
+        result.artifacts_not_stored,
+        vec![
+            unstored("dir", "out", Required, NotStoredReason::Refused),
+            unstored(
+                "needed",
+                "out/never.txt",
+                Required,
+                NotStoredReason::Missing
+            ),
+            unstored(
+                "nice",
+                "nowhere/nice.txt",
+                Optional,
+                NotStoredReason::Missing
+            ),
+        ]
+    );
+    // The files are in the attempt's store, under their names, and the
+    // stored result (what the digest is over) holds both lists.
+    let kept = f
+        .state()
+        .join("attempts")
+        .join(a.as_str())
+        .join("artifacts");
+    assert_eq!(
+        std::fs::read(kept.join("reports/unit.txt")).unwrap(),
+        b"abc"
+    );
+    assert_eq!(std::fs::read(kept.join("note")).unwrap(), b"x");
+    assert!(!kept.join("needed").exists() && !kept.join("dir").exists());
+    let stored = f.store().get_result(&a).unwrap().unwrap();
+    assert_eq!(stored["artifacts"].as_array().unwrap().len(), 2);
+    assert_eq!(stored["artifacts_not_stored"].as_array().unwrap().len(), 3);
+    assert_eq!(
+        result.result_digest,
+        remote_task_runner::wire::payload_hash(&stored).unwrap()
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn workspaces_are_prepared_no_more_than_the_limit_at_once() {
     let f = fx();
     let mut cfg = f.cfg("boot-a");
@@ -2513,6 +2872,9 @@ impl Host for RealButCore {
     fn prepare(&self, a: &AcceptedAttempt, p: &AttemptPayload) -> Result<Workspace, ApiError> {
         self.0.prepare(a, p)
     }
+    fn secret_paths(&self, p: &AttemptPayload) -> Result<Option<Vec<String>>, ApiError> {
+        self.0.secret_paths(p)
+    }
     fn place_secrets(
         &self,
         a: &AcceptedAttempt,
@@ -2524,8 +2886,8 @@ impl Host for RealButCore {
     fn secrets_ready(&self, a: &AcceptedAttempt) -> Result<bool, ApiError> {
         self.0.secrets_ready(a)
     }
-    fn mask_values(&self, a: &AcceptedAttempt) -> Result<Values, ApiError> {
-        self.0.mask_values(a)
+    fn placed_secrets(&self, a: &AcceptedAttempt) -> Result<Placed, ApiError> {
+        self.0.placed_secrets(a)
     }
     fn cleanup(&self, a: &AttemptId, ws: Option<&Workspace>) -> Result<(), ApiError> {
         self.0.cleanup(a, ws)
@@ -2610,6 +2972,48 @@ async fn the_real_host_runs_the_command_in_the_snapshot_of_the_run_and_removes_i
         assert!(f.store().launches(&b).unwrap().is_empty());
         assert!(!state.join("workspaces").join(b.as_str()).exists());
     }
+
+    // A run whose source has a secret file: the worker knows its path from
+    // the manifest in its store, and refuses to keep it as an artifact.
+    use local_ci::source::SecretSpec;
+    use remote_task_runner::secrets::capture::{capture_run, SecretInputs};
+    std::fs::write(plain.join("sub/.env"), "TOKEN=0123456789abcdef\n").unwrap();
+    let run = RunId::generate();
+    let key = remote_task_runner::secrets::key::ClusterKey::from_bytes(vec![5; 32]).unwrap();
+    let with_secret = capture_run(
+        &BTreeMap::new(),
+        &store,
+        &remote_task_runner::secrets::vault::Vault::open(&state).unwrap(),
+        &SecretInputs {
+            key: &key,
+            declared: &[SecretSpec {
+                glob: "sub/.env".into(),
+                required: true,
+            }],
+        },
+        &run,
+        &SourceRequest::Directory { dir: plain.clone() },
+        &CaptureParams::default(),
+    )
+    .unwrap();
+    assert_eq!(with_secret.manifest.secret_files.len(), 1);
+    let mut q = payload("true");
+    q.run_id = run;
+    q.source_id = with_secret.manifest.source_id.clone();
+    let digest = &with_secret.manifest.manifest_digest;
+    q.manifest_digest = Digest::parse(digest)
+        .or_else(|_| Digest::parse(&format!("sha256:{digest}")))
+        .unwrap();
+    q.artifacts = vec![decl("env", "Sub/.env", MissingPolicy::Optional)];
+    let b = AttemptId::generate();
+    let e = call(&c, submit_req(&b, &q)).await.unwrap_err();
+    assert_eq!(e.code, ErrorCode::InvalidInput, "{e:?}");
+    assert!(f.store().get(&b).unwrap().is_none());
+    // Another file of the same source is no secret: the declaration passes.
+    q.artifacts = vec![decl("x", "sub/x.txt", MissingPolicy::Optional)];
+    assert!(call(&c, submit_req(&b, &q)).await.is_ok());
+    call(&c, cancel_req(&b)).await.unwrap();
+    f.wait_terminal(&b);
 }
 
 /// The `forecast` operation is answered by the agent, with its own epoch and
@@ -2668,4 +3072,168 @@ async fn the_agent_answers_a_forecast_and_writes_nothing() {
         f.store().events_after(0, 1000).unwrap().len(),
     );
     assert_eq!(before, after);
+}
+
+fn real_env(f: &Fx) -> BTreeMap<String, String> {
+    std::fs::create_dir_all(f.path("home")).unwrap();
+    [
+        ("PATH", "/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin"),
+        ("HOME", f.path("home").to_str().unwrap()),
+        ("GIT_CONFIG_GLOBAL", "/dev/null"),
+        ("GIT_CONFIG_NOSYSTEM", "1"),
+    ]
+    .into_iter()
+    .map(|(k, v)| (k.to_string(), v.to_string()))
+    .collect()
+}
+
+fn digest_of(manifest_digest: &str) -> Digest {
+    Digest::parse(manifest_digest)
+        .or_else(|_| Digest::parse(&format!("sha256:{manifest_digest}")))
+        .unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_real_host_knows_a_worktreeinclude_file_and_a_placed_secret_under_any_name() {
+    use remote_task_runner::secrets::capture::{capture_run, SecretInputs};
+    use remote_task_runner::secrets::send::batch_requests;
+    use remote_task_runner::secrets::vault::Vault;
+    use remote_task_runner::source::{CaptureParams, SourceRequest, SourceStore};
+    const SECRET: &str = "s3cr3t-Value-0123456789";
+    let f = fx();
+    let state = f.state();
+    let env = real_env(&f);
+    let key = remote_task_runner::secrets::key::init(&state.join("cluster.key")).unwrap();
+    let store = SourceStore::open(&state).unwrap();
+    let vault = Vault::open(&state).unwrap();
+
+    // 1. A repository whose `.worktreeinclude` names an ignored file. Nobody
+    // declared it: it is a secret file of the manifest because the pattern
+    // matched.
+    let repo = f.path("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    let git = |args: &[&str]| {
+        let out = std::process::Command::new("git")
+            .args(["-c", "user.email=t@example.com", "-c", "user.name=t"])
+            .args(["-c", "commit.gpgsign=false"])
+            .args(args)
+            .current_dir(&repo)
+            .env_clear()
+            .envs(&env)
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git {args:?}: {out:?}");
+    };
+    git(&["init", "-q", "-b", "main"]);
+    std::fs::write(repo.join(".gitignore"), "local.env\n").unwrap();
+    std::fs::write(repo.join(".worktreeinclude"), "local.env\n").unwrap();
+    std::fs::write(repo.join("tracked.txt"), "t\n").unwrap();
+    git(&["add", "."]);
+    git(&["commit", "-qm", "base"]);
+    std::fs::write(repo.join("local.env"), format!("TOKEN={SECRET}\n")).unwrap();
+    let run = RunId::generate();
+    let included = capture_run(
+        &env,
+        &store,
+        &vault,
+        &SecretInputs {
+            key: &key,
+            declared: &[],
+        },
+        &run,
+        &SourceRequest::Worktree { dir: repo.clone() },
+        &CaptureParams::default(),
+    )
+    .unwrap();
+    let secret_files: Vec<String> = included
+        .manifest
+        .secret_files
+        .iter()
+        .map(|s| s.path.display())
+        .collect();
+    assert_eq!(secret_files, ["local.env"]);
+
+    let machine = remote_task_runner::worker::machine::Machine::open(
+        &state,
+        env.clone(),
+        state.join("cluster.key"),
+    )
+    .unwrap();
+    let agent = Agent::start(f.cfg("boot-a"), Arc::new(RealButCore(machine))).unwrap();
+    f.agents.lock().unwrap().push(agent.clone());
+    let c = f.connect(&agent).await;
+
+    // Declaring it is refused at the acceptance, as what it is.
+    let mut q = payload("true");
+    q.run_id = run;
+    q.source_id = included.manifest.source_id.clone();
+    q.manifest_digest = digest_of(&included.manifest.manifest_digest);
+    q.artifacts = vec![decl("env", "local.env", MissingPolicy::Optional)];
+    let a = AttemptId::generate();
+    let e = call(&c, submit_req(&a, &q)).await.unwrap_err();
+    assert_eq!(e.code, ErrorCode::InvalidInput, "{e:?}");
+    assert!(e.message.contains("secret files"), "{e:?}");
+    assert!(f.store().get(&a).unwrap().is_none());
+    // The same source with another manifest than the worker holds: the
+    // declarations cannot be compared, and that is the answer.
+    q.manifest_digest = Digest::of_bytes(b"another manifest");
+    let e = call(&c, submit_req(&a, &q)).await.unwrap_err();
+    assert_eq!(e.code, ErrorCode::Conflict, "{e:?}");
+    assert!(f.store().get(&a).unwrap().is_none());
+
+    // 2. A secret file placed by the real host: a hard link to it and a copy
+    // of it, under names no declaration check knows, are not kept.
+    let plain = f.path("plain");
+    std::fs::create_dir_all(&plain).unwrap();
+    std::fs::write(plain.join("x.txt"), "x\n").unwrap();
+    std::fs::write(plain.join(".env"), format!("TOKEN={SECRET}\n")).unwrap();
+    let run = RunId::generate();
+    let declared = [local_ci::source::SecretSpec {
+        glob: ".env".into(),
+        required: true,
+    }];
+    let captured = capture_run(
+        &BTreeMap::new(),
+        &store,
+        &vault,
+        &SecretInputs {
+            key: &key,
+            declared: &declared,
+        },
+        &run,
+        &SourceRequest::Directory { dir: plain.clone() },
+        &CaptureParams::default(),
+    )
+    .unwrap();
+    let bundle = vault
+        .load(&run, &captured.manifest.secret_files, &key)
+        .unwrap();
+    let mut p = payload("ln .env leak.txt && cp .env copy.txt && cp x.txt fine.txt");
+    p.run_id = run;
+    p.source_id = captured.manifest.source_id.clone();
+    p.manifest_digest = digest_of(&captured.manifest.manifest_digest);
+    p.has_secret_bundle = true;
+    p.artifacts = vec![
+        decl("leak", "leak.txt", MissingPolicy::Required),
+        decl("copy", "copy.txt", MissingPolicy::Required),
+        decl("fine", "fine.txt", MissingPolicy::Required),
+    ];
+    let b = AttemptId::generate();
+    submit(&c, &b, &p).await;
+    wait_for("the workspace record", || workspace_record(&f, &b).exists());
+    for r in batch_requests(&bundle, CoordinatorEpoch(1), &b, Generation(1)) {
+        call(&c, r).await.unwrap();
+    }
+    assert_eq!(f.wait_terminal(&b), Outcome::Succeeded);
+    let result = result_of(&c, &b).await;
+    let names: Vec<&str> = result.artifacts.iter().map(|r| r.name.as_str()).collect();
+    assert_eq!(names, ["fine"]);
+    assert_eq!(
+        not_stored(&result),
+        [
+            ("copy".to_string(), NotStoredReason::Refused),
+            ("leak".to_string(), NotStoredReason::Refused),
+        ]
+    );
+    refused_as_link_and_copy(&f, &b);
 }

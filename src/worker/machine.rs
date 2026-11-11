@@ -11,8 +11,8 @@ use crate::error::{ApiError, ErrorCode};
 use crate::ids::AttemptId;
 use crate::platform;
 use crate::secrets::capture::sweep_store_copies;
-use crate::secrets::envfile::Values;
 use crate::secrets::key;
+use crate::secrets::place::Placed;
 use crate::secrets::place::WorkerSecrets;
 use crate::secrets::vault::Vault;
 use crate::secrets::SecretError;
@@ -78,6 +78,10 @@ impl Machine {
     fn manifest(&self, attempt: &AcceptedAttempt) -> Result<CiManifest, ApiError> {
         let payload: AttemptPayload = serde_json::from_value(attempt.spec.clone())
             .map_err(|e| internal("stored payload", e))?;
+        self.manifest_of(&payload)
+    }
+
+    fn manifest_of(&self, payload: &AttemptPayload) -> Result<CiManifest, ApiError> {
         let missing = || {
             ApiError::new(
                 ErrorCode::NotFound,
@@ -172,6 +176,16 @@ impl Host for Machine {
             .create(&attempt.attempt_id, &self.store, &m, repo.as_ref())
     }
 
+    fn secret_paths(&self, payload: &AttemptPayload) -> Result<Option<Vec<String>>, ApiError> {
+        match self.manifest_of(payload) {
+            Ok(m) => Ok(Some(
+                m.secret_files.iter().map(|s| s.path.display()).collect(),
+            )),
+            Err(e) if e.code == ErrorCode::NotFound => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
     fn place_secrets(
         &self,
         attempt: &AcceptedAttempt,
@@ -204,9 +218,9 @@ impl Host for Machine {
         }
     }
 
-    fn mask_values(&self, attempt: &AcceptedAttempt) -> Result<Values, ApiError> {
+    fn placed_secrets(&self, attempt: &AcceptedAttempt) -> Result<Placed, ApiError> {
         self.secrets
-            .mask_values(&attempt.attempt_id)
+            .placed(&attempt.attempt_id)
             .map_err(|e| e.to_api())
     }
 

@@ -39,7 +39,7 @@ use crate::storage::{
     Seen, StorageError,
 };
 use crate::wire::{
-    payload_hash, AttemptPayload, AttemptStatus, CancelAttemptRequest, CommandSpec,
+    payload_hash, ArtifactDecl, AttemptPayload, AttemptStatus, CancelAttemptRequest, CommandSpec,
     GetAttemptRequest, InspectRequest, InspectResponse, RenewLeaseRequest, Request, Response,
     RetireAttemptRequest, RetireStatus, SchemaVersion, SubmitAttemptRequest,
 };
@@ -96,6 +96,10 @@ pub struct TaskSpec {
     pub resource_wait_timeout_ms: Option<u64>,
     #[serde(default)]
     pub has_secret_bundle: bool,
+    /// The files to keep as artifacts; none when the task declares none (and
+    /// then not written, like in the payload).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub artifacts: Vec<ArtifactDecl>,
 }
 
 /// The one place an [`AttemptPayload`] is made.
@@ -122,6 +126,7 @@ pub fn build_payload(
         deadline_ms: spec.deadline_ms,
         resource_wait_timeout_ms: spec.resource_wait_timeout_ms,
         has_secret_bundle: spec.has_secret_bundle,
+        artifacts: spec.artifacts.clone(),
     })
 }
 

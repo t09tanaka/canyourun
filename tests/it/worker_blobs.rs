@@ -15,7 +15,7 @@ use remote_task_runner::protocol::{connect, CallError, Client};
 use remote_task_runner::source::{capture, CaptureParams, SourceRequest, SourceStore};
 use remote_task_runner::state::{AttemptState, Outcome, Termination};
 use remote_task_runner::storage::{AcceptedAttempt, NewAcceptance, WorkerStore};
-use remote_task_runner::supervisor::outcome::{store_artifact, ArtifactInput};
+use remote_task_runner::supervisor::outcome::{store_artifact, ArtifactInput, Forbidden};
 use remote_task_runner::wire::*;
 use remote_task_runner::worker::blob_policy::{
     bundle_prerequisites, lock_shard, parse_reservation, staged_name, BlobLimits, Reservation,
@@ -395,6 +395,9 @@ impl Host for RealButCore {
     fn prepare(&self, a: &AcceptedAttempt, p: &AttemptPayload) -> Result<Workspace, ApiError> {
         self.0.prepare(a, p)
     }
+    fn secret_paths(&self, p: &AttemptPayload) -> Result<Option<Vec<String>>, ApiError> {
+        self.0.secret_paths(p)
+    }
     fn place_secrets(
         &self,
         a: &AcceptedAttempt,
@@ -406,11 +409,11 @@ impl Host for RealButCore {
     fn secrets_ready(&self, a: &AcceptedAttempt) -> Result<bool, ApiError> {
         self.0.secrets_ready(a)
     }
-    fn mask_values(
+    fn placed_secrets(
         &self,
         a: &AcceptedAttempt,
-    ) -> Result<remote_task_runner::secrets::envfile::Values, ApiError> {
-        self.0.mask_values(a)
+    ) -> Result<remote_task_runner::secrets::place::Placed, ApiError> {
+        self.0.placed_secrets(a)
     }
     fn cleanup(&self, a: &AttemptId, ws: Option<&Workspace>) -> Result<(), ApiError> {
         self.0.cleanup(a, ws)
@@ -601,6 +604,7 @@ fn payload(p: &Parcel, script: &str) -> AttemptPayload {
         deadline_ms: None,
         resource_wait_timeout_ms: None,
         has_secret_bundle: false,
+        artifacts: Vec::new(),
     }
 }
 
@@ -1392,6 +1396,7 @@ fn blob_get_serves_the_artifacts_of_the_attempt_in_chunks_and_nothing_else() {
                 source_id: source.source.clone(),
                 plan_digest: Digest::of_bytes(b"plan"),
                 profile_fingerprint: Digest::of_bytes(b""),
+                forbidden: &Forbidden::nothing(),
             },
             1 << 30,
         )

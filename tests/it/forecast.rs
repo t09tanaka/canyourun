@@ -129,6 +129,7 @@ fn accept(store: &WorkerStore, attempt: &AttemptId, node: &str) -> AcceptedAttem
         deadline_ms: None,
         resource_wait_timeout_ms: None,
         has_secret_bundle: false,
+        artifacts: Vec::new(),
     };
     store
         .submit(

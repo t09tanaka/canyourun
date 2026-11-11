@@ -776,6 +776,7 @@ dependencies = [
  "globset",
  "libc",
  "local-ci",
+ "memchr",
  "rusqlite",
  "rustix",
  "serde",
