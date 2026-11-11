@@ -14,6 +14,7 @@ mod not_implemented;
 mod protocol;
 mod scheduler;
 mod secrets;
+mod setup;
 mod source_capture;
 mod stop;
 mod supervisor;
