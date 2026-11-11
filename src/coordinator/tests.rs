@@ -35,6 +35,7 @@ fn spec() -> TaskSpec {
         deadline_ms: None,
         resource_wait_timeout_ms: None,
         has_secret_bundle: false,
+        artifacts: vec![],
     }
 }
 
@@ -174,4 +175,39 @@ async fn futures_are_joined_in_their_order_whichever_ends_first() {
     let fast = Box::pin(async { 2u32 }) as Pin<Box<dyn Future<Output = u32> + Send>>;
     assert_eq!(join_all(vec![slow, fast]).await, vec![1, 2]);
     assert_eq!(join_all::<u32>(vec![]).await, Vec::<u32>::new());
+}
+
+#[test]
+fn declared_artifacts_reach_the_payload_and_its_hash() {
+    use crate::wire::MissingPolicy;
+    let input = |spec: &TaskSpec| PlaceInput {
+        run_id: RunId::generate(),
+        task_id: TaskId::generate(),
+        generation: Generation(1),
+        source_id: Some(SourceId::generate()),
+        spec: serde_json::to_value(spec).unwrap(),
+    };
+    // A spec that declares none is stored as before the field existed.
+    let none = spec();
+    assert!(serde_json::to_value(&none)
+        .unwrap()
+        .get("artifacts")
+        .is_none());
+    let mut declared = spec();
+    declared.artifacts = vec![ArtifactDecl {
+        name: "report".into(),
+        path: "out/report.txt".into(),
+        if_missing: MissingPolicy::Required,
+    }];
+    let at = input(&declared);
+    let read: TaskSpec = serde_json::from_value(at.spec.clone()).unwrap();
+    let payload = build_payload(&at, &read, 60_000).unwrap();
+    assert_eq!(payload.artifacts, declared.artifacts);
+    // The same attempt with another list is another payload.
+    let without = build_payload(&at, &none, 60_000).unwrap();
+    assert!(without.artifacts.is_empty());
+    assert_ne!(
+        payload_hash(&payload).unwrap(),
+        payload_hash(&without).unwrap()
+    );
 }

@@ -533,6 +533,7 @@ fn spec() -> TaskSpec {
         deadline_ms: None,
         resource_wait_timeout_ms: None,
         has_secret_bundle: false,
+        artifacts: vec![],
     }
 }
 
