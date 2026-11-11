@@ -175,6 +175,62 @@ impl Workspaces {
         Ok(ObjectsRepo::new(self.env.clone(), dir))
     }
 
+    /// A scratch repository to try a bundle in before it touches the clone
+    /// of `repository_id`: it has the refs of the clone and borrows its
+    /// objects (nothing is copied, and nothing is written to the clone), or
+    /// is empty when there is no clone yet. It is gone when the returned
+    /// directory is dropped; one a worker that died left is cleared by
+    /// [`Self::sweep_orphans`].
+    pub fn rehearsal(
+        &self,
+        repository_id: &str,
+    ) -> Result<(tempfile::TempDir, ObjectsRepo), ApiError> {
+        let root = self.clones_root();
+        std::fs::create_dir_all(&root)
+            .map_err(|e| io_err("cannot create the clones directory", e))?;
+        let clone = root.join(plan::clone_dir_name(repository_id));
+        let tmp = tempfile::Builder::new()
+            .prefix(".clone.")
+            .tempdir_in(&root)
+            .map_err(|e| io_err("cannot make a scratch directory", e))?;
+        let work = tmp.path().join("r");
+        if clone.join(".git").exists() {
+            let (from, to) = (clone.to_string_lossy(), work.to_string_lossy());
+            git::run(
+                &self.env,
+                tmp.path(),
+                &["clone", "-q", "--mirror", "--shared", "--", &from, &to],
+            )
+            .map_err(internal)?;
+        } else {
+            std::fs::create_dir(&work)
+                .map_err(|e| io_err("cannot create the scratch repository", e))?;
+            git::run(&self.env, &work, &["init", "-q"]).map_err(internal)?;
+        }
+        Ok((tmp, ObjectsRepo::new(self.env.clone(), work)))
+    }
+
+    /// Remove the clone of `repository_id` when it holds no ref: one that
+    /// was made for a bundle that then did not unpack. A clone that holds
+    /// anything stays. Returns whether a clone was removed.
+    pub fn remove_clone_if_empty(&self, repository_id: &str) -> Result<bool, ApiError> {
+        let root = self.clones_root();
+        let name = plan::clone_dir_name(repository_id);
+        let dir = root.join(&name);
+        if !dir.join(".git").exists() {
+            return Ok(false);
+        }
+        let lock = open_lock(&root.join(format!("{name}.lock")))?;
+        lock.lock()
+            .map_err(|e| io_err("cannot lock the clone", e))?;
+        let refs = git::run(&self.env, &dir, &["for-each-ref", "--count=1"]).map_err(internal)?;
+        if !refs.trim().is_empty() {
+            return Ok(false);
+        }
+        remove_tree(&dir).map_err(|e| io_err("cannot remove an empty clone", e))?;
+        Ok(true)
+    }
+
     /// Bring the clone up to date with its `origin`, when it has one.
     pub fn update_clone(&self, clone: &ObjectsRepo) -> Result<(), ApiError> {
         let has_origin = git::run(&self.env, clone.dir(), &["remote"])

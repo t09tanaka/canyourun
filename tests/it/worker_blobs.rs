@@ -18,17 +18,18 @@ use remote_task_runner::storage::{AcceptedAttempt, NewAcceptance, WorkerStore};
 use remote_task_runner::supervisor::outcome::{store_artifact, ArtifactInput};
 use remote_task_runner::wire::*;
 use remote_task_runner::worker::blob_policy::{
-    bundle_prerequisites, lock_shard, staged_name, BlobLimits,
+    bundle_prerequisites, lock_shard, parse_reservation, staged_name, BlobLimits, Reservation,
 };
-use remote_task_runner::worker::blobs::{self, BlobSink};
+use remote_task_runner::worker::blobs::{self, BlobSink, Incoming};
 use remote_task_runner::worker::machine::Machine;
 use remote_task_runner::worker::serve::serve_connection;
 use remote_task_runner::worker::{Agent, AgentConfig, Host};
-use remote_task_runner::workspace::Workspace;
+use remote_task_runner::workspace::{CliFastWorktree, Workspace, Workspaces};
 use serde_json::json;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
@@ -193,10 +194,12 @@ impl Fx {
     }
     /// The bytes the worker lets the source take in all.
     fn reserved(&self, source: &SourceId) -> u64 {
-        std::fs::read_to_string(self.incoming(source).join("reserved"))
-            .unwrap()
-            .parse()
-            .unwrap()
+        self.reservation(source).bytes
+    }
+    /// That, and the bytes of the disk it lets it take.
+    fn reservation(&self, source: &SourceId) -> Reservation {
+        let text = std::fs::read_to_string(self.incoming(source).join("reserved")).unwrap();
+        parse_reservation(&text).unwrap()
     }
     /// The worker's clones (each a repository with no remote).
     fn clones(&self) -> Vec<PathBuf> {
@@ -2008,4 +2011,402 @@ fn sources_admitted_at_once_never_exceed_the_bound() {
         .filter(|p| f.incoming(&p.source).exists())
         .count();
     assert_eq!(staged, 3);
+}
+
+/// Every file below `dir`, by its path from there, with its length.
+fn tree_of(dir: &Path) -> BTreeMap<String, u64> {
+    fn walk(root: &Path, dir: &Path, out: &mut BTreeMap<String, u64>) {
+        for e in std::fs::read_dir(dir).into_iter().flatten() {
+            let path = e.unwrap().path();
+            let meta = std::fs::symlink_metadata(&path).unwrap();
+            if meta.is_dir() {
+                walk(root, &path, out);
+            } else {
+                let rel = path.strip_prefix(root).unwrap();
+                out.insert(rel.to_string_lossy().into_owned(), meta.len());
+            }
+        }
+    }
+    let mut out = BTreeMap::new();
+    walk(dir, dir, &mut out);
+    out
+}
+
+/// The scratch directories under the worker's clones (none stays).
+fn clone_scratch(f: &Fx) -> Vec<PathBuf> {
+    std::fs::read_dir(f.state().join("clones"))
+        .into_iter()
+        .flatten()
+        .map(|e| e.unwrap().path())
+        .filter(|p| p.is_dir() && !p.join(".git").exists())
+        .collect()
+}
+
+/// `b`'s manifest, sealed again, with its first file given as the file
+/// `hash` with `size` bytes; and the files it still names of `b`.
+fn lying_about(b: &Parcel, hash: &str, size: u64) -> (SourceId, Vec<u8>, Vec<Vec<u8>>) {
+    use local_ci::source::seal_manifest;
+    use remote_task_runner::source::classify::source_id_of_ci;
+    let mut m = b.root.clone();
+    m.object_manifest.entries[0].hash = hash.to_string();
+    m.object_manifest.entries[0].size = size;
+    let m = seal_manifest(m);
+    let files = m.object_manifest.entries[1..]
+        .iter()
+        .map(|e| b.blobs[&e.hash].clone())
+        .collect();
+    (
+        source_id_of_ci(&m.source_id).unwrap(),
+        serde_json::to_vec(&m).unwrap(),
+        files,
+    )
+}
+
+#[test]
+fn a_source_that_gives_a_stored_file_another_size_leaves_nothing_in_the_store() {
+    let f = fx();
+    let (a, b, c) = (
+        f.directory("a", 70),
+        f.directory("b", 71),
+        f.directory("c", 72),
+    );
+    let m = f.machine();
+    let (sink, l) = (m.blobs().unwrap(), limits());
+    send_all(sink, &l, &a);
+    let store = f.state().join("sources");
+
+    // The store holds the file: a manifest that gives it another size is
+    // refused when it arrives, before any file of that source is taken.
+    let (held, _) = a.blob_of_len(5000);
+    let before = tree_of(&store);
+    for wrong in [4999, 5001, 4 << 30] {
+        let (source, manifest, _) = lying_about(&b, held, wrong);
+        let e = put_all(sink, &l, &source, Manifest, &manifest).unwrap_err();
+        assert_eq!(e.code, ErrorCode::InvalidInput);
+        assert!(e.message.contains("another size"), "{}", e.message);
+        assert!(!f.incoming(&source).exists());
+    }
+    assert_eq!(tree_of(&store), before);
+
+    // The store gets the file after the manifest is staged: the source is
+    // refused when it would be published, and none of the files it brought
+    // goes into the store. With another source id it is the same again.
+    let (later, _) = c.blob_of_len(5000);
+    let mut staged = vec![];
+    for wrong in [4999, 5001] {
+        let (source, manifest, files) = lying_about(&b, later, wrong);
+        put_all(sink, &l, &source, Manifest, &manifest).unwrap();
+        for file in &files {
+            put_all(sink, &l, &source, Content, file).unwrap();
+        }
+        assert!(f.incoming(&source).exists());
+        staged.push((source, files));
+    }
+    send_all(sink, &l, &c);
+    let before = tree_of(&store);
+    let worker = f.worker_store();
+    for (source, files) in &staged {
+        let again = files.iter().find(|b| !b.is_empty()).unwrap();
+        let e = put_all(sink, &l, source, Content, again).unwrap_err();
+        assert_eq!(e.code, ErrorCode::InvalidInput);
+        assert!(e.message.contains("another size"), "{}", e.message);
+        // nothing of it waits here either
+        assert!(!f.incoming(source).exists());
+        for file in files.iter().filter(|b| !b.is_empty()) {
+            let d = Digest::of_bytes(file);
+            let hex = d.as_str().strip_prefix("sha256:").unwrap();
+            assert_eq!(worker.has_blob(hex), a.blobs.contains_key(hex));
+        }
+    }
+    assert_eq!(tree_of(&store), before);
+    // The sources that say what is so are taken as before.
+    send_all(sink, &l, &b);
+    assert!(verify(sink, &l, &b.source, b.refs()).ready);
+}
+
+#[test]
+fn a_bundle_that_is_refused_writes_nothing_into_the_clone_and_makes_none() {
+    let f = fx();
+    let repo = f.path("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    git(&repo, &["init", "-q", "-b", "main"]);
+    std::fs::write(repo.join("a.txt"), "committed\n").unwrap();
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-qm", "base"]);
+    std::fs::write(repo.join("a.txt"), "edited\n").unwrap();
+    let p = f.capture(&SourceRequest::Worktree { dir: repo.clone() });
+    let bundle = p.bundle.clone().unwrap();
+    // Another repository, with commits under the names the bundle of a
+    // source has to bring: a bundle of it unpacks, and is not the source's.
+    let other = f.path("other");
+    std::fs::create_dir_all(&other).unwrap();
+    git(&other, &["init", "-q", "-b", "main"]);
+    std::fs::write(other.join("x.txt"), noise(9, 2000)).unwrap();
+    git(&other, &["add", "."]);
+    git(&other, &["commit", "-qm", "something else"]);
+    let foreign = |root: &CiManifest| {
+        let names = [
+            format!("refs/local-ci/snapshots/{}", root.source_id),
+            format!("refs/local-ci/index/{}", root.source_id),
+        ];
+        // (the index ref is a commit with no history)
+        let tree = git(&other, &["rev-parse", "HEAD^{tree}"]);
+        let lone = git(&other, &["commit-tree", "-m", "index", &tree]);
+        git(&other, &["update-ref", &names[0], "HEAD"]);
+        git(&other, &["update-ref", &names[1], &lone]);
+        let out = f.path("foreign.bundle");
+        let out_s = out.to_str().unwrap();
+        git(
+            &other,
+            &["bundle", "create", "-q", out_s, &names[0], &names[1]],
+        );
+        std::fs::read(out).unwrap()
+    };
+
+    let m = f.machine();
+    let (sink, l) = (m.blobs().unwrap(), limits());
+    let send_rest = |p: &Parcel| {
+        for man in &p.manifests {
+            put_all(sink, &l, &p.source, Manifest, man).unwrap();
+        }
+        for b in p.blobs.values() {
+            put_all(sink, &l, &p.source, Content, b).unwrap();
+        }
+    };
+    send_rest(&p);
+
+    // A repository the worker has no clone of. A bundle whose pack is
+    // broken (its header is whole), time and again, and one that brings
+    // other commits: no clone is made, and nothing is left beside.
+    let mut broken = bundle.clone();
+    let n = broken.len();
+    for b in &mut broken[n - 40..] {
+        *b ^= 0x55;
+    }
+    assert_eq!(bundle_prerequisites(&broken), Ok(vec![]));
+    for wrong in [&broken, &broken, &foreign(&p.root)] {
+        let e = put_all(sink, &l, &p.source, Bundle, wrong).unwrap_err();
+        assert_eq!(e.code, ErrorCode::InvalidInput, "{e:?}");
+        assert!(e.message.contains("bundle"), "{}", e.message);
+        assert!(f.clones().is_empty());
+        assert!(clone_scratch(&f).is_empty(), "{:?}", clone_scratch(&f));
+        assert!(f
+            .staged(&p.source)
+            .iter()
+            .all(|n| !n.starts_with("bundle-")));
+    }
+    assert!(!verify(sink, &l, &p.source, p.refs()).ready);
+    put_all(sink, &l, &p.source, Bundle, &bundle).unwrap();
+    assert!(verify(sink, &l, &p.source, p.refs()).ready);
+    let clones = f.clones();
+    assert_eq!(clones.len(), 1);
+
+    // The clone is there. The same two bundles for the next source of the
+    // repository: its refs and its objects stay what they were.
+    std::fs::write(repo.join("a.txt"), "edited once more\n").unwrap();
+    let q = f.capture(&SourceRequest::Worktree { dir: repo.clone() });
+    send_rest(&q);
+    let state = |c: &Path| {
+        (
+            git(c, &["for-each-ref"]),
+            git(c, &["count-objects", "-v"]),
+            tree_of(&c.join(".git").join("objects")),
+        )
+    };
+    let before = state(&clones[0]);
+    let whole = f.bundle(&q.root, &[]);
+    let mut broken = whole.clone();
+    let n = broken.len();
+    for b in &mut broken[n - 40..] {
+        *b ^= 0x55;
+    }
+    let store_before = tree_of(&f.state().join("sources"));
+    for wrong in [&broken, &foreign(&q.root)] {
+        let e = put_all(sink, &l, &q.source, Bundle, wrong).unwrap_err();
+        assert_eq!(e.code, ErrorCode::InvalidInput, "{e:?}");
+        assert_eq!(state(&clones[0]), before);
+        assert!(clone_scratch(&f).is_empty());
+        assert_eq!(f.clones(), clones);
+    }
+    // (and no file of the refused source went into the store)
+    assert_eq!(tree_of(&f.state().join("sources")), store_before);
+    put_all(sink, &l, &q.source, Bundle, &whole).unwrap();
+    assert!(verify(sink, &l, &q.source, q.refs()).ready);
+    assert!(clone_scratch(&f).is_empty());
+}
+
+#[test]
+fn a_clone_is_tried_beside_and_an_empty_one_can_go() {
+    let f = fx();
+    let state = f.state();
+    std::fs::create_dir_all(&state).unwrap();
+    let ws = Workspaces::new(
+        state.clone(),
+        f.env(),
+        Arc::new(CliFastWorktree::new(f.env())),
+    );
+    let id = "github:example/repo";
+    // No clone: nothing to remove, and the scratch repository is empty.
+    assert!(!ws.remove_clone_if_empty(id).unwrap());
+    let (tmp, trial) = ws.rehearsal(id).unwrap();
+    assert_eq!(git(trial.dir(), &["for-each-ref"]), "");
+    assert!(f.clones().is_empty());
+    let at = tmp.path().to_path_buf();
+    drop(tmp);
+    assert!(!at.exists());
+
+    // An empty clone goes, one that holds a ref stays.
+    let clone = ws.ensure_clone(id, None).unwrap();
+    assert!(ws.remove_clone_if_empty(id).unwrap());
+    assert!(!clone.dir().exists());
+    let clone = ws.ensure_clone(id, None).unwrap();
+    git(clone.dir(), &["commit", "-q", "--allow-empty", "-m", "one"]);
+    let head = git(clone.dir(), &["rev-parse", "HEAD"]);
+    git(
+        clone.dir(),
+        &["update-ref", "refs/local-ci/snapshots/s", &head],
+    );
+    assert!(!ws.remove_clone_if_empty(id).unwrap());
+    assert!(clone.dir().join(".git").exists());
+
+    // The scratch repository has the refs and the objects of the clone, and
+    // what is written to it is not written to the clone.
+    let refs = git(clone.dir(), &["for-each-ref"]);
+    let objects = tree_of(&clone.dir().join(".git").join("objects"));
+    let (tmp, trial) = ws.rehearsal(id).unwrap();
+    assert_eq!(git(trial.dir(), &["for-each-ref"]), refs);
+    assert_eq!(git(trial.dir(), &["cat-file", "-t", &head]), "commit");
+    let tree = git(trial.dir(), &["mktree"]);
+    let two = git(trial.dir(), &["commit-tree", "-m", "two", &tree]);
+    git(
+        trial.dir(),
+        &["update-ref", "refs/local-ci/snapshots/t", &two],
+    );
+    assert_eq!(git(trial.dir(), &["cat-file", "-t", &two]), "commit");
+    assert_eq!(git(clone.dir(), &["for-each-ref"]), refs);
+    assert_eq!(tree_of(&clone.dir().join(".git").join("objects")), objects);
+    drop(tmp);
+    assert!(clone_scratch(&f).is_empty());
+}
+
+const GIB: u64 = 1 << 30;
+
+/// The receiving side on a disk of `capacity` bytes besides what the worker
+/// holds when it starts: the free space it reads is that, less what is
+/// staged.
+fn incoming_on_disk(f: &Fx, capacity: &Arc<AtomicU64>) -> Incoming {
+    let state = f.state();
+    std::fs::create_dir_all(&state).unwrap();
+    let ws = Workspaces::new(
+        state.clone(),
+        f.env(),
+        Arc::new(CliFastWorktree::new(f.env())),
+    );
+    let (capacity, staged) = (capacity.clone(), state.join("incoming"));
+    Incoming::new(&state, f.worker_store(), ws, f.env()).with_free_reading(Box::new(move |_| {
+        let used: u64 = tree_of(&staged)
+            .iter()
+            .filter(|(name, _)| name.ends_with(".part") || name.ends_with(".done"))
+            .map(|(_, len)| len)
+            .sum();
+        Ok(capacity.load(Ordering::SeqCst).saturating_sub(used))
+    }))
+}
+
+fn largest_of(p: &Parcel) -> u64 {
+    p.blobs.values().map(|b| b.len() as u64).max().unwrap()
+}
+
+#[test]
+fn the_disk_is_asked_for_what_every_source_reserved_and_has_not_written() {
+    let f = fx();
+    let (p, q) = (f.directory("p", 80), f.directory("q", 81));
+    let (mp, mq) = (&p.manifests[0], &q.manifests[0]);
+    // What a source takes of the disk: what it stages, and to publish it
+    // its manifest once more and its largest file twice.
+    let disk_of = |p: &Parcel| total_of(p) + p.manifests[0].len() as u64 + 2 * largest_of(p);
+    let l = limits();
+    assert_eq!(l.min_free_bytes, GIB);
+
+    // One byte short of both sources and the floor of 1 GiB.
+    let capacity = Arc::new(AtomicU64::new(GIB + disk_of(&p) + disk_of(&q) - 1));
+    let sink = incoming_on_disk(&f, &capacity);
+    put_all(&sink, &l, &p.source, Manifest, mp).unwrap();
+    assert_eq!(
+        f.reservation(&p.source),
+        Reservation {
+            bytes: total_of(&p),
+            disk: disk_of(&p)
+        }
+    );
+    // The first source has written its manifest and nothing else: the rest
+    // of what it reserved is not there for the second one.
+    let e = put_all(&sink, &l, &q.source, Manifest, mq).unwrap_err();
+    assert_eq!(e.code, ErrorCode::Overloaded);
+    assert!(e.message.contains("disk"), "{}", e.message);
+    // (the files of the first do not change that: the disk has that much
+    // less, and that much less is still to come)
+    let mut written = 0;
+    for b in p.blobs.values() {
+        if b.len() as u64 != largest_of(&p) {
+            put_all(&sink, &l, &p.source, Content, b).unwrap();
+            written += b.len();
+        }
+    }
+    assert!(written > 0 && f.incoming(&p.source).exists());
+    let last = mq.len() - 1;
+    let e = put_part(&sink, &l, &q.source, Manifest, mq, last, last + 1).unwrap_err();
+    assert_eq!(e.code, ErrorCode::Overloaded);
+    assert!(e.message.contains("disk"), "{}", e.message);
+    // With the one byte, it is taken.
+    capacity.fetch_add(1, Ordering::SeqCst);
+    let r = put_part(&sink, &l, &q.source, Manifest, mq, last, last + 1).unwrap();
+    assert!(r.complete);
+}
+
+#[test]
+fn a_bundle_is_asked_of_the_disk_with_what_its_manifest_reserved() {
+    let f = fx();
+    let repo = f.path("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    git(&repo, &["init", "-q", "-b", "main"]);
+    std::fs::write(repo.join("a.txt"), "committed\n").unwrap();
+    std::fs::write(repo.join("big.bin"), noise(3, 60_000)).unwrap();
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-qm", "base"]);
+    std::fs::write(repo.join("a.txt"), "edited\n").unwrap();
+    let p = f.capture(&SourceRequest::Worktree { dir: repo.clone() });
+    let bundle = p.bundle.as_ref().unwrap();
+    let size = bundle.len() as u64;
+    assert_eq!(p.manifests.len(), 1);
+    let l = limits();
+
+    let capacity = Arc::new(AtomicU64::new(u64::MAX));
+    let sink = incoming_on_disk(&f, &capacity);
+    put_all(&sink, &l, &p.source, Manifest, &p.manifests[0]).unwrap();
+    let first = f.reservation(&p.source);
+    assert_eq!(first.bytes, total_of(&p));
+    // The manifest reserved the files it names; none is written. The bundle
+    // is staged and unpacked into the clone: twice its size more. A disk
+    // that has room for the bundle and the floor, and not for the files that
+    // are still to come as well, does not take its first byte.
+    capacity.store(GIB + first.disk + 2 * size - 1, Ordering::SeqCst);
+    assert!(GIB + first.disk + 2 * size - 1 > GIB + first.bytes + size);
+    let e = put_part(&sink, &l, &p.source, Bundle, bundle, 0, 10).unwrap_err();
+    assert_eq!(e.code, ErrorCode::Overloaded);
+    assert!(e.message.contains("disk"), "{}", e.message);
+    assert!(f
+        .staged(&p.source)
+        .iter()
+        .all(|n| !n.starts_with("bundle-")));
+    assert_eq!(f.reservation(&p.source), first);
+    capacity.fetch_add(1, Ordering::SeqCst);
+    put_part(&sink, &l, &p.source, Bundle, bundle, 0, 10).unwrap();
+    assert_eq!(
+        f.reservation(&p.source),
+        Reservation {
+            bytes: first.bytes + size,
+            disk: first.disk + 2 * size
+        }
+    );
 }

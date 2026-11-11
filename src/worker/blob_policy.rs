@@ -317,31 +317,104 @@ pub enum Refusal {
     Disk,
 }
 
-/// May a source grow to `total` bytes ([`source_total`])? `held` is what it
-/// had reserved, `others` what the other sources that are part-way have,
-/// `free` the free space of the disk. Returns what the source has reserved
-/// from now on (a reservation never shrinks).
+/// What a source has reserved.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Reservation {
+    /// The bytes it stages in all ([`source_total`]): what counts against
+    /// `max_source_bytes` and `max_incoming_bytes`.
+    pub bytes: u64,
+    /// The bytes it writes to the disk in all: what it stages and what
+    /// publishing it writes besides ([`publish_room`]).
+    pub disk: u64,
+}
+
+/// What publishing a source writes besides its staged files, at the most at
+/// one time: its manifests once more (in the store), its bundle once more
+/// (unpacked into the clone; the scratch repository it is tried in first is
+/// gone by then), and one file twice (the store's scratch copy and the
+/// stored file, while the staged one is still there; the files go one by
+/// one). `None`: more than a number holds.
+pub fn publish_room(manifests: u64, bundle: u64, largest_file: u64) -> Option<u64> {
+    manifests
+        .checked_add(bundle)?
+        .checked_add(largest_file)?
+        .checked_add(largest_file)
+}
+
+/// What a source has still to write: what it reserved of the disk, less the
+/// bytes its staged files hold already.
+pub fn outstanding(disk: u64, staged: u64) -> u64 {
+    disk.saturating_sub(staged)
+}
+
+/// May a source grow to `total` bytes ([`source_total`]), with `room` more
+/// for publishing it ([`publish_room`])? `held` is what it had reserved,
+/// `others` the bytes the other sources that are part-way have reserved,
+/// `pending` what all the sources that are part-way (this one too) have
+/// reserved of the disk and not written yet ([`outstanding`]), `free` the
+/// free space of the disk. Returns what the source has reserved from now on
+/// (a reservation never shrinks).
 pub fn check_reservation(
     limits: &BlobLimits,
     total: Option<u64>,
-    held: u64,
+    room: Option<u64>,
+    held: Reservation,
     others: u64,
+    pending: u64,
     free: u64,
-) -> Result<u64, Refusal> {
+) -> Result<Reservation, Refusal> {
     let total = match total {
         Some(t) if t <= limits.max_source_bytes => t,
         _ => return Err(Refusal::Source),
     };
-    let Some(growth) = total.checked_sub(held).filter(|g| *g > 0) else {
-        return Ok(held);
-    };
-    match others.checked_add(total) {
-        Some(all) if all <= limits.max_incoming_bytes => {}
-        _ => return Err(Refusal::Incoming),
+    let bytes = total.max(held.bytes);
+    if bytes > held.bytes {
+        match others.checked_add(total) {
+            Some(all) if all <= limits.max_incoming_bytes => {}
+            _ => return Err(Refusal::Incoming),
+        }
     }
-    match growth.checked_add(limits.min_free_bytes) {
-        Some(need) if need <= free => Ok(total),
-        _ => Err(Refusal::Disk),
+    let Some(disk) = room.and_then(|r| r.checked_add(total)) else {
+        return Err(Refusal::Disk);
+    };
+    let disk = disk.max(held.disk);
+    if disk > held.disk {
+        let need = pending
+            .checked_add(disk - held.disk)
+            .and_then(|n| n.checked_add(limits.min_free_bytes));
+        match need {
+            Some(need) if need <= free => {}
+            _ => return Err(Refusal::Disk),
+        }
+    }
+    Ok(Reservation { bytes, disk })
+}
+
+/// The file a reservation is kept in.
+pub fn reservation_text(r: Reservation) -> String {
+    format!("{} {}", r.bytes, r.disk)
+}
+
+/// [`reservation_text`] read back: two numbers, and nothing else.
+pub fn parse_reservation(text: &str) -> Option<Reservation> {
+    let mut words = text.split(' ');
+    let bytes = words.next()?.parse().ok()?;
+    let disk = words.next()?.parse().ok()?;
+    match words.next() {
+        None => Some(Reservation { bytes, disk }),
+        Some(_) => None,
+    }
+}
+
+/// May a file a manifest names with `named` bytes be taken, when the store
+/// holds `stored` bytes under its hash (`None`: it holds none)? `Ok(true)`:
+/// the store has it already. The hash of a stored file is that of its
+/// content, so another size is never the same file.
+pub fn check_stored(stored: Option<u64>, named: u64) -> Result<bool, &'static str> {
+    match stored {
+        None => Ok(false),
+        Some(s) if s == named => Ok(true),
+        Some(_) => Err("the manifest gives a file this worker holds another size"),
     }
 }
 
@@ -783,39 +856,96 @@ mod tests {
         assert_eq!(source_total(0, u64::MAX, 1), None);
 
         // the source's own cap
-        assert_eq!(check_reservation(&l, Some(250), 0, 0, 280), Ok(250));
+        let none = Reservation { bytes: 0, disk: 0 };
+        let got = |bytes, disk| Ok(Reservation { bytes, disk });
+        let held = |bytes, disk| Reservation { bytes, disk };
         assert_eq!(
-            check_reservation(&l, Some(251), 0, 0, 1000),
+            check_reservation(&l, Some(250), Some(0), none, 0, 0, 280),
+            got(250, 250)
+        );
+        assert_eq!(
+            check_reservation(&l, Some(251), Some(0), none, 0, 0, 1000),
             Err(Refusal::Source)
         );
         assert_eq!(
-            check_reservation(&l, None, 0, 0, 1000),
+            check_reservation(&l, None, Some(0), none, 0, 0, 1000),
             Err(Refusal::Source)
         );
         // all the sources together
-        assert_eq!(check_reservation(&l, Some(100), 0, 300, 1000), Ok(100));
-        assert_eq!(check_reservation(&l, Some(100), 40, 300, 1000), Ok(100));
         assert_eq!(
-            check_reservation(&l, Some(101), 0, 300, 1000),
+            check_reservation(&l, Some(100), Some(0), none, 300, 0, 1000),
+            got(100, 100)
+        );
+        assert_eq!(
+            check_reservation(&l, Some(100), Some(0), held(40, 40), 300, 0, 1000),
+            got(100, 100)
+        );
+        assert_eq!(
+            check_reservation(&l, Some(101), Some(0), none, 300, 0, 1000),
             Err(Refusal::Incoming)
         );
         assert_eq!(
-            check_reservation(&l, Some(101), 100, 300, 1000),
+            check_reservation(&l, Some(101), Some(0), held(100, 100), 300, 0, 1000),
             Err(Refusal::Incoming)
         );
         assert_eq!(
-            check_reservation(&l, Some(1), 0, u64::MAX, 1000),
+            check_reservation(&l, Some(1), Some(0), none, u64::MAX, 0, 1000),
             Err(Refusal::Incoming)
         );
         // the disk: what is still to come, and the floor
-        assert_eq!(check_reservation(&l, Some(100), 0, 0, 130), Ok(100));
         assert_eq!(
-            check_reservation(&l, Some(100), 0, 0, 129),
+            check_reservation(&l, Some(100), Some(0), none, 0, 0, 130),
+            got(100, 100)
+        );
+        assert_eq!(
+            check_reservation(&l, Some(100), Some(0), none, 0, 0, 129),
             Err(Refusal::Disk)
         );
-        assert_eq!(check_reservation(&l, Some(100), 60, 0, 70), Ok(100));
         assert_eq!(
-            check_reservation(&l, Some(100), 60, 0, 69),
+            check_reservation(&l, Some(100), Some(0), held(60, 60), 0, 0, 70),
+            got(100, 100)
+        );
+        assert_eq!(
+            check_reservation(&l, Some(100), Some(0), held(60, 60), 0, 0, 69),
+            Err(Refusal::Disk)
+        );
+        // what publishing it writes besides counts for the disk only
+        assert_eq!(
+            check_reservation(&l, Some(100), Some(50), none, 300, 0, 180),
+            got(100, 150)
+        );
+        assert_eq!(
+            check_reservation(&l, Some(100), Some(50), none, 300, 0, 179),
+            Err(Refusal::Disk)
+        );
+        assert_eq!(
+            check_reservation(&l, Some(100), None, none, 0, 0, u64::MAX),
+            Err(Refusal::Disk)
+        );
+        assert_eq!(
+            check_reservation(&l, Some(100), Some(u64::MAX), none, 0, 0, u64::MAX),
+            Err(Refusal::Disk)
+        );
+        // what every source has reserved and not written yet is not there to
+        // take: the other sources', and this one's own
+        assert_eq!(
+            check_reservation(&l, Some(100), Some(0), none, 0, 70, 200),
+            got(100, 100)
+        );
+        assert_eq!(
+            check_reservation(&l, Some(100), Some(0), none, 0, 71, 200),
+            Err(Refusal::Disk)
+        );
+        assert_eq!(
+            check_reservation(&l, Some(100), Some(0), held(60, 60), 0, 60, 130),
+            got(100, 100)
+        );
+        assert_eq!(
+            check_reservation(&l, Some(100), Some(0), held(60, 60), 0, 60, 129),
+            Err(Refusal::Disk)
+        );
+        assert_eq!(
+            check_reservation(&l, Some(1), Some(0), none, 0, u64::MAX, u64::MAX),
             Err(Refusal::Disk)
         );
         let floor = BlobLimits {
@@ -823,17 +953,161 @@ mod tests {
             ..limits()
         };
         assert_eq!(
-            check_reservation(&floor, Some(1), 0, 0, u64::MAX),
+            check_reservation(&floor, Some(1), Some(0), none, 0, 0, u64::MAX),
             Err(Refusal::Disk)
         );
         // nothing grows: nothing is asked, and the reservation stays
-        assert_eq!(check_reservation(&l, Some(100), 100, 400, 0), Ok(100));
-        assert_eq!(check_reservation(&l, Some(40), 100, 400, 0), Ok(100));
-        assert_eq!(check_reservation(&l, Some(0), 0, 400, 0), Ok(0));
         assert_eq!(
-            check_reservation(&l, Some(251), 300, 0, 1000),
+            check_reservation(&l, Some(100), Some(0), held(100, 100), 400, 900, 0),
+            got(100, 100)
+        );
+        assert_eq!(
+            check_reservation(&l, Some(40), Some(10), held(100, 120), 400, 900, 0),
+            got(100, 120)
+        );
+        assert_eq!(
+            check_reservation(&l, Some(0), Some(0), none, 400, 900, 0),
+            got(0, 0)
+        );
+        // only the disk grows (a bundle took the place of a larger one, and
+        // a larger file is named): the bytes stay, the disk is asked
+        assert_eq!(
+            check_reservation(&l, Some(90), Some(40), held(100, 120), 400, 0, 40),
+            got(100, 130)
+        );
+        assert_eq!(
+            check_reservation(&l, Some(90), Some(40), held(100, 120), 400, 0, 39),
+            Err(Refusal::Disk)
+        );
+        assert_eq!(
+            check_reservation(&l, Some(251), Some(0), held(300, 300), 0, 0, 1000),
             Err(Refusal::Source)
         );
+    }
+
+    const GIB: u64 = 1_073_741_824;
+
+    #[test]
+    fn the_disk_is_asked_for_all_that_is_reserved_and_not_written() {
+        let d = BlobLimits::default();
+        let none = Reservation { bytes: 0, disk: 0 };
+        // A manifest that names 8 GiB (no file over 2 GiB) is staged on a
+        // disk with 20 GiB free; nothing of it is written yet.
+        let room = publish_room(0, 0, 2 * GIB);
+        assert_eq!(room, Some(4 * GIB));
+        let first = check_reservation(&d, Some(8 * GIB), room, none, 0, 0, 20 * GIB).unwrap();
+        assert_eq!(
+            first,
+            Reservation {
+                bytes: 8 * GIB,
+                disk: 12 * GIB
+            }
+        );
+        // Its bundle of 4 GiB: 12 GiB staged, 8 GiB more to publish. With
+        // the 12 GiB that are reserved and not written, the 20 GiB do not
+        // hold it and the floor of 1 GiB.
+        let room = publish_room(0, 4 * GIB, 2 * GIB);
+        assert_eq!(room, Some(8 * GIB));
+        let pending = outstanding(first.disk, 0);
+        assert_eq!(
+            check_reservation(&d, Some(12 * GIB), room, first, 0, pending, 20 * GIB),
+            Err(Refusal::Disk)
+        );
+        assert_eq!(
+            check_reservation(&d, Some(12 * GIB), room, first, 0, pending, 21 * GIB - 1),
+            Err(Refusal::Disk)
+        );
+        assert_eq!(
+            check_reservation(&d, Some(12 * GIB), room, first, 0, pending, 21 * GIB),
+            Ok(Reservation {
+                bytes: 12 * GIB,
+                disk: 20 * GIB
+            })
+        );
+        // Once 6 GiB of its files are written, the disk has 6 GiB less and
+        // as much less is pending: the answer is the same.
+        let pending = outstanding(first.disk, 6 * GIB);
+        assert_eq!(pending, 6 * GIB);
+        assert_eq!(
+            check_reservation(&d, Some(12 * GIB), room, first, 0, pending, 15 * GIB),
+            Ok(Reservation {
+                bytes: 12 * GIB,
+                disk: 20 * GIB
+            })
+        );
+        assert_eq!(
+            check_reservation(&d, Some(12 * GIB), room, first, 0, pending, 15 * GIB - 1),
+            Err(Refusal::Disk)
+        );
+        // Another source that wants 4 GiB (one file) on that disk of 20 GiB:
+        // 12 GiB to publish it, and 12 GiB are spoken for.
+        let room = publish_room(0, 0, 4 * GIB);
+        assert_eq!(
+            check_reservation(&d, Some(4 * GIB), room, none, 8 * GIB, 12 * GIB, 20 * GIB),
+            Err(Refusal::Disk)
+        );
+        assert_eq!(
+            check_reservation(&d, Some(4 * GIB), room, none, 8 * GIB, 12 * GIB, 25 * GIB),
+            Ok(Reservation {
+                bytes: 4 * GIB,
+                disk: 12 * GIB
+            })
+        );
+        assert_eq!(
+            check_reservation(
+                &d,
+                Some(4 * GIB),
+                room,
+                none,
+                8 * GIB,
+                12 * GIB,
+                25 * GIB - 1
+            ),
+            Err(Refusal::Disk)
+        );
+
+        assert_eq!(publish_room(1, 20, 300), Some(621));
+        assert_eq!(publish_room(u64::MAX, 0, 0), Some(u64::MAX));
+        assert_eq!(publish_room(u64::MAX, 1, 0), None);
+        assert_eq!(publish_room(0, u64::MAX, 1), None);
+        assert_eq!(publish_room(0, u64::MAX - 1, 1), None);
+        assert_eq!(publish_room(0, u64::MAX - 2, 1), Some(u64::MAX));
+        assert_eq!(outstanding(10, 3), 7);
+        assert_eq!(outstanding(10, 10), 0);
+        assert_eq!(outstanding(10, 11), 0);
+    }
+
+    #[test]
+    fn a_reservation_is_kept_as_two_numbers() {
+        let r = Reservation {
+            bytes: 12,
+            disk: 345,
+        };
+        assert_eq!(reservation_text(r), "12 345");
+        assert_eq!(parse_reservation("12 345"), Some(r));
+        assert_eq!(
+            parse_reservation("0 18446744073709551615"),
+            Some(Reservation {
+                bytes: 0,
+                disk: u64::MAX
+            })
+        );
+        for bad in [
+            "", "12", "12 ", " 12 345", "12 345 6", "12 345 ", "a 1", "1 b", "12\n345", "-1 2",
+        ] {
+            assert_eq!(parse_reservation(bad), None, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn a_stored_file_is_the_named_one_only_with_its_size() {
+        assert_eq!(check_stored(None, 5), Ok(false));
+        assert_eq!(check_stored(Some(5), 5), Ok(true));
+        assert!(check_stored(Some(4), 5)
+            .unwrap_err()
+            .contains("another size"));
+        assert!(check_stored(Some(6), 5).is_err());
+        assert!(check_stored(Some(0), 5).is_err());
     }
 
     #[test]

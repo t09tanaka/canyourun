@@ -255,6 +255,17 @@ impl SourceStore {
         is_blob_hash(hash) && self.inner.has(hash)
     }
 
+    /// The bytes the store holds under the hash, when it holds the blob.
+    pub fn blob_size(&self, hash: &str) -> Option<u64> {
+        if !is_blob_hash(hash) {
+            return None;
+        }
+        std::fs::metadata(self.inner.object_path(hash))
+            .ok()
+            .filter(|m| m.is_file())
+            .map(|m| m.len())
+    }
+
     pub fn object_store(&self) -> &ObjectStore {
         &self.inner
     }

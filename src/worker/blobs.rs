@@ -11,17 +11,21 @@
 //! ```text
 //! manifest-<hex>-<size>.part|.done   bundle-<hex>-<size>.part|.done
 //! parts/content-<hex>-<size>.part    files/content-<hex>-<size>.done
-//! reserved                           (the bytes the source may take in all)
+//! reserved                           (the bytes the source may stage in all,
+//!                                     and the bytes of the disk it may take)
 //! ```
 //!
 //! The only state of a transfer is those files (the length of a `.part` is
 //! what was received), so a transfer that was cut resumes on another
 //! connection or after a restart of the agent. The digest is checked when the
-//! last byte is there. Once a source has everything, the bundle is unpacked
-//! into the repository's clone, the files are moved into the store and the
-//! manifests are published (leaf first, the source's own last); only then
-//! can an attempt be prepared from it. A source that is dropped before that
-//! leaves nothing in the store.
+//! last byte is there. Once a source has everything, all that can refuse it
+//! is checked first (the sizes of the files the store holds already, and the
+//! bundle, which is unpacked into a scratch repository beside the clone);
+//! then the bundle is unpacked into the repository's clone, the files are
+//! moved into the store and the manifests are published (leaf first, the
+//! source's own last); only then can an attempt be prepared from it. A
+//! source that is refused or dropped before that leaves nothing in the
+//! store and nothing in the clone.
 //!
 //! The worker never asks origin for anything: the clone a bundle is unpacked
 //! into has no remote and is made when the first bundle arrives. A
@@ -35,10 +39,11 @@
 
 use super::blob_policy::{
     bundle_prerequisites, check_content, check_manifest_files, check_put, check_reservation,
-    content_verdict, displaces, get_range, is_stale, lock_shard, manifest_role, may_stage_source,
-    may_start_partial, order_have, parse_staged_name, plan_chunk, source_total, staged_name,
-    staged_verdict, BlobLimits, ChunkStep, Refusal, StagedName, Verdict, MAX_BUNDLE_HEADER,
-    MAX_HAVE, MAX_SNAPSHOT_REFS,
+    check_stored, content_verdict, displaces, get_range, is_stale, lock_shard, manifest_role,
+    may_stage_source, may_start_partial, order_have, outstanding, parse_reservation,
+    parse_staged_name, plan_chunk, publish_room, reservation_text, source_total, staged_name,
+    staged_verdict, BlobLimits, ChunkStep, Refusal, Reservation, StagedName, Verdict,
+    MAX_BUNDLE_HEADER, MAX_HAVE, MAX_SNAPSHOT_REFS,
 };
 use super::host::Host;
 use super::policy::MAX_VERIFY_DIGESTS;
@@ -236,6 +241,11 @@ struct Staged {
 }
 
 impl Staged {
+    /// The size of the largest file the manifests name.
+    fn largest(&self) -> u64 {
+        self.wanted.values().copied().max().unwrap_or(0)
+    }
+
     /// Take `m`, whose files new to the source are `new` (see
     /// [`check_manifest_files`]: a size already known is never replaced).
     fn add(&mut self, m: &CiManifest, new: &BTreeMap<&str, u64>, hex: &str, size: u64) {
@@ -349,13 +359,41 @@ fn bundle_head(path: &Path) -> io::Result<Vec<u8>> {
     Ok(head)
 }
 
-fn read_reserved(dir: &Path) -> Option<u64> {
-    fs::read_to_string(dir.join(RESERVED))
-        .ok()?
-        .trim()
-        .parse()
-        .ok()
+fn read_reserved(dir: &Path) -> Option<Reservation> {
+    parse_reservation(&fs::read_to_string(dir.join(RESERVED)).ok()?)
 }
+
+/// The bytes the staged files of a source hold on the disk: what is there,
+/// not what their names announce.
+fn staged_bytes(dir: &Path) -> u64 {
+    let mut sum = 0u64;
+    for d in [dir.to_path_buf(), dir.join(PARTS), dir.join(FILES)] {
+        for f in listing(&d).unwrap_or_default() {
+            if let Ok(m) = fs::symlink_metadata(d.join(f.name)) {
+                sum = sum.saturating_add(m.len());
+            }
+        }
+    }
+    sum
+}
+
+/// The free space of the file system `path` is on, or will be on once it is
+/// made (the nearest directory above it that exists is asked).
+fn free_at(read: &FreeReading, path: &Path) -> io::Result<u64> {
+    let mut at = path;
+    loop {
+        match read(at) {
+            Err(e) if e.kind() == io::ErrorKind::NotFound => match at.parent() {
+                Some(up) => at = up,
+                None => return Err(e),
+            },
+            other => return other,
+        }
+    }
+}
+
+/// How the free space of a file system is read ([`free_bytes`]).
+pub type FreeReading = Box<dyn Fn(&Path) -> io::Result<u64> + Send + Sync>;
 
 enum Progress {
     /// Not whole yet; this many bytes are held.
@@ -371,6 +409,7 @@ pub struct Incoming {
     store: SourceStore,
     workspaces: Workspaces,
     env: BTreeMap<String, String>,
+    free: FreeReading,
     /// What is staged per source, kept between requests. Only read and
     /// written under the source's file lock.
     cache: Mutex<BTreeMap<String, Staged>>,
@@ -390,8 +429,32 @@ impl Incoming {
             store,
             workspaces,
             env,
+            free: Box::new(free_bytes),
             cache: Mutex::default(),
         }
+    }
+
+    /// Read the free space of the disk with `free` (a test gives the
+    /// numbers of a disk it does not have).
+    pub fn with_free_reading(mut self, free: FreeReading) -> Self {
+        self.free = free;
+        self
+    }
+
+    /// The free space there is for a source: of the file systems the staged
+    /// files, the store and the clones are on, the one with the least. What
+    /// a source writes is asked of that one number, wherever it goes: right
+    /// when the three are one file system, and on the safe side when not.
+    fn free_room(&self) -> io::Result<u64> {
+        let mut least = u64::MAX;
+        for place in [
+            self.root.clone(),
+            self.store.root().to_path_buf(),
+            self.workspaces.clones_root(),
+        ] {
+            least = least.min(free_at(&self.free, &place)?);
+        }
+        Ok(least)
     }
 
     fn dir(&self, source: &SourceId) -> PathBuf {
@@ -597,17 +660,20 @@ impl Incoming {
         Err(overloaded("too many sources are being received"))
     }
 
-    /// Let the source take `total` bytes in all ([`source_total`]), or say
-    /// why not. With `create`, a source that has no staging directory yet
-    /// gets one (when there is room for one more source). Counting the
-    /// sources, adding up what they reserved, looking at the disk and
-    /// writing the new reservation happen under the one lock over all
-    /// sources, so two requests cannot both take the last room.
+    /// Let the source take `total` bytes in all ([`source_total`]) and
+    /// `room` more of the disk while it is published ([`publish_room`]), or
+    /// say why not. With `create`, a source that has no staging directory
+    /// yet gets one (when there is room for one more source). Counting the
+    /// sources, adding up what they reserved and have not written yet,
+    /// looking at the disk and writing the new reservation happen under the
+    /// one lock over all sources, so two requests cannot both take the last
+    /// room.
     fn reserve(
         &self,
         limits: &BlobLimits,
         source: &SourceId,
         total: Option<u64>,
+        room: Option<u64>,
         create: bool,
     ) -> Result<(), ApiError> {
         let _all = self.lock_all(limits)?;
@@ -619,7 +685,9 @@ impl Incoming {
             }
             self.admit(limits, source)?;
         }
-        let held = read_reserved(&dir).unwrap_or(0);
+        let known = read_reserved(&dir);
+        let held = known.unwrap_or(Reservation { bytes: 0, disk: 0 });
+        let mut pending = outstanding(held.disk, staged_bytes(&dir));
         let mut others = 0u64;
         for other in self.staged_sources()? {
             if other == source.as_str() {
@@ -627,18 +695,23 @@ impl Incoming {
             }
             let other_dir = self.root.join(&other);
             let theirs = match read_reserved(&other_dir) {
-                Some(n) => n,
+                Some(r) => r,
                 // being removed just now, or only something that is not
                 // ours is left in it
-                None if !other_dir.is_dir() || Self::holds_nothing(&other_dir) => 0,
-                // unknown: it may take all a source may
-                None => limits.max_source_bytes,
+                None if !other_dir.is_dir() || Self::holds_nothing(&other_dir) => continue,
+                // unknown: it may take all a source may (and publishing a
+                // source takes at most twice what it stages)
+                None => Reservation {
+                    bytes: limits.max_source_bytes,
+                    disk: limits.max_source_bytes.saturating_mul(3),
+                },
             };
-            others = others.saturating_add(theirs);
+            others = others.saturating_add(theirs.bytes);
+            pending = pending.saturating_add(outstanding(theirs.disk, staged_bytes(&other_dir)));
         }
-        let free = free_bytes(&self.root).map_err(io_err)?;
-        let reserved =
-            check_reservation(limits, total, held, others, free).map_err(|r| match r {
+        let free = self.free_room().map_err(io_err)?;
+        let reserved = check_reservation(limits, total, room, held, others, pending, free)
+            .map_err(|r| match r {
                 Refusal::Source => invalid("the source is larger than this worker accepts"),
                 Refusal::Incoming => {
                     overloaded("the sources being received take all the room there is for them")
@@ -648,9 +721,9 @@ impl Incoming {
         if !exists {
             private_dir(&dir).map_err(io_err)?;
         }
-        if !exists || reserved != held || read_reserved(&dir).is_none() {
+        if known != Some(reserved) {
             let tmp = dir.join(RESERVED_TMP);
-            fs::write(&tmp, reserved.to_string()).map_err(io_err)?;
+            fs::write(&tmp, reservation_text(reserved)).map_err(io_err)?;
             fs::rename(&tmp, dir.join(RESERVED)).map_err(io_err)?;
         }
         Ok(())
@@ -703,10 +776,10 @@ impl Incoming {
                 SourceBlobKind::Manifest => (manifests.checked_add(r.total_size), Some(bundle)),
                 _ => (Some(manifests), bundle.checked_add(r.total_size)),
             };
-            let total = manifests
-                .zip(bundle)
-                .and_then(|(m, b)| source_total(m, b, st.bytes));
-            self.reserve(limits, &r.source_id, total, true)?;
+            let sizes = manifests.zip(bundle);
+            let total = sizes.and_then(|(m, b)| source_total(m, b, st.bytes));
+            let room = sizes.and_then(|(m, b)| publish_room(m, b, st.largest()));
+            self.reserve(limits, &r.source_id, total, room, true)?;
         }
         private_dir(&home).map_err(io_err)
     }
@@ -820,12 +893,24 @@ impl Incoming {
                 return Err(invalid(why));
             }
         };
+        // A file the store holds is the one a manifest names only with the
+        // same size: refused here, before any of the source's files come.
+        // (Looked at again when the source is published: the store may get
+        // the file meanwhile.)
+        for (hash, size) in &new {
+            if let Err(why) = check_stored(self.store.blob_size(hash), *size) {
+                remove_staged(part);
+                return Err(invalid(why));
+            }
+        }
         let (manifests, bundle) = announced(&listing(&dir)?);
         let files = new
             .values()
             .try_fold(st.bytes, |sum, size| sum.checked_add(*size));
         let total = files.and_then(|f| source_total(manifests, bundle, f));
-        if let Err(e) = self.reserve(limits, &r.source_id, total, false) {
+        let largest = new.values().copied().fold(st.largest(), u64::max);
+        let room = publish_room(manifests, bundle, largest);
+        if let Err(e) = self.reserve(limits, &r.source_id, total, room, false) {
             if e.code != ErrorCode::Overloaded {
                 remove_staged(part);
             }
@@ -914,6 +999,11 @@ impl Incoming {
     /// `bundle_base_missing`) says what the clone does hold, so the next
     /// bundle fits. A bundle that is not one, or does not bring what the
     /// manifest names, is `INVALID_INPUT`.
+    ///
+    /// The bundle is unpacked into a scratch repository first (the refs of
+    /// the clone, its objects borrowed), and what the manifests name is
+    /// looked for there: a bundle that is refused has written nothing into
+    /// the clone, and has not made one.
     fn unpack(
         &self,
         limits: &BlobLimits,
@@ -942,10 +1032,6 @@ impl Incoming {
                 "the bundle is built on commits this worker does not hold; build it on what blob_verify lists",
             ));
         }
-        let repo = match existing {
-            Some(repo) => repo,
-            None => self.workspaces.ensure_clone(repository_id, None)?,
-        };
         let root = &st.manifests[root_id];
         let dir = bundle.parent().expect("a staged file is in a directory");
         let body = read_manifest(
@@ -957,12 +1043,40 @@ impl Incoming {
             )),
             limits,
         )?;
-        repo.receive_bundle(bundle, &body)
-            .map_err(|e| refuse(format!("{e:#}")))?;
-        if !self.commits_here(&repo, st, &st.carried(root_id)) {
-            return Err(refuse(
-                "it does not bring the commits the manifests name".into(),
-            ));
+        let carried = st.carried(root_id);
+        {
+            let (_scratch, trial) = self.workspaces.rehearsal(repository_id)?;
+            trial
+                .receive_bundle(bundle, &body)
+                .map_err(|e| refuse(format!("{e:#}")))?;
+            if !self.commits_here(&trial, st, &carried) {
+                return Err(refuse(
+                    "it does not bring the commits the manifests name".into(),
+                ));
+            }
+        }
+        let made = existing.is_none();
+        let repo = match existing {
+            Some(repo) => repo,
+            None => self.workspaces.ensure_clone(repository_id, None)?,
+        };
+        let taken = repo
+            .receive_bundle(bundle, &body)
+            .map_err(|e| format!("{e:#}"))
+            .and_then(|()| {
+                if self.commits_here(&repo, st, &carried) {
+                    Ok(())
+                } else {
+                    Err("it does not bring the commits the manifests name".to_string())
+                }
+            });
+        if let Err(why) = taken {
+            // What unpacked beside the clone did not unpack into it. A clone
+            // made just now for this bundle, and still empty, does not stay.
+            if made {
+                let _ = self.workspaces.remove_clone_if_empty(repository_id);
+            }
+            return Err(refuse(why));
         }
         Ok(repo)
     }
@@ -971,9 +1085,15 @@ impl Incoming {
     /// something is still missing. An error is about what was sent (a bundle
     /// that does not fit, a manifest the store refuses).
     ///
-    /// Everything that can refuse the source comes before the first file is
-    /// moved into the store, so a source that is refused or dropped leaves
-    /// nothing there.
+    /// Everything that can refuse the source comes before anything of it is
+    /// written outside its staging directory: that every file the store
+    /// holds already has the size the manifests give, that the submodule
+    /// captures they name are here, and that the bundle unpacks and brings
+    /// the commits (tried in a scratch repository, see [`Self::unpack`]).
+    /// Only then is the bundle unpacked into the clone, are the files moved
+    /// into the store and the manifests published, so a source that is
+    /// refused or dropped leaves nothing in the store and nothing in the
+    /// clone.
     fn complete(
         &self,
         limits: &BlobLimits,
@@ -994,13 +1114,53 @@ impl Incoming {
             dir.join(FILES)
                 .join(staged_name(SourceBlobKind::Content, hash, size, true))
         };
+        // Each file is in the store with the size its manifest gives, or
+        // waits here whole. One the store holds with another size is not the
+        // file of any manifest: the source can never be published, and
+        // nothing of it stays.
+        let mut refused = None;
+        let mut held = |hash: &str, size: u64| -> Result<Option<bool>, ApiError> {
+            Ok(match check_stored(self.store.blob_size(hash), size) {
+                Ok(true) => Some(true),
+                Ok(false) => staged_len(&waiting(hash, size))?.map(|_| false),
+                Err(why) => {
+                    refused = Some(why);
+                    None
+                }
+            })
+        };
+        let mut stored = BTreeSet::new();
+        let mut all_here = true;
         while let Some(hash) = st.missing.first() {
-            let here =
-                self.store.has_blob(hash) || staged_len(&waiting(hash, st.wanted[hash]))?.is_some();
-            if !here {
-                return Ok(false);
+            if held(hash, st.wanted[hash])?.is_none() {
+                all_here = false;
+                break;
             }
             st.missing.pop_first();
+        }
+        if all_here {
+            // (once: the files that were seen whole before are looked at
+            // again, for what the store got meanwhile)
+            for (hash, size) in &st.wanted {
+                match held(hash, *size)? {
+                    Some(true) => {
+                        stored.insert(hash.clone());
+                    }
+                    Some(false) => {}
+                    None => {
+                        all_here = false;
+                        break;
+                    }
+                }
+            }
+        }
+        if let Some(why) = refused {
+            self.discard(source.as_str());
+            *st = Staged::default();
+            return Err(invalid(format!("the source is refused: {why}")));
+        }
+        if !all_here {
+            return Ok(false);
         }
         let root = &st.manifests[root_id];
         let carried = st.carried(root_id);
@@ -1017,10 +1177,11 @@ impl Incoming {
         }
         let store_err = |e: anyhow::Error| internal("source store", format!("{e:#}"));
         for (hash, size) in &st.wanted {
-            if self.store.has_blob(hash) {
+            let path = waiting(hash, *size);
+            if stored.contains(hash) {
+                remove_staged(&path);
                 continue;
             }
-            let path = waiting(hash, *size);
             let want = BlobWant {
                 hash: hash.clone(),
                 size: *size,
