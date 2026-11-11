@@ -372,11 +372,12 @@ coordinator内の1つのscheduler actorが、配置のcommitを直列化する�
 - forecastが時刻を返さず `fallback` のranking（`target.ranking.finish_in_ms`）だけを返したworkerは、その値で比べる。`measured` の時刻と `fallback` のrankingは同じ尺度で比べ、配置理由にはどちらであるかを残す。rankingを時刻として表示しない。
 - 数値をまったく得られなかったworker（forecastの時刻もrankingも `null`、errorの答え、期限切れ、boot／agent epochの変化、聞いたものと違うworker／planへの答え）は `unknown` とする。`unknown` を空きとは扱わない。数値のあるworkerが1台でもあれば、`unknown` のworkerは選ばない。全員が `unknown` のときに限り、上の同点規則だけで選ぶ（配置は止めない）。task-traffic-controllerは、登録済みのnodeを持つworkerについて数値を返せないことがあり、そのworkerはこの `unknown` になる。
 - 親の側の見積（転送・setup・回収）がworkerによって不明のときは、その部分について候補の中で最も大きい既知の値を仮に入れて比べ、仮の値であることを配置理由に残す。全員が不明の部分は比較に入れない。
-- forecastを制限時間（`forecast_wait_ms`、既定1秒。`forecast_ttl_ms` より短くする）までに答えなかったworkerは、そのtickの残りの配置から外す。他のworkerの配置はそれを待たない。
+- forecastを制限時間（1秒。設定fileのkeyではなく実装の定数で、`forecast_ttl_ms` より短くなければならない。短くない組み合わせではschedulerを起動しない）までに答えなかったworkerは、そのtickの残りの配置から外す。他のworkerの配置はそれを待たない。
 - tickの途中でattachされたworkerは、次の1件の決定の前にほかのworkerと同じ確認（`inspect` と、そのworker上のattemptの確認）を受け、その決定から候補に入る。
-- 決定ごとの配置理由（比べたworker、それぞれの予測と内訳・出所・補正量、勝った理由、外したworkerとその理由）は、配置と同じtransactionで親DBに記録する。どのworkerも選べなかったときの理由は、runのevent `task_waiting` に、理由が変わったときだけ記録する。
+- 決定ごとの配置理由（比べたworker、それぞれの予測と内訳・出所・補正量、勝った理由、外したworkerとその理由）は、配置と同じtransactionで親DBに記録する。どのworkerも選べなかったときの理由は、runのevent `task_waiting` に記録する。同じtaskについて書き直すのは、結論か、tickをまたいで続く除外（そのtaskを断ったworker、drain中のworker）が変わったときだけとする。そのtickだけの事情（満杯、forecastやsubmitに答えなかった、確認できなかった）が入れ替わっても書き直さない。決定に付ける番号 `decision_seq` は親processの中での順番で、再起動すると1から数え直す（DB上の識別子ではない）。
+- 配置は古いtaskから順に、1回のtickで決まった件数まで見る。attach中のworker全員から外されたtask（下の `worker_cannot_run`）は、その順番の最後に回す。そのようなtaskが何件待っていても、配置できるtaskが後回しにならない。外していないworkerがattachされると、元の順番に戻る。
 
-利用者は設定でworkerに好みを付けられる（`[[workers]]` の `priority`、親のlocal workerは `[coordinator] local_worker_priority`。整数、既定0、大きいほど優先、範囲は -100〜100）。比較値は次のとおりとする。
+利用者は設定でworkerに好みを付けられる（`[[workers]]` の `priority`、親のlocal workerは `[coordinator] local_worker_priority`。整数、既定0、大きいほど優先、範囲は -100〜100。範囲の外の値は近い方の端として扱う）。比較値は次のとおりとする。
 
 ```
 比較値 = 予測完了時間 + (候補中の最大priority − そのworkerのpriority) × priority_step_seconds
@@ -547,8 +548,9 @@ workerは受け取る量に上限を持ち、超える要求は一部だけ処�
 - retireが確認済みになったときの扱いは、確認を記録するtransactionの中で、その時点の記録から決める。taskにcancelが記録されていれば、taskを空けずに親がそのattemptを `cancelled` に確定する。workerがsubmitを確定的に断ったことによるretireなら `failed` に確定する。どちらでもなければattemptをretire済みにしてtaskを空ける。terminalのattemptをretire済みにはしない（結果が確定したtaskを再び配置しないため）。
 - 届く前にcancelしたattemptは、workerにtombstoneが書かれたことを確かめてから、親が `cancelled` を確定する。
 - workerがsubmitをerrorで断ったとき、確定的な拒否として扱うのは、attempt自体についての答えだけとする。`INVALID_INPUT` と、同じattemptを別のpayloadで受理済みであることを示す `CONFLICT`（`conflict_reason.reason = "payload_mismatch"`）である。このときは、そのworkerへretireを送ってtombstoneを残し、確認できたら親がそのattemptを `failed` に確定する。別workerへは自動で配置しない。
-- それ以外のerror（`OVERLOADED`、`INTERNAL`、`COMMUNICATION_UNKNOWN`、`BLOCKED`、`NOT_IMPLEMENTED`、`PROTOCOL_INCOMPATIBLE`、`NOT_FOUND`、理由が `payload_mismatch` でない `CONFLICT`、親の知らないcode）は、workerの一時的な不調か、そのattemptについての答えではないものとして扱う。taskを失敗にせず、同じattemptを同じworkerへ後で送り直す。断られた理由は、attemptのevent `submit_deferred` にerror codeごとに1回記録する（待っている理由を表示できるようにするため）。
-- `PROTOCOL_INCOMPATIBLE` と `BLOCKED`（`blocked_reason` が `secret_unavailable` のものを除く）は、そのworkerでは解消しない理由として扱う。同じattemptに同じcodeが2回返ったら（1回目は `submit_deferred` に記録済み）、schedulerがそのattemptのretireを依頼し（理由 `worker_cannot_run`）、attemptのevent `worker_excluded` にworkerとcodeを残す。workerが未開始を確認した時点でtaskが空き、次のgenerationで配置される。そのtaskは、このeventを持つretire済みattemptのworkerへは配置しない（親DBの記録から判断するので、親の再起動後も同じ）。taskは失敗にしない。全workerが外れたtaskは未配置のまま待ち、理由は `task_waiting` に残る。`secret_unavailable` はどのworkerでも同じなので、移さずに同じworkerへ送り直す。
+- それ以外のerror（`OVERLOADED`、`INTERNAL`、`COMMUNICATION_UNKNOWN`、`NOT_IMPLEMENTED`、`NOT_FOUND`、理由が `payload_mismatch` でない `CONFLICT`、`blocked_reason` が `secret_unavailable` か無い `BLOCKED`、親の知らないcode）は、workerの一時的な不調か、そのattemptについての答えではないものとして扱う。taskを失敗にせず、同じattemptを同じworkerへ後で送り直す（何回でも）。断られた理由は、attemptのevent `submit_deferred` に、答え（error codeと、`BLOCKED` ではその `blocked_reason` の組）ごとに1回記録する（待っている理由を表示できるようにするため）。
+- workerが自分の側の理由だと明示した答え、つまり `PROTOCOL_INCOMPATIBLE` と、`blocked_reason` が `environment_mismatch` か `no_compatible_worker` の `BLOCKED` は、そのworkerでは解消しない理由として扱う。同じattemptに同じ答え（codeと `blocked_reason` の組）が2回返ったら（1回目は `submit_deferred` に記録済み）、schedulerがそのattemptのretireを依頼し（理由 `worker_cannot_run`）、同じtransactionでattemptのevent `worker_excluded` にworker・code・`blocked_reason` を残す。別の理由の `BLOCKED` が先に返っていても、それは2回目に数えない。workerが未開始を確認した時点でtaskが空き、次のgenerationで配置される。そのtaskは、理由 `worker_cannot_run` のretireが確認済みのattemptのworkerへは配置しない（retireの理由だけで判断する。親DBの記録から判断するので、親の再起動後も同じ）。taskは失敗にしない。全workerが外れたtaskは未配置のまま待ち、理由は `task_waiting` に残る。`secret_unavailable` はどのworkerでも同じなので、移さずに同じworkerへ送り直す。
+- 答えが届いたが読めなかったとき（schema versionが違う、別の操作への答えだった）は、workerのerrorではなく「答えが無い」として扱う。workerは依頼を実行したかもしれないので、拒否には数えず、unknownのまま保持する。
 - 配置を記録した直後でも、そのattemptにcancelかretireの依頼が記録されていれば、submitを送らない（次の確認でcancel・retireを先に届ける）。
 - 親は1回のtickで全workerを並行して確認する。1つのworkerに使う時間には上限（`worker_budget_ms`、既定15秒）を置き、上限までに答えの無かったattemptはunknownにして次のtickで確認し直す。そのworkerにはそのtickで新しい配置を送らない。応答の遅いworkerが1台あっても、他のworkerのleaseの更新は遅れない。tickの終わりに行う配置のsubmitにも同じ長さの上限を置くので、1回のtickは上限の約2倍以内に終わる。この2倍が `lease_ms` より十分短くなるように設定する。配置の決定（transaction）は並行させず、1つずつ行う。
 - payloadを組み立てられないtaskは、受付（enqueue）の時点で断る。受付を通らずに親DBにある組み立てられないtaskは、配置のたびに飛ばして他のtaskの配置を続け、理由をrunのevent `task_unplaceable` に記録する（1回の親processにつき1回）。
