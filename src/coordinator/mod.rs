@@ -22,6 +22,7 @@
 //! first attached worker, by id, that has room); choosing by predicted
 //! completion belongs to the scheduler.
 
+mod collect;
 mod link;
 pub mod policy;
 
@@ -77,6 +78,9 @@ pub enum CoordinatorError {
     Invalid(String),
     #[error("a storage call was aborted")]
     Aborted,
+    /// The parent's result store could not be read or written.
+    #[error("result store: {0}")]
+    Results(String),
 }
 
 type Result<T, E = CoordinatorError> = std::result::Result<T, E>;
@@ -220,6 +224,8 @@ pub struct Coordinator {
     cfg: CoordinatorConfig,
     workers: Mutex<BTreeMap<WorkerId, Arc<dyn WorkerLink>>>,
     actor: tokio::sync::Mutex<()>,
+    /// One pass of result collection at a time.
+    collecting: tokio::sync::Mutex<()>,
     lease_seq: AtomicU64,
     fenced: AtomicBool,
     /// The queued tasks no payload could be made for, as this process
@@ -250,6 +256,7 @@ impl Coordinator {
             cfg,
             workers: Mutex::default(),
             actor: tokio::sync::Mutex::new(()),
+            collecting: tokio::sync::Mutex::new(()),
             lease_seq: AtomicU64::new(0),
             fenced: AtomicBool::new(false),
             unplaceable: Mutex::default(),
