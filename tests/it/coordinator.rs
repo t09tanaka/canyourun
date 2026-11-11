@@ -22,7 +22,7 @@ use remote_task_runner::protocol::{connect, ClientConfig};
 use remote_task_runner::state::{
     AttemptState, Observation, Outcome, Receipt, Receipts, Termination,
 };
-use remote_task_runner::storage::{AttemptRecord, CoordinatorStore};
+use remote_task_runner::storage::{AttemptRecord, CoordinatorStore, StorageError};
 use remote_task_runner::wire::*;
 use remote_task_runner::worker::policy::{load_counts, retire_status};
 use remote_task_runner::worker::serve::serve_connection;
@@ -611,6 +611,33 @@ async fn the_coordinators_own_limits_hold_when_the_worker_allows_more() {
         assert!(c.tick().await.unwrap().placed.is_empty());
     }
     assert_eq!(a.holds().len(), 3);
+}
+
+#[tokio::test]
+async fn a_worker_that_did_not_take_a_submit_gets_no_more_in_that_tick() {
+    for fault in ["silent", "overloaded"] {
+        let f = fx();
+        let a = f.worker("w-a", (2, 1));
+        let b = f.worker("w-b", (2, 1));
+        let c = f.open(&[&a, &b]);
+        let tasks = enqueue(&c, 4).await;
+        match fault {
+            "silent" => a.set(|s| s.lose.push((Op::Submit, Lost::Request))),
+            _ => a.set(|s| s.overloaded = true),
+        }
+        let report = c.tick().await.unwrap();
+        // One attempt is pinned to the worker that did not answer for it,
+        // not the three it has room for; the rest go to the other worker.
+        assert_eq!(only(&c, &tasks[0]).worker_id, a.id, "{fault}");
+        assert_eq!(c.store().worker_load(&a.id).unwrap().pending, 1, "{fault}");
+        assert_eq!(report.placed.len(), 4, "{fault}");
+        for t in &tasks[1..] {
+            assert_eq!(only(&c, t).worker_id, b.id, "{fault}");
+        }
+        assert_eq!(b.holds().len(), 3);
+        assert!(a.holds().is_empty());
+        assert_eq!(c.store().unacked_demand().unwrap().len(), 1);
+    }
 }
 
 #[tokio::test]
@@ -1354,7 +1381,19 @@ async fn a19_a_real_worker_stops_the_retired_run_and_the_resent_retire_frees_the
     let mut w = worker_agent::fx();
     let dir = tempfile::tempdir().unwrap();
     let open = || {
-        let store = CoordinatorStore::open(dir.path(), 1).unwrap();
+        // The agent of this test lives in this process and forks its
+        // supervisors: a child between fork and exec still holds a copy of
+        // the lock of the coordinator that was just dropped. Wait for it.
+        let end = std::time::Instant::now() + Duration::from_secs(10);
+        let store = loop {
+            match CoordinatorStore::open(dir.path(), 1) {
+                Ok(store) => break store,
+                Err(StorageError::Locked(_)) if std::time::Instant::now() < end => {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                Err(e) => panic!("{e:?}"),
+            }
+        };
         Coordinator::start(store, CoordinatorConfig::default()).unwrap()
     };
     let c = open();
@@ -1412,7 +1451,12 @@ async fn a19_a_real_worker_stops_the_retired_run_and_the_resent_retire_frees_the
         assert!(c.tick().await.unwrap().placed.is_empty());
     }
     assert_eq!(attempts(&c, &task).len(), 2);
-    assert_eq!(only_live(&c, &task).state, AttemptState::Active);
+    // The marker is written a moment before the worker reports `active`.
+    let state = only_live(&c, &task).state;
+    assert!(
+        matches!(state, AttemptState::Starting | AttemptState::Active),
+        "{state:?}"
+    );
 
     // Cancel what still runs, and see it end.
     c.cancel_task(&task).await.unwrap();

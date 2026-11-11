@@ -319,7 +319,8 @@ pub fn state_path(from: AttemptState, to: AttemptState) -> Option<Vec<AttemptSta
         return Some(Vec::new());
     }
     let mut frontier = vec![(from, Vec::new())];
-    while !frontier.is_empty() {
+    // No path is longer than the number of states.
+    for _ in AttemptState::ALL {
         let mut next = Vec::new();
         for (state, path) in frontier {
             for &step in state.successors() {

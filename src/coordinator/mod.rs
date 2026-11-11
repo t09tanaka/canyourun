@@ -365,9 +365,14 @@ impl Coordinator {
 
     async fn note(&self, attempt_id: &AttemptId, kind: &'static str, payload: Value) -> Result<()> {
         let a = attempt_id.clone();
-        self.db(move |s| s.append_event(None, Some(&a), kind, &payload, wall_ms()))
-            .await?;
-        Ok(())
+        self.db(move |s| {
+            // Once per attempt: a stuck attempt is looked at on every tick.
+            if s.events_of(&a, kind)?.is_empty() {
+                s.append_event(None, Some(&a), kind, &payload, wall_ms())?;
+            }
+            Ok(())
+        })
+        .await
     }
 
     /// Ask the worker for the attempt. A status that is not about this
@@ -459,7 +464,7 @@ impl Coordinator {
             (Step::SettleCancelled, _) => {
                 self.settle_here(&a.attempt_id, cancelled(), report).await
             }
-            (Step::Submit, _) => self.submit(link, &live, report).await,
+            (Step::Submit, _) => self.submit(link, &live, report).await.map(|_| ()),
             (Step::Settle, Some(status)) => self.mirror(&status, report).await,
             (Step::Follow, Some(status)) => {
                 self.mirror(&status, report).await?;
@@ -472,13 +477,14 @@ impl Coordinator {
     }
 
     /// Send the attempt as it was recorded when it was placed: the stored
-    /// payload, which must still hash to the stored hash.
+    /// payload, which must still hash to the stored hash. Returns whether
+    /// the worker holds the attempt now.
     async fn submit(
         &self,
         link: &dyn WorkerLink,
         live: &LiveAttempt,
         report: &mut TickReport,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let a = &live.record;
         let payload: Option<AttemptPayload> = live
             .placement
@@ -492,7 +498,8 @@ impl Coordinator {
             // Fail closed: what would be sent is not what was decided.
             self.note(&a.attempt_id, "submit_payload_mismatch", Value::Null)
                 .await?;
-            return self.unknown(&a.attempt_id, report).await;
+            self.unknown(&a.attempt_id, report).await?;
+            return Ok(false);
         };
         match link.call(Request::SubmitAttempt(request)).await {
             Ok(Response::SubmitAttempt(r))
@@ -508,13 +515,13 @@ impl Coordinator {
                 let id = a.attempt_id.clone();
                 self.db(move |s| s.record_seen(&id, true, seen, Observation::Known, wall_ms()))
                     .await?;
-                Ok(())
+                Ok(true)
             }
             Err(LinkError::Remote(e)) => match policy::submit_refusal(e.code) {
                 Refusal::Fenced => Err(self.fence()),
                 Refusal::Later | Refusal::Tombstoned => {
                     self.observe(&a.attempt_id, Observation::Known).await?;
-                    Ok(())
+                    Ok(false)
                 }
                 Refusal::Never => {
                     let payload = json!({"code": e.code.to_string(), "message": e.message});
@@ -522,11 +529,14 @@ impl Coordinator {
                     self.request_retire(&a.attempt_id, REASON_SUBMIT_REFUSED)
                         .await?;
                     self.observe(&a.attempt_id, Observation::Known).await?;
-                    Ok(())
+                    Ok(false)
                 }
             },
             // Sent or not, accepted or not: nothing is known.
-            _ => self.unknown(&a.attempt_id, report).await,
+            _ => {
+                self.unknown(&a.attempt_id, report).await?;
+                Ok(false)
+            }
         }
     }
 
@@ -646,7 +656,8 @@ impl Coordinator {
 
     /// Place queued tasks, oldest first, each on the first worker (by id)
     /// that answered in this tick, is not draining and has room. The commit
-    /// counts the worker's load again; the submit follows the commit.
+    /// counts the worker's load again; the submit follows the commit, and a
+    /// worker that does not take it is left alone for the rest of the tick.
     async fn dispatch(&self, reached: Vec<Reached>, report: &mut TickReport) -> Result<()> {
         let mut open: Vec<Reached> = reached.into_iter().filter(|w| !w.draining).collect();
         if open.is_empty() {
@@ -685,8 +696,15 @@ impl Coordinator {
                         let w = worker.worker_id.clone();
                         let live = self.db(move |s| s.live_attempts(Some(&w))).await?;
                         let placed = live.into_iter().find(|l| l.record.attempt_id == attempt_id);
-                        if let Some(placed) = placed {
-                            self.submit(&*worker.link, &placed, report).await?;
+                        let took = match placed {
+                            Some(placed) => self.submit(&*worker.link, &placed, report).await?,
+                            None => false,
+                        };
+                        if !took {
+                            // A worker that did not take this one gets no
+                            // more in this tick: what is placed there cannot
+                            // move until it answers.
+                            open.remove(0);
                         }
                         break;
                     }
