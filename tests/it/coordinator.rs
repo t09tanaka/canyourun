@@ -19,6 +19,7 @@ use remote_task_runner::error::{ApiError, ConflictReason, ErrorCode};
 use remote_task_runner::ids::*;
 use remote_task_runner::protocol::transport::duplex_pair;
 use remote_task_runner::protocol::{connect, ClientConfig};
+use remote_task_runner::results::{CollectConfig, CollectReport, ResultStore};
 use remote_task_runner::state::{
     AttemptState, Observation, Outcome, Receipt, Receipts, Termination,
 };
@@ -1803,4 +1804,97 @@ async fn a19_a_real_worker_stops_the_retired_run_and_the_resent_retire_frees_the
     }
     assert_eq!(ended.map(|t| t.outcome()), Some(Outcome::Cancelled));
     assert_eq!(count_lines(&marker), 2, "one start per generation");
+}
+
+/// A30 against a real worker: what a command left is fetched through the
+/// worker's own `get_result`, `read_log`, `blob_get` and `ack_collected`,
+/// over a connection that is replaced in the middle.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a30_a_real_workers_outputs_are_collected_over_two_connections_and_the_worker_is_told() {
+    let mut w = worker_agent::fx();
+    let dir = tempfile::tempdir().unwrap();
+    let store = CoordinatorStore::open(dir.path(), 1).unwrap();
+    let c = Coordinator::start(store, CoordinatorConfig::default()).unwrap();
+    w.cluster = c.store().cluster_id().clone();
+    let agent = w.start("boot-a");
+    let id = WorkerId::parse("w-test").unwrap();
+    c.attach(id.clone(), link_to(&c, &agent, false).await);
+    let files = Arc::new(ResultStore::open(&dir.path().join("results")).unwrap());
+
+    let mut task_spec = spec();
+    let script = "printf 0123456789 > out.txt; echo hello";
+    task_spec.commands[0].argv = vec!["/bin/sh".into(), "-c".into(), script.into()];
+    task_spec.commands[0]
+        .env
+        .insert("PATH".into(), "/usr/bin:/bin".into());
+    task_spec.artifacts = vec![
+        ArtifactDecl {
+            name: "report/out.txt".into(),
+            path: "out.txt".into(),
+            if_missing: MissingPolicy::Required,
+        },
+        ArtifactDecl {
+            name: "maybe".into(),
+            path: "maybe.txt".into(),
+            if_missing: MissingPolicy::Optional,
+        },
+    ];
+    let task = TaskId::generate();
+    c.enqueue(
+        RunId::generate(),
+        source(&c),
+        vec![(task.clone(), task_spec)],
+    )
+    .await
+    .unwrap();
+    assert_eq!(c.tick().await.unwrap().placed.len(), 1);
+    let a = only(&c, &task).attempt_id;
+    let mut ended = None;
+    for _ in 0..400 {
+        c.tick().await.unwrap();
+        ended = c.store().get_attempt(&a).unwrap().unwrap().termination;
+        if ended.is_some() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(ended.map(|t| t.outcome()), Some(Outcome::Succeeded));
+
+    // A pass whose time is up before it starts does nothing and gives nothing up.
+    let slow = CollectConfig {
+        chunk_bytes: 4,
+        budget_ms: 0,
+        ..CollectConfig::default()
+    };
+    let report = c.collect(&files, slow).await.unwrap();
+    assert_eq!(report.pending, vec![a.clone()]);
+    assert!(agent
+        .store()
+        .events_of(&a, "ack_collected")
+        .unwrap()
+        .is_empty());
+
+    // A new connection; the collection goes on, in small chunks.
+    c.attach(id, link_to(&c, &agent, false).await);
+    let cfg = CollectConfig {
+        chunk_bytes: 4,
+        ..CollectConfig::default()
+    };
+    let report = c.collect(&files, cfg).await.unwrap();
+    assert_eq!(report.collected, vec![a.clone()]);
+    let out = files.artifact_path(&a, "report/out.txt").unwrap();
+    assert_eq!(std::fs::read(out).unwrap(), b"0123456789");
+    assert_eq!(files.read_log(&a, LogStream::Stdout).unwrap(), b"hello\n");
+    let row = c.store().collection(&a).unwrap().unwrap();
+    let logs = row.logs.unwrap();
+    assert_eq!(logs["stdout"]["complete"], true);
+    assert_eq!(logs["stdout"]["bytes"], 6);
+    assert!(only(&c, &task).receipts.reached(Receipt::Collected));
+    // The worker recorded the acknowledgement, once.
+    let acked = agent.store().events_of(&a, "ack_collected").unwrap();
+    assert_eq!(acked.len(), 1);
+    assert_eq!(
+        c.collect(&files, cfg).await.unwrap(),
+        CollectReport::default()
+    );
 }

@@ -6,6 +6,7 @@ mod common;
 mod proto_common;
 
 mod bridge;
+mod collection;
 mod config;
 mod coordinator;
 mod forecast;
