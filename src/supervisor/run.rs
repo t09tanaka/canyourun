@@ -152,6 +152,28 @@ pub(crate) fn absorb_retryable(r: Result<Option<StopReason>>) -> Result<Option<S
     }
 }
 
+/// At most this many hidden suspects are named in an `unresolved` event.
+pub(crate) const MAX_HIDDEN_SUSPECTS: usize = 8;
+
+/// The hidden processes that keep entry `id` from being resolved, as event
+/// detail: who holds a stuck recovery (pid, start time, parent, session and
+/// the reason it cannot be ruled out). At most [`MAX_HIDDEN_SUSPECTS`].
+pub(crate) fn hidden_suspects_json(ctx: &Context, id: &str) -> Vec<serde_json::Value> {
+    managed::hidden_suspects(ctx, id)
+        .iter()
+        .take(MAX_HIDDEN_SUSPECTS)
+        .map(|h| {
+            json!({
+                "pid": h.proc.pid,
+                "start_time": h.proc.start_time,
+                "parent": h.parent,
+                "session": h.sid,
+                "reason": h.reason(),
+            })
+        })
+        .collect()
+}
+
 /// The report for an attempt that cannot be settled, after recording why
 /// (and for which nodes) in the worker database.
 pub(crate) fn unresolved_report(
@@ -161,6 +183,7 @@ pub(crate) fn unresolved_report(
     reason: String,
     identity_unknown: bool,
     sleep_inhibit: String,
+    hidden_suspects: Vec<serde_json::Value>,
 ) -> Result<Report> {
     if let Some(a) = store.get(attempt)? {
         store.append_event(
@@ -171,6 +194,7 @@ pub(crate) fn unresolved_report(
                 "reason": reason,
                 "nodes": nodes,
                 "identity_unknown": identity_unknown,
+                "hidden_suspects": hidden_suspects,
             }),
             platform::wall_ms(),
         )?;
@@ -1382,6 +1406,7 @@ pub fn run(spec: &SuperviseSpec) -> Result<Report> {
             format!("node {last_node}: {why}; the attempt stays unresolved"),
             end.identity_unknown,
             sleep_inhibit,
+            Vec::new(),
         );
     }
     // The heartbeat that would have recorded a reader error may not have got

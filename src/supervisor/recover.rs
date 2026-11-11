@@ -36,8 +36,9 @@ use super::error::Result;
 use super::identity::{only_identity_unknown, verdict, Leader, Verdict};
 use super::members::ManagedMembers;
 use super::run::{
-    complete_terminal, open_spool, remove_fifos, settle, settle_without_spool, sidecar_child,
-    stop_confirmed_on, unresolved_report, Report, Traffic,
+    complete_terminal, hidden_suspects_json, open_spool, remove_fifos, settle,
+    settle_without_spool, sidecar_child, stop_confirmed_on, unresolved_report, Report, Traffic,
+    MAX_HIDDEN_SUSPECTS,
 };
 use super::spec::{command_id, SuperviseSpec};
 use super::stop::{group_state_on, GroupState, NoEvidence, Os, StopResult, StopTarget, System};
@@ -89,6 +90,7 @@ pub(crate) fn recover_on(
     // Each reason, and whether it is only that an identity could not be told.
     let mut unresolved: Vec<(String, bool)> = Vec::new();
     let mut unresolved_nodes: Vec<String> = Vec::new();
+    let mut hidden: Vec<serde_json::Value> = Vec::new();
     for (node, _intent_at, ident) in store.launches(attempt)? {
         let index = spec.nodes.iter().position(|n| n.node_id == node);
         let id = index.map(|i| command_id(attempt, i));
@@ -174,6 +176,12 @@ pub(crate) fn recover_on(
             if let Some(why) = problem {
                 unresolved.push((format!("node {node}: {why}"), false));
                 unresolved_nodes.push(node.to_string());
+                let room = MAX_HIDDEN_SUSPECTS.saturating_sub(hidden.len());
+                hidden.extend(
+                    hidden_suspects_json(&traffic.ctx, id)
+                        .into_iter()
+                        .take(room),
+                );
             }
         }
     }
@@ -187,6 +195,7 @@ pub(crate) fn recover_on(
             reasons.join("; "),
             by_identity,
             "not held".into(),
+            hidden,
         );
     }
     let reason =
@@ -342,6 +351,11 @@ mod tests {
         assert_eq!(unresolved.len(), 1);
         assert_eq!(unresolved[0].payload["nodes"], json!(["n"]));
         assert_eq!(unresolved[0].payload["identity_unknown"], true);
+        assert_eq!(
+            unresolved[0].payload["hidden_suspects"],
+            json!([]),
+            "no hidden process holds an entry that was never kept"
+        );
     }
 
     #[test]
