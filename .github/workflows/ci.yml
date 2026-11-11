@@ -38,11 +38,14 @@ jobs:
         run: cargo clippy --all-targets -- -D warnings
       - name: install fast-worktree
         run: command -v fast-worktree || cargo install fast-worktree --locked --version 0.3.2
-      - name: cargo test
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: nextest@0.9.151
+      - name: cargo nextest
         env:
           # the workspace tests run the real tool; its absence is a failure
           RTR_REQUIRE_FAST_WORKTREE: "1"
-        run: cargo test
+        run: cargo nextest run --workspace --all-targets
 
   msrv:
     name: MSRV (1.89)
@@ -94,8 +97,8 @@ jobs:
       - name: install cargo-schemata
         run: |
           # A cached binary of another version is replaced, not reused.
-          if ! cargo schemata --version 2>/dev/null | grep -q '0\.3\.0'; then
-            cargo install cargo-schemata --locked --version 0.3.0 --force
+          if ! cargo schemata --version 2>/dev/null | grep -q '0\.4\.0'; then
+            cargo install cargo-schemata --locked --version 0.4.0 --force
           fi
       - name: mutate this shard
         run: |
@@ -125,8 +128,8 @@ jobs:
           save-if: false
       - name: install cargo-schemata
         run: |
-          if ! cargo schemata --version 2>/dev/null | grep -q '0\.3\.0'; then
-            cargo install cargo-schemata --locked --version 0.3.0 --force
+          if ! cargo schemata --version 2>/dev/null | grep -q '0\.4\.0'; then
+            cargo install cargo-schemata --locked --version 0.4.0 --force
           fi
       - name: every target file has mutants
         run: |
