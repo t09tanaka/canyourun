@@ -63,6 +63,7 @@ fn ident() -> Ident {
         worker_id: WorkerId::parse("w-test").unwrap(),
         boot_id: WorkerBootId::parse("boot-1").unwrap(),
         agent_epoch: AgentEpoch(1),
+        forecast_ttl_ms: 2000,
     }
 }
 
@@ -276,17 +277,35 @@ fn a08_a_node_is_one_demand_before_it_registers_after_and_once_finished() {
     assert_eq!(ask(&attempts).target.finish_in_ms, Some(30_000));
 
     // Registered (waiting for the slot): the ledger's entry stands for it.
-    // Its runtime is not known there, so nothing is invented: the finish is
-    // missing with a reason, and the node is still covered, once.
+    // It carries the 20 s its own history recorded, so the finish is one
+    // ledger entry plus the target: 30 s, the same as when it was only
+    // pending. Counted twice it would be 50 s.
     let work = f.dir.path().join("work");
     std::fs::create_dir_all(&work).unwrap();
+    let argv = vec!["true".to_string()];
+    let key = task_traffic_controller::exec::command_key(&ctx, &work, None, &argv).unwrap();
+    task_traffic_controller::history::append(
+        ctx.paths.history_file(),
+        &task_traffic_controller::history::Record {
+            key: key.hash.clone(),
+            repo: key.repo.clone(),
+            subdir: key.subdir.clone(),
+            argv: key.argv.clone(),
+            key_argv: String::new(),
+            started_at: "2030-01-01T00:00:00Z".parse().unwrap(),
+            wall_secs: 20.0,
+            cpu_secs: 1.0,
+            max_rss_bytes: 1,
+            exit_code: 0,
+            weight_used: 1,
+            contended: false,
+            measurement_id: None,
+        },
+    )
+    .unwrap();
     let guard = register(&ctx, &b, &work);
     let registered = ask(&attempts);
-    assert_eq!(registered.target.finish_in_ms, None);
-    assert!(registered
-        .target
-        .null_reasons
-        .contains_key(&ForecastField::FinishInMs));
+    assert_eq!(registered.target.finish_in_ms, Some(30_000));
     let covered: usize = registered
         .coverage
         .iter()
@@ -294,6 +313,18 @@ fn a08_a_node_is_one_demand_before_it_registers_after_and_once_finished() {
         .map(|c| c.node_ids.iter().filter(|n| n.as_str() == "work").count())
         .sum();
     assert_eq!(covered, 1);
+    // The simulation's own report: the node is replaced by its ledger entry
+    // and nothing of it is applied as overlay demand.
+    let insp = inspect_with(&ctx, &cfg()).unwrap();
+    let nodes = remote_task_runner::forecast::plan::accepted_nodes(
+        &b,
+        &serde_json::from_value(attempts[0].spec.clone()).unwrap(),
+    )
+    .unwrap();
+    let (_, report) =
+        remote_task_runner::forecast::compute(&ctx, &insp, 1, &ident(), &req, &nodes).unwrap();
+    assert_eq!(report.replaced_by_ledger, [format!("{b}/work")]);
+    assert!(report.applied.is_empty());
 
     // Finished: the ledger entry is gone, the sidecar says so, and the
     // attempt is still not terminal in the worker's store. No phantom demand.

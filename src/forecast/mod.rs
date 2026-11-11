@@ -47,7 +47,14 @@ pub fn compute(
     let defaults = Defaults {
         weight: default_weight,
     };
-    let (target, notes) = plan::target_plan(&req.workload, defaults);
+    let (target, mut notes) = plan::target_plan(&req.workload, defaults);
+    if accepted.iter().any(|a| !a.terminal) {
+        // Not `soft`: it only makes the answer later, never earlier.
+        notes.note(
+            "dependencies inside accepted attempts are ignored; all their unfinished nodes count as demand ahead (over-counts)"
+                .into(),
+        );
+    }
     let overlay = plan::merge_overlay(&req.workload, &req.pending, accepted, defaults);
     let fc = ttc::forecast(ctx, insp, &target, &overlay).map_err(|e| match e {
         task_traffic_controller::error::Error::Plan(m) => ApiError::new(ErrorCode::InvalidInput, m),
@@ -83,6 +90,22 @@ fn accepted_of(attempts: &[AcceptedAttempt]) -> Result<Vec<AcceptedNode>, ApiErr
     Ok(out)
 }
 
+/// The three reads, in the one order that cannot lose a demand: the accepted
+/// attempts, then the ledger snapshot, then the sidecar of each accepted
+/// node. They are arguments so a test can record the order they are called
+/// in; swapping any two reintroduces a window in which a node is in neither
+/// the ledger nor the overlay, or counted from a finished attempt.
+fn gather(
+    accepted: impl FnOnce() -> Result<Vec<AcceptedNode>, ApiError>,
+    ledger: impl FnOnce() -> Result<Inspection, ApiError>,
+    mut sidecar: impl FnMut(&mut AcceptedNode),
+) -> Result<(Vec<AcceptedNode>, Inspection), ApiError> {
+    let mut nodes = accepted()?;
+    let insp = ledger()?;
+    nodes.iter_mut().for_each(&mut sidecar);
+    Ok((nodes, insp))
+}
+
 /// Answer one `forecast` request from the worker's state.
 ///
 /// Reading order: the accepted attempts first, then the ledger snapshot,
@@ -112,14 +135,16 @@ pub fn answer_with(
     }
     // Refuse an oversized request before any file is read.
     plan::check_request(req).map_err(plan::RequestError::into_api)?;
-    let mut accepted = accepted_of(attempts)?;
-    let insp = inspect_with(ctx, cfg).map_err(|e| internal("inspect", e))?;
-    for node in &mut accepted {
-        // A sidecar that cannot be read keeps the demand.
-        if let Loaded::Ok(sc) = managed::load_sidecar(ctx, &node.command_id) {
-            node.terminal = sc.terminal.is_some();
-        }
-    }
+    let (accepted, insp) = gather(
+        || accepted_of(attempts),
+        || inspect_with(ctx, cfg).map_err(|e| internal("inspect", e)),
+        |node| {
+            // A sidecar that cannot be read keeps the demand.
+            if let Loaded::Ok(sc) = managed::load_sidecar(ctx, &node.command_id) {
+                node.terminal = sc.terminal.is_some();
+            }
+        },
+    )?;
     compute(ctx, &insp, cfg.default_weight, ident, req, &accepted).map(|(a, _)| a)
 }
 
@@ -173,6 +198,7 @@ mod tests {
             worker_id: WorkerId::parse("w-test").unwrap(),
             boot_id: WorkerBootId::parse("boot-1").unwrap(),
             agent_epoch: AgentEpoch(3),
+            forecast_ttl_ms: 2000,
         }
     }
 
@@ -658,5 +684,136 @@ mod tests {
             run(&i, &req, &[]).0.policy_digest.to_string(),
             i.policy_digest
         );
+    }
+
+    #[test]
+    fn a_measured_target_behind_fallback_demand_is_no_measured_answer() {
+        let a = AttemptId::generate();
+        let b = AttemptId::generate();
+        let i = insp(1, calm(), vec![]);
+        let req = request(plan_of(&a, vec![node(&a, "main", Some(10_000))]), vec![]);
+        // Alone: measured, a finish.
+        let (alone, _) = run(&i, &req, &[]);
+        assert_eq!(alone.target.runtime_source, RuntimeSource::Measured);
+        assert_eq!(alone.target.finish_in_ms, Some(10_000));
+        // An accepted node that is not registered runs on the fallback
+        // runtime, and the one slot is its first: the target's start is no
+        // measured number, whatever the target's own runtime.
+        let (ans, report) = run(&i, &req, &[accepted_node(&b, "work", 0, false)]);
+        assert_eq!(report.applied.len(), 1);
+        let t = &ans.target;
+        assert_eq!(t.finish_in_ms, None);
+        assert_eq!(t.runtime_source, RuntimeSource::Fallback);
+        assert_eq!(
+            t.null_reasons.get(&ForecastField::FinishInMs),
+            Some(&Uncertainty::NoHistory)
+        );
+        assert!(t
+            .assumptions
+            .iter()
+            .any(|x| x.contains("ahead of the target has no recorded runtime")));
+        assert!(t
+            .assumptions
+            .iter()
+            .any(|x| x.contains("dependencies inside accepted attempts are ignored")));
+        assert_reasons_match(&ans);
+        // The coordinator's recorded 20 s for the same node replaces the
+        // fallback: measured again, and the finish is a number.
+        let pending = plan_of(&b, vec![node(&b, "work", Some(20_000))]);
+        let req = request(
+            plan_of(&a, vec![node(&a, "main", Some(10_000))]),
+            vec![pending],
+        );
+        let (ans, _) = run(&i, &req, &[accepted_node(&b, "work", 0, false)]);
+        assert_eq!(ans.target.runtime_source, RuntimeSource::Measured);
+        assert_eq!(ans.target.finish_in_ms, Some(30_000));
+        // A target that is a fallback itself is not "behind" anything: the
+        // note about work ahead is not made.
+        let (own, _) = run(
+            &i,
+            &request(plan_of(&a, vec![node(&a, "main", None)]), vec![]),
+            &[],
+        );
+        assert_eq!(own.target.runtime_source, RuntimeSource::Fallback);
+        assert!(!own
+            .target
+            .assumptions
+            .iter()
+            .any(|x| x.contains("ahead of the target")));
+        // A finished node is no demand: no note about it either.
+        let (done, _) = run(&i, &req_of_main(&a), &[accepted_node(&b, "work", 0, true)]);
+        assert_eq!(done.target.runtime_source, RuntimeSource::Measured);
+        assert!(!done
+            .target
+            .assumptions
+            .iter()
+            .any(|x| x.contains("accepted attempts")));
+    }
+
+    fn req_of_main(a: &AttemptId) -> ForecastRequest {
+        request(plan_of(a, vec![node(a, "main", Some(10_000))]), vec![])
+    }
+
+    #[test]
+    fn the_answer_carries_the_configured_ttl() {
+        let a = AttemptId::generate();
+        let i = insp(1, calm(), vec![]);
+        let mut id = ident();
+        id.forecast_ttl_ms = 750;
+        let (ans, _) = compute(&ctx(), &i, 2, &id, &req_of_main(&a), &[]).unwrap();
+        // Not the simulation's own 2000.
+        assert_eq!(ans.ttl_ms, 750);
+    }
+
+    #[test]
+    fn the_reads_run_accepted_then_ledger_then_sidecars() {
+        use std::cell::RefCell;
+        let log = RefCell::new(Vec::new());
+        let a = AttemptId::generate();
+        let (nodes, _) = gather(
+            || {
+                log.borrow_mut().push("accepted");
+                Ok(vec![
+                    accepted_node(&a, "x", 0, false),
+                    accepted_node(&a, "y", 1, false),
+                ])
+            },
+            || {
+                log.borrow_mut().push("ledger");
+                Ok(insp(1, calm(), vec![]))
+            },
+            |n| {
+                log.borrow_mut().push("sidecar");
+                n.terminal = n.node_id.as_str() == "y";
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            *log.borrow(),
+            ["accepted", "ledger", "sidecar", "sidecar"],
+            "a node registered between two reads must be in the ledger, a node finished \
+             between them must be dropped"
+        );
+        assert_eq!(
+            nodes.iter().map(|n| n.terminal).collect::<Vec<_>>(),
+            [false, true]
+        );
+        // A failing read stops the later ones.
+        let log = RefCell::new(Vec::new());
+        let err = gather(
+            || Err(ApiError::new(ErrorCode::Internal, "x")),
+            || {
+                log.borrow_mut().push("ledger");
+                Ok(insp(1, calm(), vec![]))
+            },
+            |_| {},
+        );
+        assert!(err.is_err() && log.borrow().is_empty());
+        let err = gather(
+            || Ok(vec![accepted_node(&a, "x", 0, false)]),
+            || Err(ApiError::new(ErrorCode::Internal, "y")),
+            |_| log.borrow_mut().push("sidecar"),
+        );
+        assert!(err.is_err() && log.borrow().is_empty());
     }
 }

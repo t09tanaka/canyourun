@@ -97,6 +97,13 @@ pub struct Notes {
 }
 
 impl Notes {
+    /// An assumption that does not make the answer conditional.
+    pub fn note(&mut self, text: String) {
+        if !self.assumptions.contains(&text) {
+            self.assumptions.push(text);
+        }
+    }
+
     fn add(&mut self, text: String) {
         if !self.assumptions.contains(&text) {
             self.assumptions.push(text);
@@ -370,16 +377,34 @@ fn reason_for(field: ForecastField, f: Facts) -> Uncertainty {
     }
 }
 
-fn source_of(plan: &ttc::WorkloadPlan) -> RuntimeSource {
+/// The worst source among runtimes: one unknown makes the whole unknown,
+/// one fallback makes it a fallback.
+fn source_of<'a>(runtimes: impl IntoIterator<Item = &'a ttc::Runtime>) -> RuntimeSource {
     let mut worst = RuntimeSource::Measured;
-    for n in &plan.nodes {
-        match n.runtime.source {
+    for r in runtimes {
+        match r.source {
             ttc::RuntimeSource::Unknown => return RuntimeSource::Unknown,
             ttc::RuntimeSource::Fallback => worst = RuntimeSource::Fallback,
             ttc::RuntimeSource::Measured => {}
         }
     }
     worst
+}
+
+/// The source of what the answer rests on: the target's nodes and the overlay
+/// demands that were applied ahead of it. An accepted node that is not
+/// registered yet runs on the fallback runtime, and the target's start
+/// depends on it, so a measured target behind it is no measured answer.
+fn answer_source(
+    plan: &ttc::WorkloadPlan,
+    overlay: &[ttc::FutureDemand],
+    applied: &[String],
+) -> RuntimeSource {
+    let ahead = overlay
+        .iter()
+        .filter(|d| applied.contains(&format!("{}/{}", d.attempt_id, d.node_id)))
+        .map(|d| &d.runtime);
+    source_of(plan.nodes.iter().map(|n| &n.runtime).chain(ahead))
 }
 
 fn confidence_of(c: ttc::Confidence) -> Confidence {
@@ -406,6 +431,9 @@ pub struct Ident {
     pub worker_id: WorkerId,
     pub boot_id: WorkerBootId,
     pub agent_epoch: AgentEpoch,
+    /// How long an answer stays usable (`forecast_ttl_ms`; the spec default
+    /// is 2000). It replaces the simulation's own constant on the wire.
+    pub forecast_ttl_ms: u64,
 }
 
 /// A simulation answer the wire cannot carry (an id it does not parse as).
@@ -445,8 +473,9 @@ pub fn to_wire(fc: &ttc::Forecast, w: &Wiring) -> Result<ForecastResponse, Conve
     };
     let overrun_entries = overrunning(w.insp);
     let waits = t.wait_reason.as_ref().and_then(|r| wait_reason_of(&r.kind));
+    let source = answer_source(w.plan, w.overlay, &fc.overlay.applied);
     let facts = Facts {
-        unmeasured: source_of(w.plan) != RuntimeSource::Measured,
+        unmeasured: source != RuntimeSource::Measured,
         overrun: overrun_entries > 0 && t.start_in_ms.is_none(),
         memory_blocked: waits == Some(WaitReason::MemoryBlocked),
     };
@@ -462,6 +491,14 @@ pub fn to_wire(fc: &ttc::Forecast, w: &Wiring) -> Result<ForecastResponse, Conve
         }
     }
     let mut assumptions = t.assumptions.clone();
+    if source != RuntimeSource::Measured
+        && source_of(w.plan.nodes.iter().map(|n| &n.runtime)) == RuntimeSource::Measured
+    {
+        assumptions.push(
+            "work queued ahead of the target has no recorded runtime; its fallback runtime is used for ordering only"
+                .to_string(),
+        );
+    }
     for a in &w.notes.assumptions {
         if !assumptions.contains(a) {
             assumptions.push(a.clone());
@@ -490,7 +527,7 @@ pub fn to_wire(fc: &ttc::Forecast, w: &Wiring) -> Result<ForecastResponse, Conve
         agent_epoch: w.ident.agent_epoch,
         snapshot_digest: snapshot,
         policy_digest: policy,
-        ttl_ms: fc.ttl_ms,
+        ttl_ms: w.ident.forecast_ttl_ms,
         coverage,
         target: ForecastTarget {
             plan_digest: w.target_digest.clone(),
@@ -499,7 +536,7 @@ pub fn to_wire(fc: &ttc::Forecast, w: &Wiring) -> Result<ForecastResponse, Conve
             execution_ms: exec,
             finish_in_ms: t.finish_in_ms,
             confidence: confidence_of(t.confidence),
-            runtime_source: source_of(w.plan),
+            runtime_source: source,
             history_count: u32::try_from(t.history_count).unwrap_or(u32::MAX),
             conditional: t.conditional || w.notes.soft,
             overrun: facts.overrun,
@@ -525,6 +562,11 @@ pub enum Validity {
 /// A forecast is a reading, not a reservation. It is stale once `ttl_ms` has
 /// passed since it was taken, and at once when the agent or the machine
 /// started again, whichever the age.
+///
+/// `age_ms` is supplied by the caller and must come from a monotonic clock
+/// (time since the answer arrived). A caller that only has the wall clock
+/// must saturate a backwards step to 0 (`now.saturating_sub(taken)`), which
+/// reads as fresh rather than as an enormous age.
 pub fn validity(
     answer: &ForecastResponse,
     age_ms: u64,
@@ -1091,20 +1133,61 @@ mod tests {
         };
         use ttc::RuntimeSource as S;
         assert_eq!(
-            source_of(&p(vec![S::Measured, S::Measured])),
+            answer_source(&p(vec![S::Measured, S::Measured]), &[], &[]),
             RuntimeSource::Measured
         );
         assert_eq!(
-            source_of(&p(vec![S::Measured, S::Fallback])),
+            answer_source(&p(vec![S::Measured, S::Fallback]), &[], &[]),
             RuntimeSource::Fallback
         );
         assert_eq!(
-            source_of(&p(vec![S::Fallback, S::Unknown, S::Measured])),
+            answer_source(&p(vec![S::Fallback, S::Unknown, S::Measured]), &[], &[]),
             RuntimeSource::Unknown
         );
         assert_eq!(
-            source_of(&p(vec![S::Unknown, S::Fallback])),
+            answer_source(&p(vec![S::Unknown, S::Fallback]), &[], &[]),
             RuntimeSource::Unknown
+        );
+        // Demand applied ahead of the target counts; demand that was
+        // replaced by the ledger, dropped or removed does not.
+        let demand = |node: &str, r: ttc::Runtime| ttc::FutureDemand {
+            attempt_id: "o".into(),
+            plan_digest: "d".into(),
+            expansion_seq: 0,
+            node_id: node.into(),
+            weight: 1,
+            predicted_rss: 0,
+            runtime: r,
+            priority: ttc::Priority::Normal,
+            ready_in_ms: 0,
+            ledger_entry: None,
+            shared_id: None,
+            terminal: false,
+        };
+        let target = p(vec![S::Measured]);
+        let overlay = [
+            demand("fb", ttc::Runtime::fallback()),
+            demand("ms", ttc::Runtime::measured(1.0, 1)),
+            demand("un", ttc::Runtime::unknown()),
+        ];
+        let applied =
+            |names: &[&str]| -> Vec<String> { names.iter().map(|n| format!("o/{n}")).collect() };
+        assert_eq!(
+            answer_source(&target, &overlay, &applied(&["ms"])),
+            RuntimeSource::Measured
+        );
+        assert_eq!(
+            answer_source(&target, &overlay, &applied(&["ms", "fb"])),
+            RuntimeSource::Fallback
+        );
+        assert_eq!(
+            answer_source(&target, &overlay, &applied(&["fb", "un"])),
+            RuntimeSource::Unknown
+        );
+        assert_eq!(
+            answer_source(&target, &overlay, &[]),
+            RuntimeSource::Measured,
+            "an overlay demand that was not applied is not ahead of the target"
         );
         assert_eq!(confidence_of(ttc::Confidence::High), Confidence::High);
         assert_eq!(confidence_of(ttc::Confidence::Medium), Confidence::Medium);
@@ -1233,10 +1316,19 @@ mod tests {
     }
 
     fn convert(fc: &ttc::Forecast, notes: &Notes) -> Result<ForecastResponse, ConvertError> {
+        convert_on(fc, notes, &insp_of(vec![]))
+    }
+
+    fn convert_on(
+        fc: &ttc::Forecast,
+        notes: &Notes,
+        insp: &Inspection,
+    ) -> Result<ForecastResponse, ConvertError> {
         let ident = Ident {
             worker_id: WorkerId::parse("w").unwrap(),
             boot_id: WorkerBootId::parse("b").unwrap(),
             agent_epoch: AgentEpoch(1),
+            forecast_ttl_ms: 2000,
         };
         let target = ttc::WorkloadPlan {
             attempt_id: "a".into(),
@@ -1251,7 +1343,7 @@ mod tests {
                 ident: &ident,
                 plan: &target,
                 target_digest: &Digest::of_bytes(b"t"),
-                insp: &insp_of(vec![]),
+                insp,
                 overlay: &[],
                 notes,
             },
@@ -1304,6 +1396,65 @@ mod tests {
         )
         .unwrap();
         assert_eq!(r.target.assumptions.len(), 1);
+    }
+
+    #[test]
+    fn overrun_and_memory_block_come_from_the_snapshot_and_the_wait() {
+        let overrunning_entry = entry(State::Running, Some(10.0), Some(20), false);
+        // The answer has no finish and no start; the wait is as given.
+        let missing = |wait: Option<&str>| {
+            let mut fc = forecast_of(&Digest::of_bytes(b"l").to_string(), vec![]);
+            let t = &mut fc.target.timing;
+            t.start_in_ms = None;
+            t.queue_wait_after_ready_ms = None;
+            t.execution_ms = None;
+            t.finish_in_ms = None;
+            t.wait_reason = wait.map(|k| ttc::WaitReason {
+                kind: k.into(),
+                detail: String::new(),
+            });
+            fc
+        };
+        let reason = |r: &ForecastResponse| r.target.null_reasons[&ForecastField::FinishInMs];
+        // A running entry past its history, and no start: overrun.
+        let r = convert_on(
+            &missing(None),
+            &Notes::default(),
+            &insp_of(vec![overrunning_entry.clone()]),
+        )
+        .unwrap();
+        assert!(r.target.overrun);
+        assert_eq!(reason(&r), Uncertainty::Overrun);
+        // No such entry: not an overrun, whatever else is missing.
+        let r = convert_on(&missing(None), &Notes::default(), &insp_of(vec![])).unwrap();
+        assert!(!r.target.overrun);
+        assert_eq!(reason(&r), Uncertainty::Conditional);
+        // A start the simulation could compute: the overrun entry is not why
+        // anything is missing.
+        let mut fc = missing(None);
+        fc.target.timing.start_in_ms = Some(0);
+        let r = convert_on(&fc, &Notes::default(), &insp_of(vec![overrunning_entry])).unwrap();
+        assert!(!r.target.overrun);
+        // The wait kind decides memory-blocked, and only that kind.
+        let r = convert_on(
+            &missing(Some("memory")),
+            &Notes::default(),
+            &insp_of(vec![]),
+        )
+        .unwrap();
+        assert_eq!(r.target.wait_reason, Some(WaitReason::MemoryBlocked));
+        assert_eq!(reason(&r), Uncertainty::MemoryBlocked);
+        let r = convert_on(&missing(Some("queue")), &Notes::default(), &insp_of(vec![])).unwrap();
+        assert_eq!(r.target.wait_reason, Some(WaitReason::QueueAhead));
+        assert_eq!(reason(&r), Uncertainty::Conditional);
+    }
+
+    #[test]
+    fn the_ttl_on_the_wire_is_the_workers_not_the_simulations() {
+        let mut fc = forecast_of(&Digest::of_bytes(b"l").to_string(), vec![]);
+        fc.ttl_ms = 5;
+        // `convert` sets the worker's 2000.
+        assert_eq!(convert(&fc, &Notes::default()).unwrap().ttl_ms, 2000);
     }
 
     #[test]

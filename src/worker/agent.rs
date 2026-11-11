@@ -66,6 +66,9 @@ pub struct AgentConfig {
     pub profile_fingerprint: Digest,
     pub max_active_task: u32,
     pub prefetch_per_worker: u32,
+    /// How long a forecast answer stays usable (`scheduler.forecast_ttl_ms`,
+    /// spec default 2000). It is the `ttl_ms` the answer carries.
+    pub forecast_ttl_ms: u64,
     pub term_grace_ms: u64,
     pub kill_wait_ms: u64,
     /// How often the supervisors and the agent's own loops look again.
@@ -124,6 +127,7 @@ impl AgentConfig {
             profile_fingerprint: Digest::of_bytes(b""),
             max_active_task: 1,
             prefetch_per_worker: 1,
+            forecast_ttl_ms: 2000,
             term_grace_ms: crate::supervisor::spec::DEFAULT_TERM_GRACE_MS,
             kill_wait_ms: 5_000,
             poll_ms: 200,
@@ -1893,6 +1897,7 @@ impl Agent {
             worker_id: self.cfg.worker_id.clone(),
             boot_id: self.cfg.boot_id.clone(),
             agent_epoch: self.epoch,
+            forecast_ttl_ms: self.cfg.forecast_ttl_ms,
         };
         crate::forecast::answer(
             &self.cfg.traffic_state_dir,
