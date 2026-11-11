@@ -7,6 +7,7 @@ mod proto_common;
 
 mod bridge;
 mod config;
+mod coordinator;
 mod forecast;
 mod not_implemented;
 mod protocol;

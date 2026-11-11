@@ -173,14 +173,14 @@ impl Host for DirHost {
     }
 }
 
-struct Fx {
+pub(crate) struct Fx {
     dir: TempDir,
     host: Arc<DirHost>,
-    cluster: ClusterId,
+    pub(crate) cluster: ClusterId,
     agents: Mutex<Vec<Arc<Agent>>>,
 }
 
-fn fx() -> Fx {
+pub(crate) fn fx() -> Fx {
     // Not under the system temp directory: a supervisor a failed test leaves
     // behind must not write into a directory a test runner clears.
     let dir = tempfile::Builder::new()
@@ -255,7 +255,7 @@ fn pgrep(pattern: &str) -> Vec<i32> {
         .collect()
 }
 
-fn wait_for(what: &str, f: impl Fn() -> bool) {
+pub(crate) fn wait_for(what: &str, f: impl Fn() -> bool) {
     let end = Instant::now() + T;
     while !f() {
         assert!(Instant::now() < end, "timed out waiting for {what}");
@@ -291,7 +291,7 @@ impl Fx {
         self.agents.lock().unwrap().push(agent.clone());
         agent
     }
-    fn start(&self, boot: &str) -> Arc<Agent> {
+    pub(crate) fn start(&self, boot: &str) -> Arc<Agent> {
         self.start_with(self.cfg(boot))
     }
     /// A new connection to the agent: its own stream and its own `hello`.
@@ -416,7 +416,7 @@ fn lines(p: &Path) -> usize {
 }
 
 /// A command that records each start and its PID, then stays.
-fn stay(f: &Fx) -> (String, PathBuf, PathBuf) {
+pub(crate) fn stay(f: &Fx) -> (String, PathBuf, PathBuf) {
     let (marker, pidfile) = (f.path("starts"), f.path("pid"));
     let script = format!(
         "echo start >> {}; echo $$ > {}; exec sleep 300",
