@@ -13,7 +13,7 @@
 //! calls it through `spawn_blocking`.
 
 use super::host::Host;
-use super::policy::{self, AttemptFacts, Recovery, Settle, Step};
+use super::policy::{self, AttemptFacts, Recovery, Settle, Step, SupervisorExit};
 use crate::error::{ApiError, ErrorCode};
 use crate::ids::*;
 use crate::platform;
@@ -488,6 +488,32 @@ impl Agent {
         }
     }
 
+    /// [`Self::pause`], ended early when the attempt is cancelled or retired
+    /// meanwhile (or is gone): that is acted on at the next look, not after
+    /// the wait.
+    fn pause_unless_news(&self, rec: &AcceptedAttempt, ms: u64) {
+        let step = self.cfg.poll_ms.max(1);
+        let mut left = ms;
+        while left > 0 && !self.stopping() {
+            let d = left.min(step);
+            self.pause(d);
+            left -= d;
+            let news = match self.store.get(&rec.attempt_id) {
+                Ok(Some(now)) => policy::wakes(
+                    rec.cancel_requested_at_ms.is_some(),
+                    now.cancel_requested_at_ms.is_some(),
+                    rec.retired,
+                    now.retired,
+                ),
+                Ok(None) => true,
+                Err(_) => false,
+            };
+            if news {
+                break;
+            }
+        }
+    }
+
     // ------------------------------------------------------------ attempts
 
     /// Make sure a thread watches `attempt`. Idempotent.
@@ -568,6 +594,8 @@ impl Agent {
         let mut noted_exit = false;
         // Supervisor starts and supervisors that failed, in a row.
         let mut failures = 0u32;
+        // Supervisors, in a row, that could not tell whose a process is.
+        let mut unknowns = 0u32;
         let mut settle_errors = 0u32;
         while !self.stopping() {
             let rec = match self.store.get(attempt) {
@@ -596,7 +624,27 @@ impl Agent {
                         let code = status.code();
                         child = None;
                         seed = None;
-                        if code != Some(0) && code != Some(4) {
+                        let exit = policy::supervisor_exit(code);
+                        if exit == SupervisorExit::IdentityUnknown {
+                            // Nothing was signalled and nothing is known. Not
+                            // a failure: the attempt is never given up for
+                            // it. It is looked at again, later each time.
+                            let wait = policy::backoff_ms(self.cfg.retry_ms, unknowns);
+                            if unknowns == 0 || policy::backoff_capped(unknowns) {
+                                note(
+                                    &self.store,
+                                    &rec,
+                                    "agent_identity_unknown",
+                                    json!({
+                                        "code": code,
+                                        "retry_ms": wait,
+                                        "longest": policy::backoff_capped(unknowns),
+                                    }),
+                                );
+                            }
+                            unknowns = unknowns.saturating_add(1);
+                            self.pause_unless_news(&rec, wait);
+                        } else if exit == SupervisorExit::Failed {
                             if !noted_exit {
                                 noted_exit = true;
                                 note(
