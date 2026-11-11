@@ -512,7 +512,7 @@ impl Incoming {
         for f in done {
             let path = dir.join(&f.name);
             let taken = read_manifest(&path, limits).ok().and_then(|m| {
-                let new = check_manifest_files(limits, &st.wanted, entries_of(&m)).ok()?;
+                let new = check_manifest_files(limits, &st.wanted, &mut entries_of(&m)).ok()?;
                 st.add(&m, &new, &f.hex, f.size);
                 Some(())
             });
@@ -813,7 +813,7 @@ impl Incoming {
                 return Err(e);
             }
         };
-        let new = match check_manifest_files(limits, &st.wanted, entries_of(&m)) {
+        let new = match check_manifest_files(limits, &st.wanted, &mut entries_of(&m)) {
             Ok(new) => new,
             Err(why) => {
                 remove_staged(part);

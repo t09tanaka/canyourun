@@ -278,7 +278,7 @@ pub fn manifest_role(
 pub fn check_manifest_files<'a>(
     limits: &BlobLimits,
     wanted: &BTreeMap<String, u64>,
-    entries: impl IntoIterator<Item = (&'a str, u64)>,
+    entries: &mut dyn Iterator<Item = (&'a str, u64)>,
 ) -> Result<BTreeMap<&'a str, u64>, &'static str> {
     let mut new: BTreeMap<&'a str, u64> = BTreeMap::new();
     for (hash, size) in entries {
@@ -740,28 +740,35 @@ mod tests {
         let new = |pairs: &[(&'static str, u64)]| -> BTreeMap<&'static str, u64> {
             pairs.iter().copied().collect()
         };
-        assert_eq!(check_manifest_files(&l, &wanted, []), Ok(new(&[])));
         assert_eq!(
-            check_manifest_files(&l, &wanted, [("a", 5), ("c", 100), ("b", 0), ("c", 100)]),
+            check_manifest_files(&l, &wanted, &mut [].into_iter()),
+            Ok(new(&[]))
+        );
+        assert_eq!(
+            check_manifest_files(
+                &l,
+                &wanted,
+                &mut [("a", 5), ("c", 100), ("b", 0), ("c", 100)].into_iter()
+            ),
             Ok(new(&[("c", 100)]))
         );
         assert_eq!(
-            check_manifest_files(&l, &BTreeMap::new(), [("a", 5), ("d", 0)]),
+            check_manifest_files(&l, &BTreeMap::new(), &mut [("a", 5), ("d", 0)].into_iter()),
             Ok(new(&[("a", 5), ("d", 0)]))
         );
         assert_eq!(
-            check_manifest_files(&l, &wanted, [("c", 101)]),
+            check_manifest_files(&l, &wanted, &mut [("c", 101)].into_iter()),
             Err("the manifest names a file larger than this worker accepts")
         );
         // a hash keeps the size it has: among the staged manifests ...
         assert_eq!(
-            check_manifest_files(&l, &wanted, [("a", 6)]),
+            check_manifest_files(&l, &wanted, &mut [("a", 6)].into_iter()),
             Err("the manifest gives a file another size than its hash has")
         );
-        assert!(check_manifest_files(&l, &wanted, [("b", 1)]).is_err());
+        assert!(check_manifest_files(&l, &wanted, &mut [("b", 1)].into_iter()).is_err());
         // ... and within the manifest
-        assert!(check_manifest_files(&l, &wanted, [("c", 1), ("c", 2)]).is_err());
-        assert!(check_manifest_files(&l, &wanted, [("c", 2), ("c", 1)]).is_err());
+        assert!(check_manifest_files(&l, &wanted, &mut [("c", 1), ("c", 2)].into_iter()).is_err());
+        assert!(check_manifest_files(&l, &wanted, &mut [("c", 2), ("c", 1)].into_iter()).is_err());
     }
 
     #[test]
