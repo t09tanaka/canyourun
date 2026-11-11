@@ -20,6 +20,18 @@ pub struct TimeoutPolicy {
     pub deadline_ms: Option<u64>,
 }
 
+impl TimeoutPolicy {
+    /// The limits while one command runs: its own run-time limit, when it has
+    /// one, replaces the attempt's default. The other two budgets are the
+    /// attempt's and stay as they are.
+    pub fn for_command(self, own_ms: Option<u64>) -> TimeoutPolicy {
+        TimeoutPolicy {
+            command_ms: own_ms.or(self.command_ms),
+            ..self
+        }
+    }
+}
+
 /// What the attempt is doing now.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Stage {
@@ -92,6 +104,31 @@ mod tests {
 
     fn info(kind: TimeoutKind, phase: TimeoutPhase) -> Option<TimeoutInfo> {
         Some(TimeoutInfo { kind, phase })
+    }
+
+    #[test]
+    fn a_command_s_own_limit_replaces_the_default_and_nothing_else() {
+        let p = policy(Some(1_000), Some(20), Some(30));
+        assert_eq!(p.for_command(None), p);
+        assert_eq!(p.for_command(Some(5)), policy(Some(5), Some(20), Some(30)));
+        // Longer than the default is an override too, and a command may have
+        // a limit where the attempt has none.
+        assert_eq!(
+            p.for_command(Some(9_000)),
+            policy(Some(9_000), Some(20), Some(30))
+        );
+        assert_eq!(
+            policy(None, None, None).for_command(Some(7)),
+            policy(Some(7), None, None)
+        );
+        // It fires as the command timeout, counted from the command's start.
+        let s = Stage::Running { since_ms: 100 };
+        let own = p.for_command(Some(5));
+        assert_eq!(fired(&own, 100, s, 104), None);
+        assert_eq!(
+            fired(&own, 100, s, 105),
+            info(TimeoutKind::Command, TimeoutPhase::Running)
+        );
     }
 
     #[test]

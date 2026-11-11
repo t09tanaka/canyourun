@@ -1168,9 +1168,15 @@ fn lease_renewal_is_ordered_idempotent_and_never_revives() {
     assert_eq!(e.code(), ErrorCode::StaleEpoch);
     assert_eq!(w.store.lease(id).unwrap(), Some((key(2, 1), false)));
     // An expiry is remembered and a late renewal does not undo it.
-    w.store.expire_lease(id, 60).unwrap();
-    w.store.expire_lease(id, 61).unwrap();
+    assert!(w.store.events_of(id, "lease_expired").unwrap().is_empty());
+    assert!(w.store.expire_lease(id, 60).unwrap());
+    assert!(!w.store.expire_lease(id, 61).unwrap());
     assert_eq!(w.store.lease(id).unwrap(), Some((key(2, 1), true)));
+    // Written once, by the first, with its time and the attempt's run.
+    let ev = w.store.events_of(id, "lease_expired").unwrap();
+    assert_eq!(ev.len(), 1);
+    assert_eq!(ev[0].at_ms, 60);
+    assert_eq!(ev[0].run_id.as_deref(), Some(a.run_id.as_str()));
     assert!(renew(key(2, 5)).is_err());
     assert!(w
         .store
@@ -1254,6 +1260,22 @@ fn receipts_log_positions_and_results() {
         .mark_receipt(id, Receipt::CommandRegistered, 6)
         .unwrap());
     assert!(w.store.mark_receipt(id, Receipt::Running, 7).unwrap());
+    // Each receipt is in the journal once, at the time it was first reached.
+    let ev = w.store.events_of(id, "attempt_receipt").unwrap();
+    let seen: Vec<(String, u64)> = ev
+        .iter()
+        .map(|e| (e.payload["receipt"].as_str().unwrap().to_string(), e.at_ms))
+        .collect();
+    assert_eq!(
+        seen,
+        vec![
+            ("command_registered".to_string(), 5),
+            ("running".to_string(), 7)
+        ]
+    );
+    assert!(ev
+        .iter()
+        .all(|e| e.run_id.as_deref() == Some(a.run_id.as_str())));
     let p = |w, d, s| LogPosition {
         written_bytes: w,
         dropped_bytes: d,

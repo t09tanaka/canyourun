@@ -7,11 +7,14 @@ use remote_task_runner::platform;
 use remote_task_runner::platform::{signal_pid, signal_process_group};
 use remote_task_runner::state::{AttemptState, Exit, Outcome, Receipt, TimeoutKind, TimeoutPhase};
 use remote_task_runner::storage::{LeaseOutcome, NewAcceptance, StorageError, WorkerStore};
+use remote_task_runner::supervisor::lease::LeaseSeed;
 use remote_task_runner::supervisor::outcome::drain_pending_deletes;
 use remote_task_runner::supervisor::process::{code, spawn_detached, supervise};
 use remote_task_runner::supervisor::recover::recover;
 use remote_task_runner::supervisor::run::{run, Report};
-use remote_task_runner::supervisor::spec::{MaskValues, NodeSpec, SuperviseSpec};
+use remote_task_runner::supervisor::spec::{
+    ArtifactFile, ArtifactsSpec, MaskValues, NodeSpec, SuperviseSpec,
+};
 use remote_task_runner::supervisor::spool::{AttemptSpool, SpoolReader};
 use remote_task_runner::wire::LeaseKey;
 use remote_task_runner::wire::LogStream;
@@ -41,6 +44,7 @@ fn node(name: &str, script: &str) -> NodeSpec {
         cwd: std::env::temp_dir(),
         env,
         weight: Some(1),
+        timeout_ms: None,
     }
 }
 
@@ -91,11 +95,13 @@ fn fx(nodes: Vec<NodeSpec>) -> Fx {
         command_timeout_ms: None,
         resource_wait_timeout_ms: None,
         deadline_ms: None,
+        lease_seed: None,
         inhibit_sleep: false,
         spool_root: Some(dir.path().join("spool")),
         log_limit_bytes: 1 << 30,
         workspace_warnings: vec![],
         mask: Default::default(),
+        artifacts: None,
     };
     Fx {
         strays: Default::default(),
@@ -813,6 +819,292 @@ fn the_command_timeout_stops_a_running_command() {
     assert_eq!(info.kind, TimeoutKind::Command);
     assert_eq!(info.phase, TimeoutPhase::Running);
     assert!(started.elapsed() < Duration::from_secs(10));
+}
+
+#[test]
+fn a_node_s_own_timeout_replaces_the_default_for_that_node_only() {
+    // The first node outlives the default and may: its own limit is longer.
+    // The second has a shorter one of its own and is stopped by it.
+    let mut f = fx(vec![
+        node("slow", "sleep 1.2; echo slow-done"),
+        node("stuck", "sleep 30"),
+    ]);
+    f.spec.command_timeout_ms = Some(400);
+    f.spec.nodes[0].timeout_ms = Some(20_000);
+    f.spec.nodes[1].timeout_ms = Some(300);
+    f.spec.term_grace_ms = 2_000;
+    let started = Instant::now();
+    let t = settled(&run(&f.spec).unwrap());
+    assert!(f.output().contains("slow-done"), "{}", f.output());
+    assert_eq!(t.outcome(), Outcome::TimedOut);
+    let info = t.timeout().unwrap();
+    assert_eq!(info.kind, TimeoutKind::Command);
+    assert_eq!(info.phase, TimeoutPhase::Running);
+    assert!(started.elapsed() < Duration::from_secs(10));
+    assert_eq!(f.store.launches(f.attempt()).unwrap().len(), 2);
+}
+
+#[test]
+fn a_node_without_its_own_timeout_keeps_the_default() {
+    let mut f = fx(vec![node("quick", "true"), node("stuck", "sleep 30")]);
+    f.spec.command_timeout_ms = Some(400);
+    // The limit of the node before it does not stay in force.
+    f.spec.nodes[0].timeout_ms = Some(60_000);
+    f.spec.term_grace_ms = 2_000;
+    let started = Instant::now();
+    let t = settled(&run(&f.spec).unwrap());
+    assert_eq!(t.outcome(), Outcome::TimedOut);
+    assert_eq!(t.timeout().unwrap().kind, TimeoutKind::Command);
+    assert!(started.elapsed() < Duration::from_secs(10));
+}
+
+#[test]
+fn a_node_timeout_of_zero_is_refused() {
+    let mut f = fx(vec![node("n", "true")]);
+    f.spec.nodes[0].timeout_ms = Some(0);
+    assert!(run(&f.spec).is_err());
+    assert!(f.store.launches(f.attempt()).unwrap().is_empty());
+}
+
+#[test]
+fn a_seeded_lease_ends_when_the_grant_made_before_the_start_ends() {
+    // A 30 s lease of which 700 ms are left when the supervisor starts.
+    let mut f = fx(vec![node("n", "sleep 30")]);
+    f.spec.lease_ms = 30_000;
+    f.spec.term_grace_ms = 300;
+    f.spec.lease_seed = Some(LeaseSeed {
+        ends_mono_ms: platform::monotonic_ms() + 700,
+        key: None,
+    });
+    let started = Instant::now();
+    let t = settled(&run(&f.spec).unwrap());
+    assert_eq!(t.outcome(), Outcome::Interrupted);
+    assert!(started.elapsed() < Duration::from_secs(15));
+    assert!(matches!(
+        f.store.lease(f.attempt()).unwrap(),
+        Some((_, true))
+    ));
+    // Said once in the journal, by whoever saw it first.
+    assert_eq!(f.events(f.attempt(), "lease_expired").len(), 1);
+}
+
+#[test]
+fn a_seed_measured_before_a_renewal_does_not_shorten_that_renewal() {
+    // The agent measured against no key; a renewal was applied before the
+    // supervisor started. The seed (already run out) says nothing about it.
+    let mut f = fx(vec![node("n", "sleep 0.8; echo done")]);
+    f.spec.lease_ms = 30_000;
+    f.store
+        .renew_lease(f.attempt(), key(1), platform::wall_ms())
+        .unwrap();
+    f.spec.lease_seed = Some(LeaseSeed {
+        ends_mono_ms: platform::monotonic_ms(),
+        key: None,
+    });
+    let t = settled(&run(&f.spec).unwrap());
+    assert_eq!(t.outcome(), Outcome::Succeeded);
+    assert!(f.events(f.attempt(), "lease_expired").is_empty());
+}
+
+// ------------------------------------------------------------ artifacts
+
+fn artifacts(f: &Fx, files: &[(&str, &str)]) -> ArtifactsSpec {
+    let ws = f.path("ws");
+    std::fs::create_dir_all(&ws).unwrap();
+    ArtifactsSpec {
+        workspace: ws,
+        source_id: SourceId::generate(),
+        plan_digest: Digest::of_bytes(b"plan"),
+        profile_fingerprint: Digest::of_bytes(b"profile"),
+        max_bytes: 1 << 20,
+        files: files
+            .iter()
+            .map(|(name, source)| ArtifactFile {
+                name: (*name).to_string(),
+                source: PathBuf::from(source),
+            })
+            .collect(),
+    }
+}
+
+fn in_ws(f: &Fx, script: &str) -> NodeSpec {
+    let mut n = node("n", script);
+    n.cwd = f.path("ws");
+    n
+}
+
+#[test]
+fn artifacts_are_stored_before_the_attempt_is_settled_and_the_result_names_them() {
+    let mut f = fx(vec![]);
+    let plan = artifacts(
+        &f,
+        &[
+            ("report.xml", "out/report.xml"),
+            ("missing.txt", "out/never-written.txt"),
+            ("link.txt", "out/link"),
+        ],
+    );
+    f.spec.nodes = vec![in_ws(
+        &f,
+        "mkdir out; printf '<ok/>' > out/report.xml; ln -s /etc/hosts out/link",
+    )];
+    f.spec.artifacts = Some(plan.clone());
+    let t = settled(&run(&f.spec).unwrap());
+    assert_eq!(t.outcome(), Outcome::Succeeded);
+
+    let result = f.store.get_result(f.attempt()).unwrap().unwrap();
+    let listed = result["artifacts"].as_array().unwrap();
+    assert_eq!(listed.len(), 1, "{result}");
+    assert_eq!(listed[0]["name"], "report.xml");
+    assert_eq!(listed[0]["size"], 5);
+    assert_eq!(listed[0]["attempt_id"], f.attempt().as_str());
+    assert_eq!(listed[0]["source_id"], plan.source_id.as_str());
+    assert_eq!(
+        listed[0]["digest"].as_str().unwrap(),
+        Digest::of_bytes(b"<ok/>").to_string()
+    );
+    let kept = f
+        .spec
+        .spool_dir()
+        .join(f.attempt().as_str())
+        .join("artifacts");
+    assert_eq!(std::fs::read(kept.join("report.xml")).unwrap(), b"<ok/>");
+    // What could not be kept is said, by name, and is in no result: a
+    // missing file, and a link that leads out of the workspace.
+    assert!(!kept.join("missing.txt").exists() && !kept.join("link.txt").exists());
+    let mut refused: Vec<String> = f
+        .events(f.attempt(), "artifact_not_stored")
+        .iter()
+        .map(|e| e["name"].as_str().unwrap().to_string())
+        .collect();
+    refused.sort();
+    assert_eq!(refused, ["link.txt", "missing.txt"]);
+
+    // The list was fixed in the journal before the termination was.
+    let all = f.store.events_of_attempt(f.attempt(), 1000).unwrap();
+    let at = |kind: &str| all.iter().position(|e| e.kind == kind).unwrap();
+    assert!(at("artifacts_stored") < at("attempt_terminal"));
+    assert_eq!(f.events(f.attempt(), "artifacts_stored").len(), 1);
+
+    // A second start changes nothing: the result is the same bytes.
+    let again = run(&f.spec).unwrap();
+    assert_eq!(again.termination, Some(t));
+    assert_eq!(f.store.get_result(f.attempt()).unwrap(), Some(result));
+    assert_eq!(f.events(f.attempt(), "artifacts_stored").len(), 1);
+}
+
+#[test]
+fn a_failed_command_keeps_what_it_left_and_a_cancel_before_the_start_keeps_nothing() {
+    let mut f = fx(vec![]);
+    f.spec.artifacts = Some(artifacts(&f, &[("log.txt", "log.txt")]));
+    f.spec.nodes = vec![in_ws(&f, "echo why > log.txt; exit 3")];
+    let t = settled(&run(&f.spec).unwrap());
+    assert_eq!(t.outcome(), Outcome::Failed);
+    let result = f.store.get_result(f.attempt()).unwrap().unwrap();
+    assert_eq!(result["artifacts"][0]["name"], "log.txt");
+
+    // Cancelled before anything started: no command wrote anything, nothing
+    // is looked for and nothing is reported missing.
+    let mut g = fx(vec![]);
+    g.spec.artifacts = Some(artifacts(&g, &[("log.txt", "log.txt")]));
+    g.spec.nodes = vec![in_ws(&g, "echo x > log.txt")];
+    g.store
+        .cancel(g.attempt(), CoordinatorEpoch(1), platform::wall_ms())
+        .unwrap();
+    let t = settled(&run(&g.spec).unwrap());
+    assert_eq!(t.outcome(), Outcome::Cancelled);
+    assert!(g.events(g.attempt(), "artifacts_stored").is_empty());
+    assert!(g.events(g.attempt(), "artifact_not_stored").is_empty());
+    let result = g.store.get_result(g.attempt()).unwrap().unwrap();
+    assert_eq!(result["artifacts"], serde_json::json!([]));
+}
+
+#[test]
+fn a_crash_after_the_artifacts_were_fixed_is_settled_with_the_same_list_without_the_workspace() {
+    let mut f = fx(vec![]);
+    f.spec.artifacts = Some(artifacts(&f, &[("a.txt", "a.txt")]));
+    f.spec.nodes = vec![in_ws(&f, "printf kept > a.txt")];
+    let t = settled(&run(&f.spec).unwrap());
+    let first = f.store.get_result(f.attempt()).unwrap().unwrap();
+    assert_eq!(first["artifacts"][0]["name"], "a.txt");
+
+    // The same journal, in an attempt whose supervisor died right after
+    // fixing the termination: no result yet, and the workspace is gone.
+    let spec = f.next_attempt();
+    let b = &spec.attempt_id;
+    let from = f.spec.spool_dir().join(f.attempt().as_str());
+    let to = spec.spool_dir().join(b.as_str());
+    std::fs::create_dir_all(to.join("artifacts")).unwrap();
+    std::fs::copy(from.join("artifacts/a.txt"), to.join("artifacts/a.txt")).unwrap();
+    // A file copied by a supervisor that died before the list was fixed.
+    std::fs::write(to.join("artifacts/orphan.bin"), b"left over").unwrap();
+    let mut record = first["artifacts"][0].clone();
+    record["attempt_id"] = serde_json::json!(b.as_str());
+    let run_id = f.store.get(b).unwrap().unwrap().run_id;
+    f.store
+        .append_event(
+            Some(&run_id),
+            Some(b),
+            "artifacts_stored",
+            &serde_json::json!({ "set": "attempt", "artifacts": [record] }),
+            40,
+        )
+        .unwrap();
+    AttemptSpool::open(&spec.spool_dir(), b, 1 << 20)
+        .unwrap()
+        .finish()
+        .unwrap();
+    f.store.transition(b, AttemptState::Finalizing, 51).unwrap();
+    f.store.finalize(b, t, 52).unwrap();
+    std::fs::remove_dir_all(f.path("ws")).unwrap();
+
+    let r = run(&spec).unwrap();
+    assert_eq!((r.termination, r.finalized_here), (Some(t), false));
+    let result = f.store.get_result(b).unwrap().unwrap();
+    assert_eq!(result["artifacts"], serde_json::json!([record]));
+    assert!(to.join("artifacts/a.txt").exists());
+    assert!(!to.join("artifacts/orphan.bin").exists());
+
+    // An entry that cannot be read is never taken for "no artifacts".
+    let spec = f.next_attempt();
+    let c = &spec.attempt_id;
+    f.store
+        .append_event(
+            Some(&run_id),
+            Some(c),
+            "artifacts_stored",
+            &serde_json::json!({ "set": "attempt", "artifacts": "garbled" }),
+            60,
+        )
+        .unwrap();
+    AttemptSpool::open(&spec.spool_dir(), c, 1 << 20)
+        .unwrap()
+        .finish()
+        .unwrap();
+    f.store.transition(c, AttemptState::Finalizing, 61).unwrap();
+    f.store.finalize(c, t, 62).unwrap();
+    assert!(run(&spec).is_err());
+    assert!(f.store.get_result(c).unwrap().is_none());
+}
+
+#[test]
+fn a_declared_artifact_that_leaves_the_workspace_refuses_the_spec() {
+    for (name, source) in [
+        ("a.txt", "../a.txt"),
+        ("a.txt", "/etc/hosts"),
+        ("../a.txt", "a.txt"),
+        (".tmp-x", "a.txt"),
+    ] {
+        let mut f = fx(vec![node("n", "true")]);
+        f.spec.artifacts = Some(artifacts(&f, &[(name, source)]));
+        assert!(run(&f.spec).is_err(), "{name} {source}");
+        assert!(f.store.launches(f.attempt()).unwrap().is_empty());
+    }
+    let mut f = fx(vec![node("n", "true")]);
+    let mut plan = artifacts(&f, &[("a.txt", "a.txt")]);
+    plan.workspace = PathBuf::from("relative/ws");
+    f.spec.artifacts = Some(plan);
+    assert!(run(&f.spec).is_err());
 }
 
 #[test]

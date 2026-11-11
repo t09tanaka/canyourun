@@ -12,18 +12,19 @@ use remote_task_runner::error::{ApiError, ErrorCode};
 use remote_task_runner::ids::*;
 use remote_task_runner::protocol::transport::duplex_pair;
 use remote_task_runner::protocol::{connect, CallError, Client};
-use remote_task_runner::state::{AttemptState, Outcome};
+use remote_task_runner::secrets::envfile::{secret_values, Values};
+use remote_task_runner::state::{AttemptState, Outcome, Receipt};
 use remote_task_runner::storage::{AcceptedAttempt, BlobKind, NewBlobRef, WorkerStore};
 use remote_task_runner::wire::*;
 use remote_task_runner::worker::policy::{Step, STARTUP_ORDER};
 use remote_task_runner::worker::serve::serve_connection;
-use remote_task_runner::worker::{Agent, AgentConfig, Host};
+use remote_task_runner::worker::{Agent, AgentConfig, Host, ProbePoint, Session};
 use remote_task_runner::workspace::{Workspace, WorkspaceKind};
 use std::collections::BTreeMap;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
 use tokio::sync::Semaphore;
@@ -42,12 +43,18 @@ struct DirHost {
     preparing_max: AtomicUsize,
     /// `secrets_ready` panics (it runs on the attempt's watcher thread).
     panic_secrets: AtomicBool,
+    /// A secret value that is not text is among the ones to mask.
+    binary_secret: AtomicBool,
     fail_cleanup: AtomicBool,
     slow_cleanup_ms: AtomicU64,
     /// The attempts being cleaned right now, and whether one ever was twice.
     cleaning: Mutex<Vec<String>>,
     overlap: AtomicBool,
+    /// Called by `mask_values` once it has read the values.
+    on_mask: Mutex<Option<MaskHook>>,
 }
+
+type MaskHook = Box<dyn Fn(&AttemptId) + Send + Sync>;
 
 impl DirHost {
     fn log(&self, what: impl Into<String>) {
@@ -128,6 +135,21 @@ impl Host for DirHost {
         }
         Ok(self.secrets_ready.load(Ordering::SeqCst))
     }
+    /// From the file in the workspace, like the real host: nothing is kept
+    /// in memory between the bundle's arrival and the start.
+    fn mask_values(&self, a: &AcceptedAttempt) -> Result<Values, ApiError> {
+        let content = std::fs::read(self.ws_dir(&a.attempt_id).join(".env")).unwrap_or_default();
+        let mut values = secret_values(&content);
+        if self.binary_secret.load(Ordering::SeqCst) {
+            values
+                .values
+                .push(vec![0xff, 0xfe, 0xfd, 0xfc, 0xfb, 0xfa, 0xf9, 0xf8]);
+        }
+        if let Some(hook) = self.on_mask.lock().unwrap().as_ref() {
+            hook(&a.attempt_id);
+        }
+        Ok(values)
+    }
     fn cleanup(&self, a: &AttemptId, ws: Option<&Workspace>) -> Result<(), ApiError> {
         self.log(format!("cleanup {a}"));
         {
@@ -174,10 +196,12 @@ fn fx() -> Fx {
         preparing_now: AtomicUsize::new(0),
         preparing_max: AtomicUsize::new(0),
         panic_secrets: AtomicBool::new(false),
+        binary_secret: AtomicBool::new(false),
         fail_cleanup: AtomicBool::new(false),
         slow_cleanup_ms: AtomicU64::new(0),
         cleaning: Mutex::default(),
         overlap: AtomicBool::new(false),
+        on_mask: Mutex::default(),
     });
     Fx {
         dir,
@@ -478,9 +502,9 @@ async fn the_same_attempt_with_another_payload_is_a_conflict() {
         .await
         .unwrap_err();
     assert_eq!(e.code, ErrorCode::InvalidInput);
-    // So is a per-command timeout the supervisor would not apply.
+    // So is a per-command timeout that is none.
     let mut timed = p.clone();
-    timed.commands[0].timeout_ms = Some(1_000);
+    timed.commands[0].timeout_ms = Some(0);
     let e = call(&c, submit_req(&AttemptId::generate(), &timed))
         .await
         .unwrap_err();
@@ -810,6 +834,363 @@ async fn the_command_waits_for_its_secret_bundle() {
     // Once it started, nothing more is placed.
     let e = call(&c, put).await.unwrap_err();
     assert_eq!(e.code, ErrorCode::Conflict);
+}
+
+// ------------------------------------- receipts, masking, order, timeouts
+
+async fn watched(c: &Client, a: &AttemptId) -> Vec<AttemptEvent> {
+    let Response::WatchEvents(w) = call(
+        c,
+        Request::WatchEvents(WatchEventsRequest {
+            schema_version: SchemaVersion::CURRENT,
+            request_id: RequestId::generate(),
+            attempt_id: Some(a.clone()),
+            after_seq: 0,
+            limit: 500,
+        }),
+    )
+    .await
+    .unwrap() else {
+        panic!()
+    };
+    w.events
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn watch_events_shows_the_receipts_of_the_command_in_the_order_they_were_reached() {
+    let f = fx();
+    let agent = f.start("boot-a");
+    let c = f.connect(&agent).await;
+    let a = AttemptId::generate();
+    submit(&c, &a, &payload("sleep 0.5")).await;
+    assert_eq!(f.wait_terminal(&a), Outcome::Succeeded);
+    let ev = watched(&c, &a).await;
+    let receipts: Vec<Receipt> = ev.iter().filter_map(|e| e.receipt).collect();
+    assert_eq!(
+        receipts,
+        [
+            Receipt::WorkerAccepted,
+            Receipt::CommandRegistered,
+            Receipt::Running,
+            Receipt::Terminal
+        ],
+        "{ev:?}"
+    );
+    for r in [Receipt::CommandRegistered, Receipt::Running] {
+        let e = ev.iter().find(|e| e.receipt == Some(r)).unwrap();
+        assert_eq!((e.kind, e.state), (EventKind::ReceiptReached, None));
+    }
+    assert!(ev.iter().all(|e| e.kind != EventKind::LeaseExpired));
+    // The same receipts, with the same times, as the status shows.
+    let rec = f.rec(&a);
+    assert!(rec.receipts.reached(Receipt::CommandRegistered));
+    assert!(rec.receipts.reached(Receipt::Running));
+}
+
+/// Every regular file below `dir` that holds `needle`.
+fn files_holding(dir: &Path, needle: &[u8]) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(d) = stack.pop() {
+        // The directory is alive: one that went meanwhile holds nothing.
+        let Ok(entries) = std::fs::read_dir(&d) else {
+            continue;
+        };
+        for e in entries.flatten() {
+            let p = e.path();
+            let Ok(meta) = std::fs::symlink_metadata(&p) else {
+                continue;
+            };
+            if meta.is_dir() {
+                stack.push(p);
+            } else if meta.is_file() {
+                let bytes = std::fs::read(&p).unwrap_or_default();
+                if bytes.windows(needle.len()).any(|w| w == needle) {
+                    found.push(p);
+                }
+            }
+        }
+    }
+    found
+}
+
+async fn read_all(c: &Client, a: &AttemptId, stream: LogStream) -> Vec<u8> {
+    let Response::ReadLog(log) = call(
+        c,
+        Request::ReadLog(ReadLogRequest {
+            schema_version: SchemaVersion::CURRENT,
+            request_id: RequestId::generate(),
+            attempt_id: a.clone(),
+            node_id: NodeId::parse("main").unwrap(),
+            stream,
+            offset: 0,
+            max_bytes: 1 << 20,
+        }),
+    )
+    .await
+    .unwrap() else {
+        panic!()
+    };
+    log.data.0
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_secret_of_the_bundle_never_reaches_the_spool_the_journal_or_a_file_left_behind() {
+    const SECRET: &str = "s3cr3t-Value-0123456789";
+    let f = fx();
+    let agent = f.start("boot-a");
+    let c = f.connect(&agent).await;
+    f.host.secrets_ready.store(false, Ordering::SeqCst);
+    let go = f.path("go");
+    // Printed whole, on both streams, and split over two writes.
+    let script = format!(
+        "cat .env; cat .env >&2; printf 'half=%s' s3cr3t-Value-; sleep 0.2; echo 0123456789; \
+         while [ ! -e {} ]; do sleep 0.05; done; echo end-of-output",
+        go.display()
+    );
+    let mut p = payload(&script);
+    p.has_secret_bundle = true;
+    let a = AttemptId::generate();
+    submit(&c, &a, &p).await;
+    wait_for("the workspace record", || workspace_record(&f, &a).exists());
+    let put = Request::SecretBundlePut(SecretBundlePutRequest {
+        schema_version: SchemaVersion::CURRENT,
+        request_id: RequestId::generate(),
+        coordinator_epoch: CoordinatorEpoch(1),
+        attempt_id: a.clone(),
+        generation: Generation(1),
+        files: vec![SecretFile {
+            path: ".env".into(),
+            hmac_digest: HmacDigest::parse(&format!("hmac-sha256:{}", "a".repeat(64))).unwrap(),
+            content: Bytes(format!("API_TOKEN={SECRET}\nPORT=80\n").into_bytes()),
+        }],
+    });
+    call(&c, put).await.unwrap();
+    wait_for("the running state", || {
+        f.rec(&a).state == AttemptState::Active
+    });
+    // While it runs, the one file of the state directory that holds the
+    // value is the supervisor's spec, readable by this user alone.
+    let spec = f
+        .state()
+        .join("attempts")
+        .join(a.as_str())
+        .join("supervise.json");
+    let mode = std::fs::metadata(&spec).unwrap().permissions().mode();
+    assert_eq!(mode & 0o777, 0o600);
+    wait_for("the output", || {
+        let log = f.state().join("attempts").join(a.as_str()).join("logs");
+        !files_holding(&log, b"half=").is_empty()
+    });
+    assert_eq!(
+        files_holding(&f.state(), SECRET.as_bytes()).as_slice(),
+        std::slice::from_ref(&spec)
+    );
+    std::fs::write(&go, "").unwrap();
+    assert_eq!(f.wait_terminal(&a), Outcome::Succeeded);
+
+    let out = String::from_utf8(read_all(&c, &a, LogStream::Stdout).await).unwrap();
+    assert!(out.contains("API_TOKEN=***"), "{out}");
+    assert!(out.contains("half=***"), "{out}");
+    assert!(out.contains("end-of-output"), "{out}");
+    // A value too short to mask stays, and is counted once in the journal.
+    assert!(out.contains("PORT=80"), "{out}");
+    assert_eq!(events(&f, &a, "agent_mask_skipped"), 1);
+    assert!(
+        !out.contains(SECRET) && !out.contains("0123456789"),
+        "{out}"
+    );
+    // The spec that carried the values goes with the workspace, and then
+    // nothing the worker keeps (spool, database, its journal) holds it.
+    wait_for("the spec to go", || !spec.exists());
+    assert_eq!(
+        files_holding(&f.state(), SECRET.as_bytes()),
+        Vec::<PathBuf>::new()
+    );
+    let journal = f.store().events_of_attempt(&a, 1000).unwrap();
+    assert!(journal
+        .iter()
+        .all(|e| !e.payload.to_string().contains(SECRET)));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_agent_restarted_after_the_bundle_arrived_still_masks_it() {
+    const SECRET: &str = "another-S3cret-value";
+    let f = fx();
+    let agent = f.start("boot-a");
+    let c = f.connect(&agent).await;
+    f.host.secrets_ready.store(false, Ordering::SeqCst);
+    let mut p = payload("cat .env");
+    p.has_secret_bundle = true;
+    let a = AttemptId::generate();
+    submit(&c, &a, &p).await;
+    wait_for("the workspace record", || workspace_record(&f, &a).exists());
+    // The file is in place, but the agent goes before it says "ready".
+    std::fs::write(f.host.ws_dir(&a).join(".env"), format!("KEY={SECRET}\n")).unwrap();
+    agent.shutdown();
+    drop(c);
+    assert_eq!(f.rec(&a).state, AttemptState::Preparing);
+    f.host.secrets_ready.store(true, Ordering::SeqCst);
+    let agent = f.start("boot-a");
+    let c = f.connect(&agent).await;
+    assert_eq!(f.wait_terminal(&a), Outcome::Succeeded);
+    let out = String::from_utf8(read_all(&c, &a, LogStream::Stdout).await).unwrap();
+    assert_eq!(out.trim(), "KEY=***");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_secret_file_sent_while_the_mask_is_made_is_refused_and_never_placed() {
+    let f = fx();
+    let agent = f.start("boot-a");
+    let c = f.connect(&agent).await;
+    f.host.secrets_ready.store(false, Ordering::SeqCst);
+    let mut p = payload("cat .env");
+    p.has_secret_bundle = true;
+    let a = AttemptId::generate();
+    let put = |content: &str| {
+        let Request::SecretBundlePut(mut r) = put_req(&a) else {
+            panic!()
+        };
+        r.files[0].content = Bytes(content.as_bytes().to_vec());
+        Request::SecretBundlePut(r)
+    };
+    // The values are read for the mask; before the attempt is `Ready`,
+    // another file for the same path arrives (this host would overwrite).
+    let late = put("KEY=a-later-S3cret-value\n");
+    type Answer = Result<Response, ApiError>;
+    let (seen_tx, seen_rx) = mpsc::channel::<(Option<Answer>, mpsc::Receiver<Answer>)>();
+    {
+        let agent = agent.clone();
+        *f.host.on_mask.lock().unwrap() = Some(Box::new(move |_| {
+            let (tx, rx) = mpsc::channel();
+            let (agent, late) = (agent.clone(), late.clone());
+            std::thread::spawn(move || {
+                let session = Session {
+                    coordinator_epoch: CoordinatorEpoch(1),
+                };
+                let _ = tx.send(agent.handle(session, late));
+            });
+            // Long enough for a put that is not kept out to be answered; a
+            // put that is kept out is never answered in here.
+            let early = rx.recv_timeout(Duration::from_millis(500)).ok();
+            let _ = seen_tx.send((early, rx));
+        }));
+    }
+    submit(&c, &a, &p).await;
+    wait_for("the workspace record", || workspace_record(&f, &a).exists());
+    call(&c, put("KEY=the-first-S3cret-value\n")).await.unwrap();
+    let (early, later) = seen_rx.recv_timeout(T).unwrap();
+    assert!(
+        early.is_none(),
+        "answered while the mask was made: {early:?}"
+    );
+    // Answered once the attempt is `Ready`: too late, for good.
+    let e = later.recv_timeout(T).unwrap().unwrap_err();
+    assert_eq!(e.code, ErrorCode::Conflict, "{e:?}");
+    *f.host.on_mask.lock().unwrap() = None;
+    assert_eq!(f.wait_terminal(&a), Outcome::Succeeded);
+    assert_eq!(f.host.count(&format!("place {a}")), 1);
+    // What the command read is what the mask was made of.
+    let out = String::from_utf8(read_all(&c, &a, LogStream::Stdout).await).unwrap();
+    assert_eq!(out.trim(), "KEY=***");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_secret_that_cannot_be_masked_keeps_the_command_from_starting() {
+    let f = fx();
+    let agent = f.start("boot-a");
+    let c = f.connect(&agent).await;
+    f.host.binary_secret.store(true, Ordering::SeqCst);
+    let marker = f.path("ran");
+    let a = AttemptId::generate();
+    submit(&c, &a, &payload(&format!("touch {}", marker.display()))).await;
+    assert_eq!(f.wait_terminal(&a), Outcome::Failed);
+    assert!(!marker.exists());
+    assert!(f.store().launches(&a).unwrap().is_empty());
+    assert_eq!(events(&f, &a, "agent_prepare_failed"), 1);
+}
+
+fn command(name: &str, script: &str, depends_on: &[&str]) -> CommandSpec {
+    let mut c = payload(script).commands.remove(0);
+    c.node_id = NodeId::parse(name).unwrap();
+    c.depends_on = depends_on
+        .iter()
+        .map(|d| NodeId::parse(d).unwrap())
+        .collect();
+    c
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_command_runs_after_the_ones_it_depends_on_also_when_they_are_given_later() {
+    let f = fx();
+    let agent = f.start("boot-a");
+    let c = f.connect(&agent).await;
+    let order = f.path("order");
+    let say = |name: &str| format!("echo {name} >> {}", order.display());
+    let mut p = payload("true");
+    p.commands = vec![
+        command("test", &say("test"), &["build", "fetch"]),
+        command("build", &say("build"), &["fetch"]),
+        command("lint", &say("lint"), &[]),
+        command("fetch", &say("fetch"), &[]),
+    ];
+    let a = AttemptId::generate();
+    submit(&c, &a, &p).await;
+    assert_eq!(f.wait_terminal(&a), Outcome::Succeeded);
+    assert_eq!(
+        std::fs::read_to_string(&order).unwrap(),
+        "lint\nfetch\nbuild\ntest\n"
+    );
+    let launched: Vec<String> = f
+        .store()
+        .launches(&a)
+        .unwrap()
+        .into_iter()
+        .map(|l| l.0.to_string())
+        .collect();
+    assert_eq!(launched, ["lint", "fetch", "build", "test"]);
+
+    // A dependency that fails: what waits for it never starts.
+    let mut p = payload("true");
+    p.commands = vec![
+        command("test", &say("never"), &["build"]),
+        command("build", "exit 7", &[]),
+    ];
+    let b = AttemptId::generate();
+    submit(&c, &b, &p).await;
+    assert_eq!(f.wait_terminal(&b), Outcome::Failed);
+    assert_eq!(f.store().launches(&b).unwrap().len(), 1);
+    assert!(!std::fs::read_to_string(&order).unwrap().contains("never"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_command_s_own_timeout_overrides_the_default_of_the_attempt() {
+    let f = fx();
+    let agent = f.start("boot-a");
+    let c = f.connect(&agent).await;
+    // Longer than the default: the command may take its time.
+    let mut p = payload("sleep 1.2");
+    p.command_timeout_ms = Some(400);
+    p.commands[0].timeout_ms = Some(30_000);
+    let a = AttemptId::generate();
+    submit(&c, &a, &p).await;
+    assert_eq!(f.wait_terminal(&a), Outcome::Succeeded);
+    // Shorter than the default, and with no default at all.
+    for default in [Some(60_000), None] {
+        let mut p = payload("sleep 30");
+        p.command_timeout_ms = default;
+        p.commands[0].timeout_ms = Some(400);
+        let b = AttemptId::generate();
+        let started = Instant::now();
+        submit(&c, &b, &p).await;
+        assert_eq!(f.wait_terminal(&b), Outcome::TimedOut);
+        assert!(started.elapsed() < Duration::from_secs(15));
+        let t = f.rec(&b).termination.unwrap();
+        assert_eq!(
+            t.timeout().unwrap().kind,
+            remote_task_runner::state::TimeoutKind::Command
+        );
+    }
 }
 
 // ------------------------------------------------- results, events, GC
@@ -1227,6 +1608,18 @@ async fn a_submit_that_no_supervisor_could_honour_is_refused_before_it_is_stored
     p.commands[0].env.insert("A=B".into(), "x".into());
     let e = call(&c, submit_req(&a, &p)).await.unwrap_err();
     assert_eq!(e.code, ErrorCode::InvalidInput);
+    // A command that waits for itself, or for one that does not exist.
+    let mut p = payload("true");
+    p.commands[0].depends_on = vec![NodeId::parse("main").unwrap()];
+    let e = call(&c, submit_req(&a, &p)).await.unwrap_err();
+    assert_eq!(e.code, ErrorCode::InvalidInput);
+    p.commands[0].depends_on = vec![NodeId::parse("nowhere").unwrap()];
+    let e = call(&c, submit_req(&a, &p)).await.unwrap_err();
+    assert_eq!(e.code, ErrorCode::InvalidInput);
+    let mut p = payload("true");
+    p.commands[0].timeout_ms = Some(0);
+    let e = call(&c, submit_req(&a, &p)).await.unwrap_err();
+    assert_eq!(e.code, ErrorCode::InvalidInput);
     assert!(f.store().get(&a).unwrap().is_none());
 }
 
@@ -1327,7 +1720,10 @@ async fn a_lease_that_ran_out_during_the_preparation_starts_no_command() {
     .unwrap() else {
         panic!()
     };
-    assert!(w.events.iter().any(|e| e.kind == EventKind::LeaseExpired));
+    let expired = |e: &&AttemptEvent| e.kind == EventKind::LeaseExpired;
+    assert_eq!(w.events.iter().filter(expired).count(), 1, "{:?}", w.events);
+    // From the journal entry the database wrote with the expiry itself.
+    assert_eq!(events(&f, &a, "lease_expired"), 1);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -1378,18 +1774,191 @@ async fn the_lease_counts_from_its_grant_not_from_the_supervisors_start() {
     let f = fx();
     let agent = f.start("boot-a");
     let c = f.connect(&agent).await;
-    // Never renewed: the supervisor starts 1.5 s into a 3 s lease and would
-    // count 3 s of its own. The agent ends the lease when the grant ends.
+    // Never renewed: the supervisor starts 2 s into a 4 s lease and would
+    // count 4 s of its own (ending 6 s after the acceptance). It is given
+    // what is left and ends the lease when the grant ends.
     f.host.block_prepare.store(true, Ordering::SeqCst);
-    let (script, _, _) = stay(&f);
+    let (script, marker, _) = stay(&f);
     let mut p = payload(&script);
-    p.lease_ms = 3_000;
+    p.lease_ms = 4_000;
     let a = AttemptId::generate();
     submit(&c, &a, &p).await;
-    std::thread::sleep(Duration::from_millis(1_500));
+    std::thread::sleep(Duration::from_millis(2_000));
     f.host.block_prepare.store(false, Ordering::SeqCst);
     assert_eq!(f.wait_terminal(&a), Outcome::Interrupted);
-    assert_eq!(events(&f, &a, "agent_lease_expired"), 1);
+    assert_eq!(lines(&marker), 1, "the command did start");
+    // The supervisor saw it on its own clock, when the grant ended: the
+    // time of the expiry itself, however long the stop took after it.
+    let expired = f.store().events_of(&a, "lease_expired").unwrap();
+    assert_eq!(expired.len(), 1);
+    let after = expired[0].at_ms - f.rec(&a).accepted_at_ms;
+    assert!((3_500..5_500).contains(&after), "{after} ms");
+    assert_eq!(events(&f, &a, "agent_lease_expired"), 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_renewal_before_the_start_seeds_the_supervisor_with_what_is_left_of_it() {
+    let f = fx();
+    let agent = f.start("boot-a");
+    let c = f.connect(&agent).await;
+    // A 4 s lease, renewed 1 s after the acceptance, and a supervisor that
+    // starts at 3 s. From the acceptance it would end at 4 s, counted in full
+    // from the start at 7 s; from the renewal it ends at 5 s.
+    f.host.block_prepare.store(true, Ordering::SeqCst);
+    let (script, marker, _) = stay(&f);
+    let mut p = payload(&script);
+    p.lease_ms = 4_000;
+    let a = AttemptId::generate();
+    submit(&c, &a, &p).await;
+    std::thread::sleep(Duration::from_millis(1_000));
+    let Response::RenewLease(r) = call(
+        &c,
+        Request::RenewLease(RenewLeaseRequest {
+            schema_version: SchemaVersion::CURRENT,
+            request_id: RequestId::generate(),
+            coordinator_epoch: CoordinatorEpoch(1),
+            attempt_id: a.clone(),
+            generation: Generation(1),
+            lease_seq: 1,
+            lease_ms: 4_000,
+        }),
+    )
+    .await
+    .unwrap() else {
+        panic!()
+    };
+    assert!(r.extended);
+    let renewed_at = f.store().lease_renewed_at(&a).unwrap().unwrap();
+    std::thread::sleep(Duration::from_millis(2_000));
+    f.host.block_prepare.store(false, Ordering::SeqCst);
+    assert_eq!(f.wait_terminal(&a), Outcome::Interrupted);
+    assert_eq!(lines(&marker), 1, "the command did start");
+    let expired = f.store().events_of(&a, "lease_expired").unwrap();
+    assert_eq!(expired.len(), 1);
+    // One period after the renewal: not at the first grant's end (3 s
+    // after it) and not a full period after the supervisor's start (6 s).
+    let after = expired[0].at_ms - renewed_at;
+    assert!((3_500..5_500).contains(&after), "{after} ms");
+}
+
+fn renew_req(a: &AttemptId, seq: u64, lease_ms: u64) -> Request {
+    Request::RenewLease(RenewLeaseRequest {
+        schema_version: SchemaVersion::CURRENT,
+        request_id: RequestId::generate(),
+        coordinator_epoch: CoordinatorEpoch(1),
+        attempt_id: a.clone(),
+        generation: Generation(1),
+        lease_seq: seq,
+        lease_ms,
+    })
+}
+
+fn seed_of(f: &Fx, a: &AttemptId) -> serde_json::Value {
+    let spec = f
+        .state()
+        .join("attempts")
+        .join(a.as_str())
+        .join("supervise.json");
+    let spec: serde_json::Value = serde_json::from_slice(&std::fs::read(spec).unwrap()).unwrap();
+    spec["lease_seed"].clone()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_start_that_meets_a_renewal_half_done_waits_for_all_of_it() {
+    let f = fx();
+    let agent = f.start("boot-a");
+    let c = f.connect(&agent).await;
+    f.host.block_prepare.store(true, Ordering::SeqCst);
+    let (script, marker, _) = stay(&f);
+    let mut p = payload(&script);
+    // As long as its neighbours': the supervisor of a busy machine needs
+    // more than a moment to start the command within the renewed lease.
+    p.lease_ms = 4_000;
+    let a = AttemptId::generate();
+    // The order, made by the probe and not by luck: the renewal is
+    // committed (the new key is in the database), then the start comes to
+    // measure the lease, and only then is the renewal's grant time recorded.
+    let (measure_tx, measure_rx) = mpsc::channel::<()>();
+    let measure_rx = Mutex::new(measure_rx);
+    let host = f.host.clone();
+    agent.set_probe(Arc::new(move |point, _| match point {
+        ProbePoint::LeaseMeasure => {
+            let _ = measure_tx.send(());
+        }
+        ProbePoint::LeaseRenewed => {
+            host.block_prepare.store(false, Ordering::SeqCst);
+            measure_rx
+                .lock()
+                .unwrap()
+                .recv_timeout(T)
+                .expect("the start came to measure the lease");
+            // A start that is not kept out reads the new key with the first
+            // grant's time now. Time for it to do that; a start that is
+            // kept out does nothing however long this is.
+            std::thread::sleep(Duration::from_millis(300));
+        }
+    }));
+    submit(&c, &a, &p).await;
+    // The first grant runs out during the preparation.
+    std::thread::sleep(Duration::from_millis(4_300));
+    let Response::RenewLease(r) = call(&c, renew_req(&a, 1, 4_000)).await.unwrap() else {
+        panic!()
+    };
+    assert!(r.extended);
+    // The renewed lease is neither ended by the agent nor cut short by the
+    // seed: the command starts, and the seed is the renewal's.
+    wait_for("the command to start", || lines(&marker) == 1);
+    assert_eq!(events(&f, &a, "lease_expired"), 0);
+    assert_eq!(seed_of(&f, &a)["key"]["lease_seq"], 1);
+    let renewed_at = f.store().lease_renewed_at(&a).unwrap().unwrap();
+    assert_eq!(f.wait_terminal(&a), Outcome::Interrupted);
+    let expired = f.store().events_of(&a, "lease_expired").unwrap();
+    assert_eq!(expired.len(), 1);
+    let after = expired[0].at_ms - renewed_at;
+    assert!((3_500..6_500).contains(&after), "{after} ms");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_lease_that_cannot_be_read_starts_nothing_until_it_can_be() {
+    let f = fx();
+    let agent = f.start("boot-a");
+    let c = f.connect(&agent).await;
+    f.host.block_prepare.store(true, Ordering::SeqCst);
+    let (script, marker, _) = stay(&f);
+    let a = AttemptId::generate();
+    submit(&c, &a, &payload(&script)).await;
+    let Response::RenewLease(r) = call(&c, renew_req(&a, 1, 60_000)).await.unwrap() else {
+        panic!()
+    };
+    assert!(r.extended);
+    // Only the lease cannot be read: the table is away, the rest of the
+    // database answers.
+    let db = rusqlite::Connection::open(f.state().join("worker.db")).unwrap();
+    db.busy_timeout(T).unwrap();
+    db.execute_batch("ALTER TABLE lease RENAME TO lease_away")
+        .unwrap();
+    assert!(f.store().lease(&a).is_err());
+    f.host.block_prepare.store(false, Ordering::SeqCst);
+    wait_for("the unreadable lease to be noted", || {
+        events(&f, &a, "agent_lease_unreadable") == 1
+    });
+    // Several looks later (one every 200 ms): prepared, nothing started,
+    // nothing given up, one entry in the journal.
+    std::thread::sleep(Duration::from_millis(1_000));
+    assert_eq!(f.rec(&a).state, AttemptState::Ready);
+    assert_eq!(lines(&marker), 0);
+    assert!(f.store().launches(&a).unwrap().is_empty());
+    assert!(f.supervisors(&a).is_empty());
+    assert_eq!(seed_of(&f, &a), serde_json::Value::Null);
+    assert_eq!(events(&f, &a, "agent_lease_unreadable"), 1);
+    assert_eq!(events(&f, &a, "agent_gave_up"), 0);
+    db.execute_batch("ALTER TABLE lease_away RENAME TO lease")
+        .unwrap();
+    // The next look reads it: the start is seeded with the applied key.
+    wait_for("the command to start", || lines(&marker) == 1);
+    assert_eq!(seed_of(&f, &a)["key"]["lease_seq"], 1);
+    call(&c, cancel_req(&a)).await.unwrap();
+    assert_eq!(f.wait_terminal(&a), Outcome::Cancelled);
 }
 
 // Its own test, not the second half of the one above: both wait out real
@@ -1434,7 +2003,7 @@ async fn a_renewal_after_the_start_moves_the_lease_and_the_first_grants_watch_en
     );
     std::thread::sleep(Duration::from_millis(4_600).saturating_sub(accepted.elapsed()));
     assert_eq!(f.rec(&b).state, AttemptState::Active);
-    assert_eq!(events(&f, &b, "agent_lease_expired"), 0);
+    assert_eq!(events(&f, &b, "lease_expired"), 0);
     call(&c, retire_req(&b)).await.unwrap();
     f.wait_terminal(&b);
 }
@@ -1928,6 +2497,9 @@ impl Host for RealButCore {
     }
     fn secrets_ready(&self, a: &AcceptedAttempt) -> Result<bool, ApiError> {
         self.0.secrets_ready(a)
+    }
+    fn mask_values(&self, a: &AcceptedAttempt) -> Result<Values, ApiError> {
+        self.0.mask_values(a)
     }
     fn cleanup(&self, a: &AttemptId, ws: Option<&Workspace>) -> Result<(), ApiError> {
         self.0.cleanup(a, ws)

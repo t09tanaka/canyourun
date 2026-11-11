@@ -33,12 +33,16 @@
 use super::error::{Result, SupervisorError};
 use super::identity::Leader;
 use super::members::ManagedMembers;
-use super::outcome::{add_ref, finish_attempt, sync_log_position, OutcomeError, SpoolEnd};
+use super::outcome::{
+    add_ref, finish_attempt, remove_unlisted, store_artifact, sweep_tmp, sync_log_position,
+    ArtifactInput, OutcomeError, SpoolEnd,
+};
 use super::pump::{pump, Pipe};
 use super::spec::{command_id, spec_digest, NodeSpec, SuperviseSpec};
 use super::spool::{closed_status, AttemptSpool, SpoolError, SpoolReader, StreamStatus};
 use super::spool_plan::{
-    attempt_limit, logs_locator, warning_texts, MAX_WARNINGS, MAX_WARNING_BYTES,
+    artifacts_event, attempt_limit, journaled_artifacts, logs_locator, warning_texts,
+    ARTIFACTS_EVENT_KEY, MAX_WARNINGS, MAX_WARNING_BYTES,
 };
 use super::stop::{
     retries_for, stop_group_retrying_on, Os, StopResult, StopTarget, StopTimes, System,
@@ -54,7 +58,7 @@ use crate::state::{AttemptState, Exit, Receipt, Termination};
 use crate::storage::{
     BlobKind, Finalized, LaunchClaim, LogPosition, ProcessIdentity, StorageError, WorkerStore,
 };
-use crate::wire::LogStream;
+use crate::wire::{ArtifactRecord, LogStream};
 use serde_json::json;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -295,10 +299,21 @@ pub(crate) fn settle<'a>(
     term: Termination,
 ) -> Result<(Termination, bool)> {
     to_finalizing(store, attempt)?;
-    // TODO(S10b): `SuperviseSpec` gets the list of artifacts to keep and the
-    // supervisor stores them (`store_artifact`) before settling; until then an
-    // attempt has none.
-    match finish_attempt(store, root, attempt, spool, term, &[], platform::wall_ms()) {
+    // The artifacts are the ones the journal fixed ([`keep_artifacts`]),
+    // whoever settles: a supervisor that comes after a crash, when the
+    // workspace may be gone, stores the same list. What was copied without
+    // getting into that list is in no result, and is removed.
+    let artifacts = fixed_artifacts(store, attempt)?;
+    remove_unlisted(root, attempt, &artifacts).map_err(outcome_error)?;
+    match finish_attempt(
+        store,
+        root,
+        attempt,
+        spool,
+        term,
+        &artifacts,
+        platform::wall_ms(),
+    ) {
         Ok(recorded) => {
             let fixed = store
                 .get(attempt)?
@@ -313,10 +328,103 @@ pub(crate) fn settle<'a>(
         Err(OutcomeError::SpoolFailed(e)) => {
             settle_without_spool(store, root, attempt, "finish", &e.to_string(), term)
         }
-        Err(OutcomeError::Storage(e)) => Err(e.into()),
-        Err(OutcomeError::Io(e)) => Err(e.into()),
-        Err(e) => Err(SupervisorError::State(e.to_string())),
+        Err(e) => Err(outcome_error(e)),
     }
+}
+
+fn outcome_error(e: OutcomeError) -> SupervisorError {
+    match e {
+        OutcomeError::Storage(e) => e.into(),
+        OutcomeError::Io(e) => e.into(),
+        e => SupervisorError::State(e.to_string()),
+    }
+}
+
+/// The artifacts the attempt's journal fixed; none when it fixed none.
+pub(crate) fn fixed_artifacts(
+    store: &WorkerStore,
+    attempt: &AttemptId,
+) -> Result<Vec<ArtifactRecord>> {
+    let events = store.events_of(attempt, ARTIFACTS_EVENT)?;
+    let payloads: Vec<&serde_json::Value> = events.iter().map(|e| &e.payload).collect();
+    journaled_artifacts(&payloads).ok_or_else(|| {
+        SupervisorError::State(format!(
+            "the artifacts entry in the journal of attempt {attempt} cannot be read"
+        ))
+    })
+}
+
+const ARTIFACTS_EVENT: &str = "artifacts_stored";
+
+/// Copy the declared artifacts out of the workspace and fix the list in the
+/// journal, before the attempt is settled. Call it once the commands have
+/// ended and are confirmed stopped (nothing writes the files any more), and
+/// only then: the result is immutable and the workspace goes when the attempt
+/// is terminal.
+///
+/// A file that cannot be kept (missing, not a regular file, reached through
+/// a symlink, too large, ...) is left out and said in the journal
+/// (`artifact_not_stored`, once per name, with the masked reason); the
+/// attempt's termination is not changed by it. Whether a missing artifact
+/// fails the run is the coordinator's decision, which knows what was
+/// required. The list is fixed once: a second call changes nothing.
+pub(crate) fn keep_artifacts(
+    spec: &SuperviseSpec,
+    store: &WorkerStore,
+    masker: &Masker,
+) -> Result<()> {
+    let Some(plan) = &spec.artifacts else {
+        return Ok(());
+    };
+    let attempt = &spec.attempt_id;
+    if !store.events_of(attempt, ARTIFACTS_EVENT)?.is_empty() {
+        return Ok(());
+    }
+    let Some(rec) = store.get(attempt)? else {
+        return Err(SupervisorError::State(format!(
+            "attempt {attempt} vanished"
+        )));
+    };
+    let root = spec.spool_dir();
+    sweep_tmp(&root, attempt).map_err(outcome_error)?;
+    let mut kept = Vec::new();
+    let mut refused = Vec::new();
+    for f in &plan.files {
+        let input = ArtifactInput {
+            name: &f.name,
+            source: &f.source,
+            source_id: plan.source_id.clone(),
+            plan_digest: plan.plan_digest.clone(),
+            profile_fingerprint: plan.profile_fingerprint.clone(),
+        };
+        match store_artifact(&root, attempt, &plan.workspace, &input, plan.max_bytes) {
+            Ok(record) => kept.push(record),
+            Err(OutcomeError::Storage(e)) => return Err(e.into()),
+            Err(e) => {
+                let why =
+                    String::from_utf8_lossy(&masker.mask(e.to_string().as_bytes())).into_owned();
+                refused.push((f.name.clone(), json!({ "name": f.name, "why": why })));
+            }
+        }
+    }
+    let at = platform::wall_ms();
+    store.append_events_unseen(
+        Some(&rec.run_id),
+        attempt,
+        "artifact_not_stored",
+        "name",
+        &refused,
+        at,
+    )?;
+    store.append_events_unseen(
+        Some(&rec.run_id),
+        attempt,
+        ARTIFACTS_EVENT,
+        "set",
+        &[(ARTIFACTS_EVENT_KEY.to_string(), artifacts_event(&kept))],
+        at,
+    )?;
+    Ok(())
 }
 
 /// Settle an attempt whose spool failed at `stage`: say so in the journal and
@@ -360,6 +468,9 @@ pub(crate) fn settle_without_spool(
         Err(OutcomeError::Storage(e)) => return Err(e.into()),
         Err(e) => return Err(SupervisorError::State(e.to_string())),
     }
+    // No result will name an artifact, so none is kept: a file that stayed
+    // would be in no reference and never collected.
+    remove_unlisted(root, attempt, &[]).map_err(outcome_error)?;
     let fin = finalize(store, attempt, after_spool_failure(term))?;
     Ok((fin.termination(), fin.won()))
 }
@@ -526,6 +637,8 @@ struct Control<'a> {
     started_ms: u64,
     spool: &'a AttemptSpool,
     masker: Masker,
+    /// The run-time limit of the node being run, when it has its own.
+    node_timeout_ms: Option<u64>,
     beat: SpoolBeat,
     /// The first failure of a thread feeding the spool.
     pump_error: Arc<Mutex<Option<String>>>,
@@ -552,7 +665,8 @@ impl Control<'_> {
             // can be claimed.
             self.store.expire_lease(attempt, platform::wall_ms())?;
         }
-        let timeout = timeouts::fired(&self.spec.timeout_policy(), self.started_ms, stage, now);
+        let policy = self.spec.timeout_policy().for_command(self.node_timeout_ms);
+        let timeout = timeouts::fired(&policy, self.started_ms, stage, now);
         Ok(pick_reason(
             rec.cancel_requested_at_ms.is_some() || rec.retired,
             expired,
@@ -581,6 +695,7 @@ impl Control<'_> {
 
     fn run_node(&mut self, index: usize, node: &NodeSpec) -> Result<NodeEnd> {
         let spec = self.spec;
+        self.node_timeout_ms = node.timeout_ms;
         let attempt = spec.attempt_id.clone();
         let id = command_id(&attempt, index);
         // The pipe the command's output comes through. Without it nothing is
@@ -1199,10 +1314,11 @@ pub fn run(spec: &SuperviseSpec) -> Result<Report> {
         spec,
         store: &store,
         traffic: Traffic::open(spec)?,
-        lease: LeaseClock::start(now, spec.lease_ms, spec.poll_ms, applied),
+        lease: LeaseClock::start_seeded(now, spec.lease_ms, spec.poll_ms, applied, spec.lease_seed),
         started_ms: now,
         spool: &spool,
         masker: masker.clone(),
+        node_timeout_ms: None,
         beat: SpoolBeat::default(),
         pump_error: Arc::default(),
     };
@@ -1240,6 +1356,11 @@ pub fn run(spec: &SuperviseSpec) -> Result<Report> {
     // The heartbeat that would have recorded a reader error may not have got
     // through; `run_piped` made the stop reason of it already.
     account_for_reader(&store, attempt, &ctl.beat, ctl.pump_failure())?;
+    // Every command that was started has ended and is confirmed stopped.
+    // With none started (a cancel got in first) there is nothing to keep.
+    if !store.launches(attempt)?.is_empty() {
+        keep_artifacts(spec, &store, &masker)?;
+    }
     let term = termination(end.reason, end.exit);
     let (termination, finalized_here) = settle(&store, &root, attempt, &spool, term)?;
     Ok(Report {

@@ -633,8 +633,22 @@ impl WorkerStore {
             )));
         }
         let a = attempt_id.to_string();
-        self.db
-            .write(move |tx| common::mark_receipt(tx, ATTEMPT, &a, receipt, at_ms))
+        self.db.write(move |tx| {
+            let run = require(tx, &a)?.run_id;
+            let fresh = common::mark_receipt(tx, ATTEMPT, &a, receipt, at_ms)?;
+            if fresh {
+                // In the same commit, so the journal shows it exactly once.
+                common::append_event(
+                    tx,
+                    Some(run.as_str()),
+                    Some(&a),
+                    "attempt_receipt",
+                    &serde_json::json!({ "receipt": receipt }),
+                    at_ms,
+                )?;
+            }
+            Ok(fresh)
+        })
     }
 
     // ------------------------------------------------------------- launch
@@ -852,19 +866,40 @@ impl WorkerStore {
         })
     }
 
-    /// The supervisor saw the lease run out (by its monotonic clock). Later
-    /// renewals are refused.
-    pub fn expire_lease(&self, attempt_id: &AttemptId, at_ms: u64) -> Result<()> {
+    /// The lease ran out (the supervisor saw it by its monotonic clock, or
+    /// the agent before any supervisor started). Later renewals are refused.
+    /// The first call writes `lease_expired` to the journal in the same
+    /// commit; whoever comes second changes nothing. Returns whether this
+    /// call was the first.
+    pub fn expire_lease(&self, attempt_id: &AttemptId, at_ms: u64) -> Result<bool> {
         let a = attempt_id.to_string();
         self.db.write(move |tx| {
-            require(tx, &a)?;
+            let run = require(tx, &a)?.run_id;
+            let already: Option<Option<i64>> = tx
+                .query_row(
+                    "SELECT expired_at_ms FROM lease WHERE attempt_id = ?1",
+                    [&a],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            if already.flatten().is_some() {
+                return Ok(false);
+            }
             tx.execute(
                 "INSERT INTO lease (attempt_id, coordinator_epoch, lease_seq, renewed_at_ms, expired_at_ms)
                  VALUES (?1, 0, 0, ?2, ?2)
-                 ON CONFLICT (attempt_id) DO UPDATE SET expired_at_ms = COALESCE(expired_at_ms, ?2)",
+                 ON CONFLICT (attempt_id) DO UPDATE SET expired_at_ms = ?2",
                 params![a, to_i64(at_ms)?],
             )?;
-            Ok(())
+            common::append_event(
+                tx,
+                Some(run.as_str()),
+                Some(&a),
+                "lease_expired",
+                &Value::Null,
+                at_ms,
+            )?;
+            Ok(true)
         })
     }
 
