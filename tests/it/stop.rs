@@ -201,8 +201,13 @@ fn a_group_that_is_already_gone_is_confirmed_at_once() {
     let (mut child, t) = spawn_group(false);
     let _ = platform::signal_process_group(t.target.pgid, libc::SIGKILL);
     child.wait().unwrap();
+    // The killed member is a zombie until its new parent reaps it: until
+    // then the group number still has a member, which is no longer known to
+    // be the command (a zombie proves nothing).
     let started = std::time::Instant::now();
-    while alive(&t) && started.elapsed() < Duration::from_secs(3) {
+    while group_state(&t.target, &t.members) != GroupState::Gone
+        && started.elapsed() < Duration::from_secs(10)
+    {
         std::thread::sleep(Duration::from_millis(20));
     }
     assert_eq!(stop(&t, times(10_000)), StopResult::Confirmed);
