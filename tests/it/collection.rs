@@ -327,6 +327,9 @@ impl Worker {
                     released: true,
                 }))
             }
+            // It has no estimate to give: the scheduler then places by what
+            // the parent itself holds.
+            Request::Forecast(_) => Err(err(ErrorCode::Internal)),
             other => panic!("not sent to this worker: {other:?}"),
         }
     }
@@ -342,6 +345,7 @@ fn kind_of(request: &Request) -> (&'static str, u64) {
         Request::ReadLog(r) => ("log", r.offset),
         Request::BlobGet(r) => ("blob", r.offset),
         Request::AckCollected(_) => ("ack", 0),
+        Request::Forecast(_) => ("forecast", 0),
         other => panic!("{other:?}"),
     }
 }
