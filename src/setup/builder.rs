@@ -42,6 +42,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
+/// How often, and how far apart, a builder that could not be settled is
+/// looked at again.
+const REAP_TRIES: u32 = 60;
+const REAP_PAUSE_MS: u64 = 1_000;
+
 /// How the builders get their workspaces: the same way the consumers do.
 pub trait BuilderWorkspaces: Send + Sync {
     fn create(&self, attempt: &AttemptId, payload: &AttemptPayload) -> Result<Workspace, ApiError>;
@@ -496,11 +501,49 @@ impl Setups {
                         me.run_builder(&id, &attempt, &key, &source, &payload)
                     }))
                     .unwrap_or_else(|_| BuildEnd::Crashed("the builder thread panicked".into()));
+                    // the consumers are told first; then a builder whose
+                    // processes could not be confirmed stopped is looked at
+                    // again, as the agent does for an attempt
                     me.finish(&id, end);
+                    me.reap(&me.cfg.builders().join(id.as_str()), &attempt);
                 }
             });
         if spawned.is_err() {
             self.finish(&id, BuildEnd::Crashed("no thread for the builder".into()));
+        }
+    }
+
+    /// Settle a builder that was left unsettled (its supervisor died and
+    /// what it started could not be told from what is not its own, or the
+    /// supervisor itself could not confirm the stop): the supervisor's
+    /// recovery is run again, with a pause, as the agent does for an attempt,
+    /// until it settles, up to a limit. What is still unsettled then is
+    /// settled at the next start.
+    fn reap(&self, dir: &Path, attempt: &AttemptId) {
+        for _ in 0..REAP_TRIES {
+            if !lock(&self.leftover).contains(attempt) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(self.cfg.poll_ms.max(REAP_PAUSE_MS)));
+            let settled = SuperviseSpec::from_file(&dir.join("spec.json"))
+                .ok()
+                .and_then(|s| supervise(&s).ok())
+                .is_some_and(|r| r.unresolved.is_none());
+            if !settled {
+                continue;
+            }
+            if let Some(ws) = std::fs::read(dir.join("workspace.json"))
+                .ok()
+                .and_then(|b| serde_json::from_slice::<Workspace>(&b).ok())
+            {
+                if self.ws.remove(&ws).is_err() {
+                    continue;
+                }
+            }
+            if remove_tree(dir).is_ok() {
+                lock(&self.leftover).remove(attempt);
+                return;
+            }
         }
     }
 
@@ -524,6 +567,18 @@ impl Setups {
             .flights
             .get(id)
             .map_or((0, true), |f| (f.refs.len(), f.stop))
+    }
+
+    /// The references of a builder are kept in its directory (written
+    /// whole, atomically, whenever they change), so that what a crash cut
+    /// short can be told afterwards.
+    fn keep_refs(&self, id: &BuilderId, dir: &Path, last: &mut Option<BTreeSet<String>>) {
+        let now = lock(&self.inner).flights.get(id).map(|f| f.refs.clone());
+        if let Some(now) = now.filter(|n| last.as_ref() != Some(n)) {
+            let bytes = serde_json::to_vec(&now).expect("strings serialize");
+            let _ = write_private(&dir.join("consumers.json"), &bytes);
+            *last = Some(now);
+        }
     }
 
     /// The builder: its workspace, its supervisor, its lease, its template.
@@ -611,7 +666,9 @@ impl Setups {
         let mut last = platform::monotonic_ms();
         let mut seq = 0u64;
         let mut cancelled = false;
+        let mut kept = None;
         let status = loop {
+            self.keep_refs(id, dir, &mut kept);
             match child.try_wait() {
                 Ok(Some(s)) => break s,
                 Ok(None) => {}
