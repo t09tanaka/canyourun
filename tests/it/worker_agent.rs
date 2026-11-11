@@ -8,7 +8,7 @@ use crate::common::{alive, read_pid};
 use crate::proto_common;
 
 use proto_common::client_cfg;
-use remote_task_runner::error::{ApiError, ErrorCode};
+use remote_task_runner::error::{ApiError, ConflictReason, ErrorCode};
 use remote_task_runner::ids::*;
 use remote_task_runner::protocol::transport::duplex_pair;
 use remote_task_runner::protocol::{connect, CallError, Client};
@@ -173,14 +173,14 @@ impl Host for DirHost {
     }
 }
 
-struct Fx {
+pub(crate) struct Fx {
     dir: TempDir,
     host: Arc<DirHost>,
-    cluster: ClusterId,
+    pub(crate) cluster: ClusterId,
     agents: Mutex<Vec<Arc<Agent>>>,
 }
 
-fn fx() -> Fx {
+pub(crate) fn fx() -> Fx {
     // Not under the system temp directory: a supervisor a failed test leaves
     // behind must not write into a directory a test runner clears.
     let dir = tempfile::Builder::new()
@@ -255,7 +255,7 @@ fn pgrep(pattern: &str) -> Vec<i32> {
         .collect()
 }
 
-fn wait_for(what: &str, f: impl Fn() -> bool) {
+pub(crate) fn wait_for(what: &str, f: impl Fn() -> bool) {
     let end = Instant::now() + T;
     while !f() {
         assert!(Instant::now() < end, "timed out waiting for {what}");
@@ -291,7 +291,7 @@ impl Fx {
         self.agents.lock().unwrap().push(agent.clone());
         agent
     }
-    fn start(&self, boot: &str) -> Arc<Agent> {
+    pub(crate) fn start(&self, boot: &str) -> Arc<Agent> {
         self.start_with(self.cfg(boot))
     }
     /// A new connection to the agent: its own stream and its own `hello`.
@@ -430,7 +430,7 @@ fn lines(p: &Path) -> usize {
 }
 
 /// A command that records each start and its PID, then stays.
-fn stay(f: &Fx) -> (String, PathBuf, PathBuf) {
+pub(crate) fn stay(f: &Fx) -> (String, PathBuf, PathBuf) {
     let (marker, pidfile) = (f.path("starts"), f.path("pid"));
     let script = format!(
         "echo start >> {}; echo $$ > {}; exec sleep 300",
@@ -498,6 +498,7 @@ async fn the_same_attempt_with_another_payload_is_a_conflict() {
     other.commands[0].argv[2] = "echo other".into();
     let e = call(&c, submit_req(&a, &other)).await.unwrap_err();
     assert_eq!(e.code, ErrorCode::Conflict);
+    assert_eq!(e.conflict_reason, Some(ConflictReason::PayloadMismatch));
 
     // A hash that is not the payload's is refused before anything is stored.
     let fresh = AttemptId::generate();

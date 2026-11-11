@@ -99,6 +99,9 @@ pub enum ConflictReason {
     /// lists commits the clone does hold (see `blob_verify`): a bundle built
     /// on those is taken.
     BundleBaseMissing { have: Vec<String> },
+    /// A `submit_attempt` names an attempt the worker already holds with
+    /// another payload. Sending the same request again never succeeds.
+    PayloadMismatch,
     /// A reason this version does not know (a newer peer sent it). What it
     /// carried is dropped: the caller treats the error as a plain
     /// `CONFLICT`.
@@ -399,6 +402,11 @@ mod tests {
             serde_json::to_value(ConflictReason::Unknown).unwrap(),
             json!({"reason": "unknown"})
         );
+        let e = ApiError::conflict(ConflictReason::PayloadMismatch, "other payload");
+        let v = serde_json::to_value(&e).unwrap();
+        assert_eq!(v["conflict_reason"], json!({"reason": "payload_mismatch"}));
+        let back: ApiError = serde_json::from_value(v).unwrap();
+        assert_eq!(back.conflict_reason, Some(ConflictReason::PayloadMismatch));
     }
 
     #[test]

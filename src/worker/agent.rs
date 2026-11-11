@@ -16,7 +16,7 @@ use super::blob_policy::BlobLimits;
 use super::blobs;
 use super::host::Host;
 use super::policy::{self, AttemptFacts, Recovery, Settle, Step, SupervisorExit};
-use crate::error::{ApiError, ErrorCode};
+use crate::error::{ApiError, ConflictReason, ErrorCode};
 use crate::ids::*;
 use crate::platform;
 use crate::state::{
@@ -315,6 +315,10 @@ fn failed() -> Termination {
 }
 
 fn api(e: StorageError) -> ApiError {
+    // The one conflict a sender must not answer by sending again.
+    if matches!(e, StorageError::PayloadConflict(_)) {
+        return ApiError::conflict(ConflictReason::PayloadMismatch, e.to_string());
+    }
     // A busy database committed nothing: the same request may be sent again.
     let code = if e.is_retryable() {
         ErrorCode::Overloaded

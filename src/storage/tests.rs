@@ -3,7 +3,7 @@
 use super::*;
 use crate::error::ErrorCode;
 use crate::ids::*;
-use crate::state::{Exit, Observation, Outcome, Receipt};
+use crate::state::{Exit, Observation, Outcome, Receipt, Receipts};
 use crate::wire::LeaseKey;
 use serde_json::json;
 use tempfile::TempDir;
@@ -2412,4 +2412,638 @@ fn a_retired_attempt_blocks_a_new_submit_until_it_is_terminal_even_on_the_databa
         )?)
     });
     assert!(second.is_err());
+}
+
+// ================================================================== queue
+
+fn queue_fx(tasks: usize) -> (TempDir, CoordinatorStore, RunId, Vec<TaskId>) {
+    let dir = tempfile::tempdir().unwrap();
+    let store = CoordinatorStore::open(dir.path(), 1).unwrap();
+    let run = RunId::generate();
+    let ids: Vec<TaskId> = (0..tasks).map(|_| TaskId::generate()).collect();
+    let specs: Vec<(TaskId, serde_json::Value)> = ids
+        .iter()
+        .enumerate()
+        .map(|(i, t)| (t.clone(), json!({ "n": i })))
+        .collect();
+    store.enqueue(&run, None, &json!({}), &specs, 5).unwrap();
+    (dir, store, run, ids)
+}
+
+fn worker(name: &str) -> WorkerId {
+    WorkerId::parse(name).unwrap()
+}
+
+fn place_on(store: &CoordinatorStore, task: &TaskId, w: &str, cap: u32) -> PlaceOutcome {
+    store
+        .place(
+            task,
+            &worker(w),
+            &AttemptId::generate(),
+            move |l| l.active + l.pending < cap,
+            |i| Ok((hash('a'), json!({ "generation": i.generation.0 }))),
+            10,
+        )
+        .unwrap()
+}
+
+fn placed(o: PlaceOutcome) -> AttemptRecord {
+    match o {
+        PlaceOutcome::Placed(r) => *r,
+        other => panic!("{other:?}"),
+    }
+}
+
+fn queued(store: &CoordinatorStore) -> Vec<TaskId> {
+    let q = store.queued_tasks(100).unwrap();
+    q.into_iter().map(|t| t.task_id).collect()
+}
+
+fn seen(state: AttemptState, termination: Option<Termination>) -> Option<Seen> {
+    Some(Seen {
+        state,
+        termination,
+        receipts: Receipts::default(),
+    })
+}
+
+#[test]
+fn a_run_is_queued_whole_or_not_at_all_and_in_the_order_given() {
+    let (_d, store, run, ids) = queue_fx(3);
+    assert_eq!(queued(&store), ids);
+    assert_eq!(store.queued_tasks(2).unwrap().len(), 2);
+    assert_eq!(store.queued_tasks(1).unwrap()[0].spec, json!({"n": 0}));
+    assert_eq!(store.queued_tasks(1).unwrap()[0].run_id, run);
+    // A run without tasks, and a run one of whose tasks already exists.
+    let empty = store.enqueue(&RunId::generate(), None, &json!({}), &[], 6);
+    assert!(matches!(empty, Err(StorageError::Invalid(_))), "{empty:?}");
+    let other = RunId::generate();
+    let clash = vec![(TaskId::generate(), json!({})), (ids[0].clone(), json!({}))];
+    assert!(store.enqueue(&other, None, &json!({}), &clash, 6).is_err());
+    assert_eq!(queued(&store), ids, "nothing of the refused run is queued");
+    let runs: i64 = store
+        .db
+        .call(|c| Ok(c.query_row("SELECT count(*) FROM run", [], |r| r.get(0))?))
+        .unwrap();
+    assert_eq!(runs, 1);
+}
+
+#[test]
+fn placing_commits_the_attempt_and_its_unacked_demand_together() {
+    let (_d, store, _run, ids) = queue_fx(2);
+    let a = placed(place_on(&store, &ids[0], "w-a", 1));
+    assert_eq!(a.generation, Generation(1));
+    assert_eq!(a.state, AttemptState::Accepted);
+    assert_eq!(a.worker_id, worker("w-a"));
+    assert_eq!(a.coordinator_epoch, store.epoch());
+    assert!(a.receipts.reached(Receipt::CoordinatorAccepted));
+    let demand = store.unacked_demand().unwrap();
+    assert_eq!(demand.len(), 1);
+    assert_eq!(demand[0].attempt_id, Some(a.attempt_id.clone()));
+    assert_eq!(demand[0].demand, json!({"generation": 1}));
+    assert_eq!(queued(&store), vec![ids[1].clone()]);
+    assert_eq!(
+        store.worker_load(&worker("w-a")).unwrap(),
+        WorkerLoad {
+            active: 0,
+            pending: 1
+        }
+    );
+
+    // A full worker: nothing is written.
+    let full = place_on(&store, &ids[1], "w-a", 1);
+    assert_eq!(
+        full,
+        PlaceOutcome::WorkerFull(WorkerLoad {
+            active: 0,
+            pending: 1
+        })
+    );
+    // A placed task is not placed twice, on this worker or another.
+    assert_eq!(place_on(&store, &ids[0], "w-b", 9), PlaceOutcome::NotQueued);
+    // A payload that cannot be built leaves nothing behind either.
+    let failed = store.place(
+        &ids[1],
+        &worker("w-b"),
+        &AttemptId::generate(),
+        |_| true,
+        |_| Err(StorageError::Invalid("no payload".into())),
+        10,
+    );
+    assert!(
+        matches!(failed, Ok(PlaceOutcome::Unbuildable(_))),
+        "{failed:?}"
+    );
+    assert_eq!(store.unacked_demand().unwrap().len(), 1);
+    assert_eq!(store.live_attempts(None).unwrap().len(), 1);
+    assert_eq!(queued(&store), vec![ids[1].clone()]);
+}
+
+#[test]
+fn a_task_is_queued_again_only_once_its_attempt_is_confirmed_retired() {
+    let (_d, store, run, ids) = queue_fx(5);
+    // 0: live. 1: terminal. 2: retire asked. 3: retire confirmed. 4: cancelled.
+    let live = placed(place_on(&store, &ids[0], "w-a", 9));
+    let ended = placed(place_on(&store, &ids[1], "w-a", 9));
+    store
+        .record_seen(
+            &ended.attempt_id,
+            true,
+            seen(AttemptState::Terminal, Some(done(Outcome::Failed))),
+            Observation::Known,
+            20,
+        )
+        .unwrap();
+    let asked = placed(place_on(&store, &ids[2], "w-a", 9));
+    store.begin_retire(&asked.attempt_id, "move", 20).unwrap();
+    let gone = placed(place_on(&store, &ids[3], "w-a", 9));
+    store.begin_retire(&gone.attempt_id, "move", 20).unwrap();
+    store.confirm_retire(&gone.attempt_id, 21).unwrap();
+    assert_eq!(store.cancel_task(&ids[4], 22).unwrap(), None);
+    assert_eq!(store.task_cancel_requested(&ids[4]).unwrap(), Some(22));
+    assert_eq!(store.task_cancel_requested(&ids[0]).unwrap(), None);
+
+    assert_eq!(queued(&store), vec![ids[3].clone()]);
+    for o in [Observation::Unknown, Observation::Reconciling] {
+        store
+            .record_seen(&live.attempt_id, false, None, o, 23)
+            .unwrap();
+        assert_eq!(queued(&store), vec![ids[3].clone()], "{o:?} keeps its task");
+    }
+    assert_eq!(place_on(&store, &ids[4], "w-b", 9), PlaceOutcome::NotQueued);
+    assert_eq!(place_on(&store, &ids[2], "w-b", 9), PlaceOutcome::NotQueued);
+
+    // The slots: live and retire-asked hold one each, the others none.
+    let live_now = store.live_attempts(Some(&worker("w-a"))).unwrap();
+    let ids_now: Vec<_> = live_now
+        .iter()
+        .map(|l| l.record.attempt_id.clone())
+        .collect();
+    assert_eq!(
+        ids_now,
+        vec![live.attempt_id.clone(), asked.attempt_id.clone()]
+    );
+    assert_eq!(live_now[0].retire_reason, None);
+    assert_eq!(live_now[1].retire_reason.as_deref(), Some("move"));
+    assert!(live_now[0]
+        .placement
+        .as_ref()
+        .unwrap()
+        .acked_at_ms
+        .is_none());
+    assert_eq!(
+        store.worker_load(&worker("w-a")).unwrap(),
+        WorkerLoad {
+            active: 0,
+            pending: 2
+        }
+    );
+    assert!(store
+        .live_attempts(Some(&worker("w-b")))
+        .unwrap()
+        .is_empty());
+
+    // The retired one goes elsewhere as the next generation.
+    let next = placed(place_on(&store, &ids[3], "w-b", 9));
+    assert_eq!(next.generation, Generation(2));
+    let all = store.attempts_of_task(&ids[3]).unwrap();
+    assert_eq!(all.len(), 2);
+    assert!(all[0].retired && !all[1].retired);
+    assert!(queued(&store).is_empty());
+
+    // A closed run places nothing more.
+    let (_d2, store2, run2, ids2) = queue_fx(1);
+    store2.close_run(&run2, 30).unwrap();
+    assert!(queued(&store2).is_empty());
+    assert_eq!(
+        place_on(&store2, &ids2[0], "w-a", 9),
+        PlaceOutcome::NotQueued
+    );
+    let _ = run;
+}
+
+#[test]
+fn one_task_placed_from_many_threads_gets_one_attempt() {
+    let (_d, store, _run, ids) = queue_fx(1);
+    let outcomes: Vec<PlaceOutcome> = std::thread::scope(|s| {
+        let handles: Vec<_> = (0..8)
+            .map(|i| {
+                let (store, task) = (&store, &ids[0]);
+                s.spawn(move || place_on(store, task, &format!("w-{i}"), 9))
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+    let won = outcomes
+        .iter()
+        .filter(|o| matches!(o, PlaceOutcome::Placed(_)))
+        .count();
+    assert_eq!(won, 1);
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|o| **o == PlaceOutcome::NotQueued)
+            .count(),
+        7
+    );
+    assert_eq!(store.unacked_demand().unwrap().len(), 1);
+}
+
+#[test]
+fn what_a_worker_reported_is_mirrored_edge_by_edge_and_a_result_is_fixed_once() {
+    let (_d, store, _run, ids) = queue_fx(1);
+    let a = placed(place_on(&store, &ids[0], "w-a", 9)).attempt_id;
+    let mut receipts = Receipts::default();
+    receipts.mark(Receipt::CommandRegistered, 1);
+    let rec = store
+        .record_seen(
+            &a,
+            true,
+            Some(Seen {
+                state: AttemptState::Active,
+                termination: None,
+                receipts,
+            }),
+            Observation::Known,
+            30,
+        )
+        .unwrap();
+    assert_eq!(rec.state, AttemptState::Active);
+    assert_eq!(rec.receipts.at_ms(Receipt::WorkerAccepted), Some(30));
+    assert!(rec.receipts.reached(Receipt::CommandRegistered));
+    assert!(!rec.receipts.reached(Receipt::Running));
+    assert!(store.unacked_demand().unwrap().is_empty());
+    assert_eq!(
+        store.worker_load(&worker("w-a")).unwrap(),
+        WorkerLoad {
+            active: 1,
+            pending: 0
+        }
+    );
+    let steps = store.events_of(&a, "attempt_state").unwrap();
+    assert_eq!(steps.len(), 4, "accepted to active is four edges");
+
+    // A state behind the mirror, and an observation alone.
+    let rec = store
+        .record_seen(
+            &a,
+            false,
+            seen(AttemptState::Ready, None),
+            Observation::Unknown,
+            31,
+        )
+        .unwrap();
+    assert_eq!(rec.state, AttemptState::Active);
+    assert_eq!(rec.observation, Observation::Unknown);
+    assert_eq!(store.events_of(&a, "attempt_observation").unwrap().len(), 1);
+    store
+        .record_seen(&a, false, None, Observation::Unknown, 32)
+        .unwrap();
+    assert_eq!(store.events_of(&a, "attempt_observation").unwrap().len(), 1);
+
+    // A terminal state without a result is refused whole.
+    let bad = store.record_seen(
+        &a,
+        false,
+        seen(AttemptState::Terminal, None),
+        Observation::Known,
+        33,
+    );
+    assert!(matches!(bad, Err(StorageError::Invalid(_))), "{bad:?}");
+    assert_eq!(
+        store.get_attempt(&a).unwrap().unwrap().observation,
+        Observation::Unknown
+    );
+
+    let end = seen(AttemptState::Terminal, Some(done(Outcome::Interrupted)));
+    let rec = store
+        .record_seen(&a, false, end, Observation::Known, 34)
+        .unwrap();
+    assert_eq!(rec.termination, Some(done(Outcome::Interrupted)));
+    assert_eq!(rec.terminal_at_ms, Some(34));
+    let again = seen(AttemptState::Terminal, Some(done(Outcome::Succeeded)));
+    let rec = store
+        .record_seen(&a, false, again, Observation::Known, 35)
+        .unwrap();
+    assert_eq!(rec.termination, Some(done(Outcome::Interrupted)));
+    assert_eq!(store.events_of(&a, "attempt_terminal").unwrap().len(), 1);
+    assert_eq!(
+        store.worker_load(&worker("w-a")).unwrap(),
+        WorkerLoad::default()
+    );
+    assert!(store.live_attempts(None).unwrap().is_empty());
+}
+
+#[test]
+fn a_cancel_of_a_task_reaches_its_live_attempt_once_and_a_restart_marks_it_reconciling() {
+    let (dir, store, _run, ids) = queue_fx(2);
+    let a = placed(place_on(&store, &ids[0], "w-a", 9)).attempt_id;
+    let hit = store.cancel_task(&ids[0], 40).unwrap().unwrap();
+    assert_eq!(hit.attempt_id, a);
+    assert_eq!(hit.cancel_requested_at_ms, Some(40));
+    let again = store.cancel_task(&ids[0], 41).unwrap().unwrap();
+    assert_eq!(again.cancel_requested_at_ms, Some(40));
+    assert_eq!(store.task_cancel_requested(&ids[0]).unwrap(), Some(40));
+    assert_eq!(store.events_of(&a, "cancel_requested").unwrap().len(), 1);
+    assert!(matches!(
+        store.cancel_task(&TaskId::generate(), 42),
+        Err(StorageError::NotFound { .. })
+    ));
+    assert!(matches!(
+        store.task_cancel_requested(&TaskId::generate()),
+        Err(StorageError::NotFound { .. })
+    ));
+
+    drop(store);
+    let store = CoordinatorStore::open(dir.path(), 50).unwrap();
+    assert_eq!(store.epoch(), CoordinatorEpoch(2));
+    assert_eq!(store.mark_reconciling().unwrap(), 1);
+    assert_eq!(store.mark_reconciling().unwrap(), 0);
+    let live = store.live_attempts(None).unwrap();
+    assert_eq!(live[0].record.observation, Observation::Reconciling);
+    assert_eq!(live[0].record.coordinator_epoch, CoordinatorEpoch(1));
+    assert_eq!(
+        store.unacked_demand().unwrap().len(),
+        1,
+        "the demand survives"
+    );
+    assert_eq!(queued(&store), vec![ids[1].clone()]);
+}
+
+#[test]
+fn a_terminal_attempt_is_not_retired_by_a_late_confirmation() {
+    let (_dir, store, _run, ids) = queue_fx(1);
+    let a = placed(place_on(&store, &ids[0], "w-a", 9)).attempt_id;
+    store.begin_retire(&a, "move", 20).unwrap();
+    let end = seen(AttemptState::Terminal, Some(done(Outcome::Succeeded)));
+    store
+        .record_seen(&a, true, end, Observation::Known, 21)
+        .unwrap();
+    let e = store.confirm_retire(&a, 22).err().unwrap();
+    assert!(matches!(e, StorageError::IllegalState { .. }), "{e:?}");
+    assert_eq!(e.code(), ErrorCode::Conflict);
+    // Nothing of the refused confirmation stays.
+    let rec = store.get_attempt(&a).unwrap().unwrap();
+    assert!(!rec.retired);
+    assert_eq!(rec.termination, Some(done(Outcome::Succeeded)));
+    assert_eq!(store.retire_tombstone(&a).unwrap(), Some((20, None)));
+    assert!(store.events_of(&a, "retire_confirmed").unwrap().is_empty());
+    assert!(queued(&store).is_empty(), "the task is not placed again");
+    let e = store.finish_retire(&a, "refused", 23).err().unwrap();
+    assert!(matches!(e, StorageError::IllegalState { .. }), "{e:?}");
+}
+
+#[test]
+fn a_confirmed_retire_frees_the_task_or_settles_the_attempt_by_what_is_recorded() {
+    let (_dir, store, _run, ids) = queue_fx(4);
+    let at = |i: usize| placed(place_on(&store, &ids[i], "w-a", 9)).attempt_id;
+    // Without a tombstone there is nothing to confirm.
+    let plain = at(0);
+    assert!(matches!(
+        store.finish_retire(&plain, "refused", 20),
+        Err(StorageError::NotFound { .. })
+    ));
+
+    // An ordinary retire: the task is free again.
+    store.begin_retire(&plain, "move", 20).unwrap();
+    assert_eq!(
+        store.finish_retire(&plain, "refused", 21).unwrap(),
+        RetireEnd::Freed
+    );
+    let rec = store.get_attempt(&plain).unwrap().unwrap();
+    assert!(rec.retired && rec.termination.is_none());
+    assert_eq!(rec.retired_at_ms, Some(21));
+    assert_eq!(
+        store.retire_tombstone(&plain).unwrap(),
+        Some((20, Some(21)))
+    );
+    assert!(queued(&store).contains(&ids[0]));
+
+    // The task was cancelled after the retire was asked for: the attempt
+    // ends `cancelled` and the task is not placed again.
+    let cancelled = at(1);
+    store.begin_retire(&cancelled, "move", 30).unwrap();
+    store.cancel_task(&ids[1], 31).unwrap();
+    let RetireEnd::Settled(rec) = store.finish_retire(&cancelled, "refused", 32).unwrap() else {
+        panic!("a cancelled task is settled")
+    };
+    assert_eq!(rec.state, AttemptState::Terminal);
+    assert_eq!(rec.termination, Some(done(Outcome::Cancelled)));
+    assert_eq!(rec.terminal_at_ms, Some(32));
+    assert!(!rec.retired);
+    assert_eq!(rec.observation, Observation::Known);
+    assert_eq!(
+        store.retire_tombstone(&cancelled).unwrap(),
+        Some((30, Some(32)))
+    );
+    let confirmed = store.events_of(&cancelled, "retire_confirmed").unwrap();
+    assert_eq!(confirmed.len(), 1);
+    assert_eq!(confirmed[0].payload["settled"], "cancelled");
+    assert!(!queued(&store).contains(&ids[1]));
+
+    // The retire was asked for because the worker will never take it.
+    let refused = at(2);
+    store.begin_retire(&refused, "refused", 40).unwrap();
+    store
+        .record_seen(&refused, false, None, Observation::Unknown, 41)
+        .unwrap();
+    let RetireEnd::Settled(rec) = store.finish_retire(&refused, "refused", 42).unwrap() else {
+        panic!("a refused attempt is settled")
+    };
+    assert_eq!(rec.termination.unwrap().outcome(), Outcome::Failed);
+    assert_eq!(rec.observation, Observation::Known);
+    assert!(!rec.retired);
+    let confirmed = store.events_of(&refused, "retire_confirmed").unwrap();
+    assert_eq!(confirmed[0].payload["settled"], "failed");
+    assert!(!queued(&store).contains(&ids[2]));
+    // A cancel wins over the reason.
+    let both = at(3);
+    store.begin_retire(&both, "refused", 50).unwrap();
+    store.cancel_task(&ids[3], 51).unwrap();
+    let RetireEnd::Settled(rec) = store.finish_retire(&both, "refused", 52).unwrap() else {
+        panic!()
+    };
+    assert_eq!(rec.termination, Some(done(Outcome::Cancelled)));
+
+    // Nothing settled holds a slot or demand; once concluded, it stays.
+    assert_eq!(
+        store.worker_load(&worker("w-a")).unwrap(),
+        WorkerLoad::default()
+    );
+    assert!(store.unacked_demand().unwrap().is_empty());
+    assert!(store.live_attempts(None).unwrap().is_empty());
+    for a in [&cancelled, &refused] {
+        let e = store.finish_retire(a, "refused", 60).err().unwrap();
+        assert!(matches!(e, StorageError::IllegalState { .. }), "{e:?}");
+    }
+    // Confirming a freed one again changes nothing.
+    assert_eq!(
+        store.finish_retire(&plain, "refused", 60).unwrap(),
+        RetireEnd::Freed
+    );
+    assert_eq!(
+        store.get_attempt(&plain).unwrap().unwrap().retired_at_ms,
+        Some(21)
+    );
+    assert_eq!(queued(&store), vec![ids[0].clone()]);
+}
+
+#[test]
+fn a_task_whose_payload_cannot_be_built_is_refused_alone_and_a_fault_is_a_fault() {
+    let (_dir, store, _run, ids) = queue_fx(1);
+    let put = |r: Result<(PayloadHash, serde_json::Value)>| {
+        store.place(
+            &ids[0],
+            &worker("w-a"),
+            &AttemptId::generate(),
+            |_| true,
+            move |_| r,
+            10,
+        )
+    };
+    assert_eq!(
+        put(Err(StorageError::Invalid("no payload".into()))).unwrap(),
+        PlaceOutcome::Unbuildable("no payload".into())
+    );
+    let e = put(Err(StorageError::Corrupt("disk".into())))
+        .err()
+        .unwrap();
+    assert!(matches!(e, StorageError::Corrupt(_)), "{e:?}");
+    // Neither wrote anything: the task is as it was, and can be placed.
+    assert!(store.attempts_of_task(&ids[0]).unwrap().is_empty());
+    assert_eq!(queued(&store), ids);
+    assert!(matches!(
+        put(Ok((hash('a'), json!({})))).unwrap(),
+        PlaceOutcome::Placed(_)
+    ));
+}
+
+#[test]
+fn a_step_1_coordinator_database_with_rows_is_read_as_it_is_and_upgraded_once() {
+    use super::policy::Access;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("coordinator.db");
+    let all = schema::steps(DbKind::Coordinator);
+    assert_eq!(all.len(), 2, "this test is about step 1 -> 2");
+    let (cluster, coordinator) = (ClusterId::generate(), CoordinatorId::generate());
+    let (run, queued_task, placed_task) =
+        (RunId::generate(), TaskId::generate(), TaskId::generate());
+    let attempt = AttemptId::generate();
+    {
+        // What the first step's binary wrote: a run with a task that waits
+        // and one that was placed and is running.
+        let v1 = db::open_with(
+            &path,
+            "coordinator",
+            &all[..1],
+            schema::compat(1),
+            Access::ReadWrite,
+        )
+        .unwrap();
+        let rows = [
+            format!("INSERT INTO cluster VALUES ('{cluster}', '{coordinator}', 1)"),
+            format!("INSERT INTO coordinator_state VALUES (1, '{cluster}', 3)"),
+            format!(
+                "INSERT INTO run (run_id, spec_json, created_at_ms) VALUES ('{run}', '{{}}', 2)"
+            ),
+            format!("INSERT INTO task VALUES ('{queued_task}', '{run}', '{{\"n\":1}}', 3)"),
+            format!("INSERT INTO task VALUES ('{placed_task}', '{run}', '{{\"n\":2}}', 4)"),
+            format!(
+                "INSERT INTO attempt (attempt_id, task_id, worker_id, generation, payload_hash,
+                    coordinator_epoch, state, receipts_json, created_at_ms)
+                 VALUES ('{attempt}', '{placed_task}', 'w-a', 1, '{}', 3, 'active', '{}', 5)",
+                hash('a').as_str(),
+                serde_json::to_string(&Receipts::default()).unwrap()
+            ),
+            format!(
+                "INSERT INTO placement (task_id, worker_id, attempt_id, demand_json, created_at_ms)
+                 VALUES ('{placed_task}', 'w-a', '{attempt}', '{{}}', 5)"
+            ),
+        ];
+        v1.write(move |tx| {
+            for sql in &rows {
+                tx.execute(sql, [])?;
+            }
+            Ok(())
+        })
+        .unwrap();
+    }
+    let schema_of = |store: &CoordinatorStore| -> (String, i64, i64) {
+        store
+            .db
+            .call(|c| {
+                let version = c.query_row(
+                    "SELECT value FROM schema_meta WHERE key = 'schema_version'",
+                    [],
+                    |r| r.get(0),
+                )?;
+                let column = c.query_row(
+                    "SELECT count(*) FROM pragma_table_info('task')
+                     WHERE name = 'cancel_requested_at_ms'",
+                    [],
+                    |r| r.get(0),
+                )?;
+                let index = c.query_row(
+                    "SELECT count(*) FROM sqlite_master
+                     WHERE type = 'index' AND name = 'placement_attempt'",
+                    [],
+                    |r| r.get(0),
+                )?;
+                Ok((version, column, index))
+            })
+            .unwrap()
+    };
+    let check_rows = |store: &CoordinatorStore| {
+        assert_eq!(queued(store), vec![queued_task.clone()]);
+        let live = store.live_attempts(None).unwrap();
+        assert_eq!(live.len(), 1);
+        assert_eq!(live[0].record.attempt_id, attempt);
+        assert_eq!(live[0].record.state, AttemptState::Active);
+        assert!(live[0].placement.is_some());
+        assert_eq!(store.task_cancel_requested(&queued_task).unwrap(), None);
+        assert_eq!(
+            store.worker_load(&worker("w-a")).unwrap(),
+            WorkerLoad {
+                active: 1,
+                pending: 0
+            }
+        );
+    };
+
+    // Read-only, the newer binary reads the old file without changing it.
+    {
+        let ro = CoordinatorStore::open_read_only(dir.path()).unwrap();
+        assert_eq!(schema_of(&ro), ("1".to_string(), 0, 0));
+        assert_eq!(ro.epoch(), CoordinatorEpoch(3));
+        check_rows(&ro);
+        assert!(matches!(
+            ro.task_cancel_requested(&TaskId::generate()),
+            Err(StorageError::NotFound { .. })
+        ));
+    }
+
+    // Opened for writing, it is migrated, and every row is still there.
+    let store = CoordinatorStore::open(dir.path(), 10).unwrap();
+    assert_eq!(schema_of(&store), ("2".to_string(), 1, 1));
+    assert_eq!(store.epoch(), CoordinatorEpoch(4));
+    assert_eq!(store.cluster_id(), &cluster);
+    check_rows(&store);
+    // What the second step added works on the old rows.
+    assert_eq!(store.cancel_task(&queued_task, 11).unwrap(), None);
+    assert_eq!(store.task_cancel_requested(&queued_task).unwrap(), Some(11));
+    assert!(queued(&store).is_empty());
+    let hit = store.cancel_task(&placed_task, 12).unwrap().unwrap();
+    assert_eq!(hit.attempt_id, attempt);
+    assert_eq!(hit.cancel_requested_at_ms, Some(12));
+    drop(store);
+
+    // Opening again migrates nothing and loses nothing.
+    let store = CoordinatorStore::open(dir.path(), 20).unwrap();
+    assert_eq!(schema_of(&store), ("2".to_string(), 1, 1));
+    assert_eq!(store.epoch(), CoordinatorEpoch(5));
+    assert_eq!(store.task_cancel_requested(&queued_task).unwrap(), Some(11));
+    assert_eq!(store.live_attempts(None).unwrap().len(), 1);
+    let ro = CoordinatorStore::open_read_only(dir.path()).unwrap();
+    assert_eq!(ro.task_cancel_requested(&queued_task).unwrap(), Some(11));
+    assert!(queued(&ro).is_empty());
 }

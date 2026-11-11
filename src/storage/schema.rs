@@ -168,6 +168,13 @@ CREATE INDEX blob_ref_attempt ON blob_ref(attempt_id);
 CREATE INDEX blob_ref_locator ON blob_ref(locator);
 ";
 
+/// The queue: a cancel of a task is durable before any attempt of it exists,
+/// and a cancelled task is never placed.
+const COORDINATOR_V2: &str = "
+ALTER TABLE task ADD COLUMN cancel_requested_at_ms INTEGER;
+CREATE INDEX placement_attempt ON placement(attempt_id);
+";
+
 const WORKER_V1: &str = "
 CREATE TABLE worker_state (
     singleton             INTEGER PRIMARY KEY CHECK (singleton = 1),
@@ -255,7 +262,10 @@ CREATE INDEX blob_ref_locator ON blob_ref(locator);
 /// The migration list of a database kind.
 pub(crate) fn steps(kind: DbKind) -> Vec<String> {
     match kind {
-        DbKind::Coordinator => vec![format!("{COMMON}{COORDINATOR_V1}")],
+        DbKind::Coordinator => vec![
+            format!("{COMMON}{COORDINATOR_V1}"),
+            COORDINATOR_V2.to_string(),
+        ],
         DbKind::Worker => vec![format!("{COMMON}{WORKER_V1}")],
     }
 }

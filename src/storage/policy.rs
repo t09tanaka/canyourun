@@ -308,6 +308,35 @@ pub fn decide_gc(
     }
 }
 
+// ---------------------------------------------------------------- mirror
+
+/// The legal steps that take a mirrored attempt from `from` to `to`, shortest
+/// first: the coordinator sees a worker's state only now and then, so its
+/// copy may be several edges behind. Empty when they are equal; `None` when
+/// `to` cannot be reached (it lies behind `from`), and the copy is left alone.
+pub fn state_path(from: AttemptState, to: AttemptState) -> Option<Vec<AttemptState>> {
+    if from == to {
+        return Some(Vec::new());
+    }
+    let mut frontier = vec![(from, Vec::new())];
+    // No path is longer than the number of states.
+    for _ in AttemptState::ALL {
+        let mut next = Vec::new();
+        for (state, path) in frontier {
+            for &step in state.successors() {
+                let mut longer: Vec<AttemptState> = path.clone();
+                longer.push(step);
+                if step == to {
+                    return Some(longer);
+                }
+                next.push((step, longer));
+            }
+        }
+        frontier = next;
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -782,5 +811,48 @@ mod tests {
             collected: false,
             ..cand()
         }
+    }
+
+    #[test]
+    fn a_state_path_is_the_shortest_run_of_legal_edges_or_nothing() {
+        use AttemptState::*;
+        // Steps from the row's state to the column's, in the order of
+        // `AttemptState::ALL`; -1 is unreachable.
+        let want: [[i8; 8]; 8] = [
+            [0, 1, 2, 3, 4, 1, 1, 2],
+            [-1, 0, 1, 2, 3, 1, 1, 2],
+            [-1, -1, 0, 1, 2, 1, 1, 2],
+            [-1, -1, -1, 0, 1, 1, 1, 2],
+            [-1, -1, -1, -1, 0, 1, 1, 2],
+            [-1, -1, -1, -1, -1, 0, 1, 2],
+            [-1, -1, -1, -1, -1, -1, 0, 1],
+            [-1, -1, -1, -1, -1, -1, -1, 0],
+        ];
+        assert_eq!(
+            AttemptState::ALL,
+            [Accepted, Preparing, Ready, Starting, Active, Cancelling, Finalizing, Terminal]
+        );
+        for (i, from) in AttemptState::ALL.into_iter().enumerate() {
+            for (j, to) in AttemptState::ALL.into_iter().enumerate() {
+                let path = state_path(from, to);
+                let len = path.as_ref().map_or(-1, |p| p.len() as i8);
+                assert_eq!(len, want[i][j], "{from:?} -> {to:?}: {path:?}");
+                let Some(path) = path else { continue };
+                let mut at = from;
+                for step in &path {
+                    assert!(at.can_transition(*step), "{at:?} -> {step:?}");
+                    at = *step;
+                }
+                assert_eq!(at, to);
+            }
+        }
+        assert_eq!(
+            state_path(Accepted, Active),
+            Some(vec![Preparing, Ready, Starting, Active])
+        );
+        assert_eq!(
+            state_path(Ready, Terminal),
+            Some(vec![Finalizing, Terminal])
+        );
     }
 }
