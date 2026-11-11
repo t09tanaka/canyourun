@@ -18,6 +18,9 @@ use rusqlite::{params, Connection, OptionalExtension, Row};
 use serde_json::Value;
 use std::path::Path;
 
+mod queue;
+pub use queue::{LiveAttempt, PlaceInput, PlaceOutcome, QueuedTask, Seen, WorkerLoad};
+
 const ATTEMPT: &str = "attempt";
 
 fn id<T>(what: &str, r: std::result::Result<T, IdError>) -> Result<T> {
