@@ -290,8 +290,8 @@ pub fn check_manifest_files<'a>(
             Some(k) if k != size => {
                 return Err("the manifest gives a file another size than its hash has");
             }
-            Some(_) if wanted.contains_key(hash) => {}
-            _ => {
+            Some(_) => {}
+            None => {
                 new.insert(hash, size);
             }
         }
