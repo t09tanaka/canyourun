@@ -624,6 +624,25 @@ impl CoordinatorStore {
         })
     }
 
+    /// What was recorded with the placement of an attempt (the payload that
+    /// was decided, and the decision), acknowledged or not.
+    pub fn placement_demand(&self, attempt_id: &AttemptId) -> Result<Option<Value>> {
+        let aid = attempt_id.to_string();
+        self.db.call(move |c| {
+            let demand: Option<String> = c
+                .query_row(
+                    "SELECT demand_json FROM placement WHERE attempt_id = ?1
+                     ORDER BY placement_id DESC LIMIT 1",
+                    [&aid],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            demand
+                .map(|d| from_json("placement demand", &d))
+                .transpose()
+        })
+    }
+
     /// After a restart nothing is known first-hand: every attempt that still
     /// needs attention is `reconciling` until its worker was asked. Returns
     /// how many.
