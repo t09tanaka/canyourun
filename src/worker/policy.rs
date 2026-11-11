@@ -602,6 +602,7 @@ mod tests {
 
     fn cmd(node: &str) -> CommandSpec {
         CommandSpec {
+            setup_step: None,
             node_id: NodeId::parse(node).unwrap(),
             argv: vec!["true".into()],
             cwd: String::new(),
@@ -614,6 +615,7 @@ mod tests {
     fn payload() -> AttemptPayload {
         let d = Digest::of_bytes(b"x");
         AttemptPayload {
+            setup: None,
             run_id: RunId::generate(),
             task_id: TaskId::generate(),
             generation: Generation(1),

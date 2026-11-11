@@ -120,6 +120,7 @@ pub fn build_payload(
         .clone()
         .ok_or_else(|| StorageError::Invalid(format!("run {} has no source", input.run_id)))?;
     Ok(AttemptPayload {
+        setup: None,
         run_id: input.run_id.clone(),
         task_id: input.task_id.clone(),
         generation: input.generation,

@@ -830,6 +830,7 @@ mod tests {
     fn accepted_nodes_are_numbered_in_execution_order() {
         let a = AttemptId::generate();
         let cmd = |name: &str, deps: &[&str]| CommandSpec {
+            setup_step: None,
             node_id: NodeId::parse(name).unwrap(),
             argv: vec!["true".into()],
             cwd: String::new(),
@@ -859,6 +860,7 @@ mod tests {
     fn payload_of(commands: Vec<CommandSpec>) -> AttemptPayload {
         let d = Digest::of_bytes(b"x");
         AttemptPayload {
+            setup: None,
             run_id: crate::ids::RunId::generate(),
             task_id: crate::ids::TaskId::generate(),
             generation: crate::ids::Generation(1),

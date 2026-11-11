@@ -582,6 +582,7 @@ fn payload(p: &Parcel, script: &str) -> AttemptPayload {
     let mut env = BTreeMap::new();
     env.insert("PATH".to_string(), "/usr/bin:/bin".to_string());
     AttemptPayload {
+        setup: None,
         run_id: RunId::generate(),
         task_id: TaskId::generate(),
         generation: Generation(1),
@@ -592,6 +593,7 @@ fn payload(p: &Parcel, script: &str) -> AttemptPayload {
             .unwrap(),
         permit_id: None,
         commands: vec![CommandSpec {
+            setup_step: None,
             node_id: NodeId::parse("main").unwrap(),
             argv: vec!["/bin/sh".into(), "-c".into(), script.into()],
             cwd: String::new(),
