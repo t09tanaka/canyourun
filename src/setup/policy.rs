@@ -612,13 +612,18 @@ mod tests {
             version: "1".into(),
         });
         assert!(bad(&s).contains("tools or secrets"));
+        let secrets = |n: usize| -> Vec<SecretVersion> {
+            (0..n)
+                .map(|i| SecretVersion {
+                    name: i.to_string(),
+                    digest: "d".into(),
+                })
+                .collect()
+        };
         let mut s = spec(&["a"]);
-        s.secrets = (0..=MAX_LISTED)
-            .map(|i| SecretVersion {
-                name: i.to_string(),
-                digest: "d".into(),
-            })
-            .collect();
+        s.secrets = secrets(MAX_LISTED);
+        assert!(validate(&s).is_ok());
+        s.secrets = secrets(MAX_LISTED + 1);
         assert!(bad(&s).contains("tools or secrets"));
     }
 
