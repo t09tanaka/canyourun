@@ -20,6 +20,7 @@ use remote_task_runner::ids::*;
 use remote_task_runner::protocol::transport::duplex_pair;
 use remote_task_runner::protocol::{connect, ClientConfig};
 use remote_task_runner::results::{CollectConfig, CollectReport, ResultStore};
+use remote_task_runner::scheduler::{CostModel, Scheduler, SchedulerConfig, UnknownCosts};
 use remote_task_runner::state::{
     AttemptState, Observation, Outcome, Receipt, Receipts, Termination,
 };
@@ -40,8 +41,9 @@ use tokio::sync::Semaphore;
 // ------------------------------------------------------------ the workers
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Op {
+pub(crate) enum Op {
     Inspect,
+    Forecast,
     Get,
     Submit,
     Cancel,
@@ -49,9 +51,37 @@ enum Op {
     Renew,
 }
 
+/// What a fake worker says when it is asked for a forecast.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Says {
+    /// A finish time (`measured`), or a ranking (`fallback`).
+    Number(RuntimeSource),
+    /// No number: a command of its own ran past its history.
+    Nothing,
+    /// An error.
+    Error,
+    /// It never answers.
+    Silence,
+}
+
+/// How a fake worker forecasts: every task it holds, and every one the
+/// question says is on its way, takes `run_ms`, one after the other; the
+/// asked task is ready after the delay the question names, which overlaps
+/// that queue.
+#[derive(Debug, Clone)]
+pub(crate) struct Forecasting {
+    pub(crate) run_ms: u64,
+    pub(crate) says: Says,
+    pub(crate) boot: &'static str,
+    pub(crate) epoch: u64,
+    pub(crate) ttl_ms: u64,
+    /// The answer takes this long.
+    pub(crate) delay_ms: u64,
+}
+
 /// Where a request is lost.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Lost {
+pub(crate) enum Lost {
     /// It never arrives.
     Request,
     /// It is carried out and its answer never arrives.
@@ -59,28 +89,28 @@ enum Lost {
 }
 
 #[derive(Debug, Clone)]
-struct Held {
-    payload: AttemptPayload,
-    hash: PayloadHash,
-    state: AttemptState,
-    termination: Option<Termination>,
-    receipts: Receipts,
-    retired: bool,
-    launches: u32,
-    lease: Option<LeaseKey>,
-    renewals: u32,
+pub(crate) struct Held {
+    pub(crate) payload: AttemptPayload,
+    pub(crate) hash: PayloadHash,
+    pub(crate) state: AttemptState,
+    pub(crate) termination: Option<Termination>,
+    pub(crate) receipts: Receipts,
+    pub(crate) retired: bool,
+    pub(crate) launches: u32,
+    pub(crate) lease: Option<LeaseKey>,
+    pub(crate) renewals: u32,
 }
 
 /// Which worker runs which task now, over all workers of a test: a task
 /// that runs in two places at once is the failure everything here prevents.
 #[derive(Default)]
-struct Cluster {
+pub(crate) struct Cluster {
     running: Mutex<BTreeMap<TaskId, String>>,
     starts: Mutex<Vec<(TaskId, AttemptId, String)>>,
 }
 
 impl Cluster {
-    fn starts_of(&self, task: &TaskId) -> Vec<String> {
+    pub(crate) fn starts_of(&self, task: &TaskId) -> Vec<String> {
         let starts = self.starts.lock().unwrap();
         starts
             .iter()
@@ -90,35 +120,38 @@ impl Cluster {
     }
 }
 
-struct State {
-    max_epoch: u64,
-    held: BTreeMap<AttemptId, Held>,
-    tombstones: BTreeSet<AttemptId>,
-    offline: bool,
-    lose: Vec<(Op, Lost)>,
-    overloaded: bool,
-    refuse: bool,
+pub(crate) struct State {
+    pub(crate) max_epoch: u64,
+    pub(crate) held: BTreeMap<AttemptId, Held>,
+    pub(crate) tombstones: BTreeSet<AttemptId>,
+    pub(crate) offline: bool,
+    pub(crate) lose: Vec<(Op, Lost)>,
+    pub(crate) overloaded: bool,
+    pub(crate) refuse: bool,
     /// What a new submit is answered with instead of being taken.
-    fault: Option<ApiError>,
-    slow_stop: bool,
+    pub(crate) fault: Option<ApiError>,
+    pub(crate) slow_stop: bool,
     /// How a command that is being retired ends, when not by the stop.
-    ends_in_retire: Option<Outcome>,
+    pub(crate) ends_in_retire: Option<Outcome>,
     /// The `get_attempt` that follows a retire gets no answer.
-    lose_get_after_retire: bool,
+    pub(crate) lose_get_after_retire: bool,
     /// After `inspect`, nothing is answered and nothing returns.
-    stall: bool,
-    draining: bool,
-    limits: (u32, u32),
+    pub(crate) stall: bool,
+    pub(crate) draining: bool,
+    pub(crate) limits: (u32, u32),
     /// The requests that were carried out, in order.
-    log: Vec<(Op, AttemptId)>,
+    pub(crate) log: Vec<(Op, AttemptId)>,
     /// What `inspect` says its id is.
-    says: WorkerId,
+    pub(crate) says: WorkerId,
+    pub(crate) forecasting: Forecasting,
+    /// Every forecast question that arrived, in order.
+    pub(crate) asked: Vec<ForecastRequest>,
 }
 
-struct FakeWorker {
-    id: WorkerId,
+pub(crate) struct FakeWorker {
+    pub(crate) id: WorkerId,
     cluster: Arc<Cluster>,
-    state: Mutex<State>,
+    pub(crate) state: Mutex<State>,
 }
 
 fn err(code: ErrorCode) -> ApiError {
@@ -152,29 +185,38 @@ impl FakeWorker {
                 limits,
                 log: Vec::new(),
                 says: id,
+                forecasting: Forecasting {
+                    run_ms: 10_000,
+                    says: Says::Number(RuntimeSource::Measured),
+                    boot: "boot-1",
+                    epoch: 1,
+                    ttl_ms: 2000,
+                    delay_ms: 0,
+                },
+                asked: Vec::new(),
             }),
         })
     }
 
-    fn set(&self, f: impl FnOnce(&mut State)) {
+    pub(crate) fn set(&self, f: impl FnOnce(&mut State)) {
         f(&mut self.state.lock().unwrap());
     }
 
-    fn held(&self, a: &AttemptId) -> Option<Held> {
+    pub(crate) fn held(&self, a: &AttemptId) -> Option<Held> {
         self.state.lock().unwrap().held.get(a).cloned()
     }
 
-    fn holds(&self) -> Vec<AttemptId> {
+    pub(crate) fn holds(&self) -> Vec<AttemptId> {
         self.state.lock().unwrap().held.keys().cloned().collect()
     }
 
-    fn count(&self, op: Op) -> usize {
+    pub(crate) fn count(&self, op: Op) -> usize {
         let s = self.state.lock().unwrap();
         s.log.iter().filter(|(o, _)| *o == op).count()
     }
 
     /// The worker starts the command of an accepted attempt.
-    fn start(&self, a: &AttemptId) {
+    pub(crate) fn start(&self, a: &AttemptId) {
         let mut s = self.state.lock().unwrap();
         let h = s.held.get_mut(a).expect("the worker holds the attempt");
         assert_eq!(
@@ -216,7 +258,7 @@ impl FakeWorker {
     }
 
     /// The command ends, or the worker stops it by itself (lease expiry).
-    fn finish(&self, a: &AttemptId, outcome: Outcome) {
+    pub(crate) fn finish(&self, a: &AttemptId, outcome: Outcome) {
         let mut s = self.state.lock().unwrap();
         let mut h = s.held.remove(a).expect("the worker holds the attempt");
         self.stop(&mut h, outcome);
@@ -416,6 +458,76 @@ impl FakeWorker {
                     state,
                 }))
             }
+            Request::Forecast(r) => {
+                Self::epoch(&mut s, r.coordinator_epoch)?;
+                s.asked.push(r.clone());
+                s.log.push((Op::Forecast, r.workload.attempt_id.clone()));
+                let f = s.forecasting.clone();
+                if f.says == Says::Error {
+                    return Err(err(ErrorCode::Internal));
+                }
+                let held = s
+                    .held
+                    .iter()
+                    .filter(|(_, h)| h.state != AttemptState::Terminal)
+                    .count();
+                let coming = r
+                    .pending
+                    .iter()
+                    .filter(|p| !s.held.contains_key(&p.attempt_id))
+                    .count();
+                let queue = (held + coming) as u64 * f.run_ms;
+                let nodes = r.workload.nodes.iter();
+                let ready = nodes.filter_map(|n| n.external_delay_ms).max().unwrap_or(0);
+                let finish = ready.max(queue) + f.run_ms;
+                let wait = queue.saturating_sub(ready);
+                let mut null_reasons = BTreeMap::new();
+                let (finish_in_ms, execution_ms, ranking, runtime_source) = match f.says {
+                    Says::Number(RuntimeSource::Measured) => {
+                        (Some(finish), Some(f.run_ms), None, RuntimeSource::Measured)
+                    }
+                    Says::Number(source) => {
+                        null_reasons.insert(ForecastField::ExecutionMs, Uncertainty::NoHistory);
+                        null_reasons.insert(ForecastField::FinishInMs, Uncertainty::NoHistory);
+                        let ranking = ForecastRanking {
+                            start_in_ms: Some(ready.max(queue)),
+                            finish_in_ms: Some(finish),
+                        };
+                        (None, None, Some(ranking), source)
+                    }
+                    _ => {
+                        null_reasons.insert(ForecastField::FinishInMs, Uncertainty::Overrun);
+                        (None, Some(f.run_ms), None, RuntimeSource::Measured)
+                    }
+                };
+                let known = f.says != Says::Nothing;
+                Ok(Response::Forecast(ForecastResponse {
+                    schema_version: SchemaVersion::CURRENT,
+                    worker_id: s.says.clone(),
+                    worker_boot_id: WorkerBootId::parse(f.boot).unwrap(),
+                    agent_epoch: AgentEpoch(f.epoch),
+                    snapshot_digest: Digest::of_bytes(b"s"),
+                    policy_digest: Digest::of_bytes(b"p"),
+                    ttl_ms: f.ttl_ms,
+                    coverage: vec![],
+                    target: ForecastTarget {
+                        plan_digest: r.workload.plan_digest.clone(),
+                        ready_in_ms: Some(ready),
+                        queue_wait_after_ready_ms: known.then_some(wait),
+                        execution_ms,
+                        finish_in_ms,
+                        confidence: Confidence::Medium,
+                        runtime_source,
+                        history_count: 0,
+                        conditional: false,
+                        overrun: !known,
+                        wait_reason: None,
+                        assumptions: vec![],
+                        null_reasons,
+                        ranking,
+                    },
+                }))
+            }
             other => panic!("the coordinator core does not send {other:?}"),
         }
     }
@@ -424,6 +536,7 @@ impl FakeWorker {
 fn op_of(request: &Request) -> Op {
     match request {
         Request::Inspect(_) => Op::Inspect,
+        Request::Forecast(_) => Op::Forecast,
         Request::GetAttempt(_) => Op::Get,
         Request::SubmitAttempt(_) => Op::Submit,
         Request::CancelAttempt(_) => Op::Cancel,
@@ -444,6 +557,15 @@ impl WorkerLink for FakeWorker {
             if stall && op != Op::Inspect {
                 // Never answered; only the caller's own deadline ends it.
                 std::future::pending::<()>().await;
+            }
+            if op == Op::Forecast {
+                let f = self.state.lock().unwrap().forecasting.clone();
+                if f.says == Says::Silence {
+                    std::future::pending::<()>().await;
+                }
+                if f.delay_ms > 0 {
+                    tokio::time::sleep(Duration::from_millis(f.delay_ms)).await;
+                }
             }
             let lost = {
                 let mut s = self.state.lock().unwrap();
@@ -469,13 +591,15 @@ impl WorkerLink for FakeWorker {
 
 // ------------------------------------------------------------ the fixture
 
-struct Fx {
+pub(crate) struct Fx {
     dir: TempDir,
-    cluster: Arc<Cluster>,
-    cfg: CoordinatorConfig,
+    pub(crate) cluster: Arc<Cluster>,
+    pub(crate) cfg: CoordinatorConfig,
+    pub(crate) sched: SchedulerConfig,
+    pub(crate) costs: Arc<dyn CostModel>,
 }
 
-fn fx() -> Fx {
+pub(crate) fn fx() -> Fx {
     Fx {
         dir: tempfile::tempdir().unwrap(),
         cluster: Arc::default(),
@@ -487,13 +611,15 @@ fn fx() -> Fx {
             lease_ms: 60_000,
             worker_budget_ms: 10_000,
         },
+        sched: SchedulerConfig::default(),
+        costs: Arc::new(UnknownCosts),
     }
 }
 
 impl Fx {
     /// Start a coordinator on the state directory: the first, or the next
     /// after the one before was dropped.
-    fn open(&self, workers: &[&Arc<FakeWorker>]) -> Coordinator {
+    pub(crate) fn open(&self, workers: &[&Arc<FakeWorker>]) -> Coordinator {
         // The lock of the coordinator before is released when it is dropped,
         // but a child another test forks at that moment holds a copy of the
         // lock file until it execs: wait that moment out.
@@ -506,19 +632,20 @@ impl Fx {
                 other => break other.unwrap(),
             }
         };
-        let c = Coordinator::start(store, self.cfg).unwrap();
+        let sched = Scheduler::new(self.sched, Arc::clone(&self.costs));
+        let c = Coordinator::start_with(store, self.cfg, sched).unwrap();
         for w in workers {
             c.attach(w.id.clone(), Arc::clone(w) as Arc<dyn WorkerLink>);
         }
         c
     }
 
-    fn worker(&self, name: &str, limits: (u32, u32)) -> Arc<FakeWorker> {
+    pub(crate) fn worker(&self, name: &str, limits: (u32, u32)) -> Arc<FakeWorker> {
         FakeWorker::new(name, &self.cluster, limits)
     }
 }
 
-fn spec() -> TaskSpec {
+pub(crate) fn spec() -> TaskSpec {
     TaskSpec {
         plan_digest: Digest::of_bytes(b"plan"),
         manifest_digest: Digest::of_bytes(b"manifest"),
@@ -539,7 +666,7 @@ fn spec() -> TaskSpec {
 }
 
 /// A source the parent holds (a run refers to one).
-fn source(c: &Coordinator) -> SourceId {
+pub(crate) fn source(c: &Coordinator) -> SourceId {
     let id = SourceId::generate();
     c.store()
         .put_source_ref(&id, &Digest::of_bytes(b"manifest"), 1)
@@ -547,7 +674,7 @@ fn source(c: &Coordinator) -> SourceId {
     id
 }
 
-async fn enqueue(c: &Coordinator, n: usize) -> Vec<TaskId> {
+pub(crate) async fn enqueue(c: &Coordinator, n: usize) -> Vec<TaskId> {
     let tasks: Vec<TaskId> = (0..n).map(|_| TaskId::generate()).collect();
     let specs = tasks.iter().map(|t| (t.clone(), spec())).collect();
     c.enqueue(RunId::generate(), source(c), specs)
@@ -556,18 +683,18 @@ async fn enqueue(c: &Coordinator, n: usize) -> Vec<TaskId> {
     tasks
 }
 
-fn attempts(c: &Coordinator, task: &TaskId) -> Vec<AttemptRecord> {
+pub(crate) fn attempts(c: &Coordinator, task: &TaskId) -> Vec<AttemptRecord> {
     c.store().attempts_of_task(task).unwrap()
 }
 
 /// The one attempt of a task.
-fn only(c: &Coordinator, task: &TaskId) -> AttemptRecord {
+pub(crate) fn only(c: &Coordinator, task: &TaskId) -> AttemptRecord {
     let mut all = attempts(c, task);
     assert_eq!(all.len(), 1, "{all:?}");
     all.remove(0)
 }
 
-fn queued(c: &Coordinator) -> Vec<TaskId> {
+pub(crate) fn queued(c: &Coordinator) -> Vec<TaskId> {
     let q = c.store().queued_tasks(100).unwrap();
     q.into_iter().map(|t| t.task_id).collect()
 }
@@ -1352,13 +1479,13 @@ async fn the_same_attempt_with_another_payload_is_refused_for_good() {
 #[tokio::test]
 async fn a_fault_of_the_worker_is_not_a_verdict_on_the_attempt() {
     // Every answer that says nothing about the attempt itself, a conflict
-    // without the reason that names the payload included.
+    // without the reason that names the payload included. (A worker that
+    // keeps answering `BLOCKED` or `PROTOCOL_INCOMPATIBLE` is left for
+    // another one: see the scheduler's tests.)
     for code in [
         ErrorCode::Internal,
         ErrorCode::CommunicationUnknown,
-        ErrorCode::Blocked,
         ErrorCode::NotImplemented,
-        ErrorCode::ProtocolIncompatible,
         ErrorCode::NotFound,
         ErrorCode::Conflict,
     ] {
@@ -1533,13 +1660,17 @@ async fn a_cancel_while_a_retire_is_pending_settles_the_attempt_cancelled() {
 async fn a_worker_that_stalls_does_not_keep_the_leases_of_the_others_from_renewal() {
     let mut f = fx();
     f.cfg.worker_budget_ms = 1_500;
-    // It is asked first (by id), and holds two attempts.
+    // It is asked first (by id), and holds two attempts: the first task
+    // goes to it, the second to the other (which is free), and the third
+    // to it again (both are as busy, and its id is the smaller).
     let stalled = f.worker("w-a", (2, 0));
     let healthy = f.worker("w-b", (2, 0));
     let c = f.open(&[&stalled, &healthy]);
-    let tasks = enqueue(&c, 3).await;
+    let mut tasks = enqueue(&c, 3).await;
     c.tick().await.unwrap();
+    tasks.swap(1, 2);
     for t in &tasks[..2] {
+        assert_eq!(only(&c, t).worker_id, stalled.id);
         stalled.start(&only(&c, t).attempt_id);
     }
     let on_healthy = only(&c, &tasks[2]);
