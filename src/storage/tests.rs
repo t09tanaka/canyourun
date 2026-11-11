@@ -3177,3 +3177,125 @@ fn the_termination_and_the_result_are_one_commit() {
     assert_eq!((fin.won(), fresh), (false, true));
     assert_eq!(result, of(&done(Outcome::Failed)));
 }
+
+/// Take the task's attempt off `w`: placed there, retire asked for with
+/// `reason`, and confirmed.
+fn taken_off(store: &CoordinatorStore, task: &TaskId, w: &str, reason: &str) -> AttemptId {
+    let a = placed(place_on(store, task, w, 1000)).attempt_id;
+    store.begin_retire(&a, reason, 20).unwrap();
+    store.confirm_retire(&a, 21).unwrap();
+    a
+}
+
+#[test]
+fn only_a_confirmed_retire_with_the_given_reason_excludes_its_worker() {
+    let (_d, store, _run, ids) = queue_fx(3);
+    let of = |task: &TaskId, reason: &str| -> Vec<String> {
+        let all = store.excluded_workers(task, reason).unwrap();
+        all.iter().map(|w| w.to_string()).collect()
+    };
+    taken_off(&store, &ids[0], "w-b", "cannot");
+    taken_off(&store, &ids[0], "w-a", "cannot");
+    taken_off(&store, &ids[0], "w-c", "move");
+    assert_eq!(of(&ids[0], "cannot"), ["w-a", "w-b"]);
+    assert_eq!(of(&ids[0], "move"), ["w-c"]);
+    assert_eq!(of(&ids[0], "other"), Vec::<String>::new());
+    // Asked for and not confirmed: the attempt is still there.
+    let asked = placed(place_on(&store, &ids[1], "w-a", 1000)).attempt_id;
+    store.begin_retire(&asked, "cannot", 20).unwrap();
+    assert_eq!(of(&ids[1], "cannot"), Vec::<String>::new());
+    store.confirm_retire(&asked, 21).unwrap();
+    assert_eq!(of(&ids[1], "cannot"), ["w-a"]);
+    // Another task's attempts say nothing about this one.
+    assert_eq!(of(&ids[2], "cannot"), Vec::<String>::new());
+}
+
+#[test]
+fn the_scan_puts_the_tasks_none_of_the_given_workers_may_take_after_the_others() {
+    let (_d, store, _run, ids) = queue_fx(261);
+    // 0..258: taken off w-a for the reason. 258: taken off w-a for another
+    // reason. 259: taken off w-b for the reason. 260: never placed.
+    for task in &ids[..258] {
+        taken_off(&store, task, "w-a", "cannot");
+    }
+    taken_off(&store, &ids[258], "w-a", "move");
+    taken_off(&store, &ids[259], "w-b", "cannot");
+    let scan = |workers: &[&str], reason: &str| -> Vec<TaskId> {
+        let workers: Vec<WorkerId> = workers.iter().map(|w| worker(w)).collect();
+        let q = store.queued_tasks_for(256, &workers, reason).unwrap();
+        assert_eq!(q.len(), 256);
+        q.into_iter().map(|t| t.task_id).collect()
+    };
+    let by_age = ids[..256].to_vec();
+    // Nobody is asked about: by age, as the plain scan.
+    assert_eq!(scan(&[], "cannot"), by_age);
+    let plain = store.queued_tasks(256).unwrap();
+    assert_eq!(
+        plain.into_iter().map(|t| t.task_id).collect::<Vec<_>>(),
+        by_age
+    );
+    // For w-a alone the 258 wait behind the three it may take.
+    let mut behind = ids[258..].to_vec();
+    behind.extend_from_slice(&ids[..253]);
+    assert_eq!(scan(&["w-a"], "cannot"), behind);
+    // Another reason excludes nobody.
+    assert_eq!(scan(&["w-a"], "other"), by_age);
+    // With a worker that may take them they are back in their place: only a
+    // task every one of the workers is excluded for goes behind.
+    assert_eq!(scan(&["w-a", "w-b"], "cannot"), by_age);
+    assert_eq!(scan(&["w-b", "w-c"], "cannot"), by_age);
+    taken_off(&store, &ids[0], "w-b", "cannot");
+    let without_first = ids[1..257].to_vec();
+    assert_eq!(scan(&["w-a", "w-b"], "cannot"), without_first);
+    assert_eq!(scan(&["w-b", "w-a"], "cannot"), without_first);
+    // w-b alone: the first and 259 go behind everything, which is beyond
+    // the scan.
+    assert_eq!(scan(&["w-b"], "cannot"), without_first);
+    // The last place is theirs when there is room for it.
+    let all = store
+        .queued_tasks_for(1000, &[worker("w-b")], "cannot")
+        .unwrap();
+    let tail: Vec<TaskId> = all[259..].iter().map(|t| t.task_id.clone()).collect();
+    assert_eq!(tail, vec![ids[0].clone(), ids[259].clone()]);
+}
+
+#[test]
+fn a_retire_and_its_note_are_written_together_or_not_at_all() {
+    let (_d, store, _run, ids) = queue_fx(2);
+    let a = placed(place_on(&store, &ids[0], "w-a", 9)).attempt_id;
+    let note = json!({"worker": "w-a"});
+    let noted = |a: &AttemptId| store.events_of(a, "noted").unwrap().len();
+    assert!(store
+        .begin_retire_noting(&a, "cannot", Some(("noted", &note)), 20)
+        .unwrap());
+    assert_eq!(noted(&a), 1);
+    assert_eq!(store.events_of(&a, "noted").unwrap()[0].payload, note);
+    assert_eq!(store.events_of(&a, "retire_requested").unwrap().len(), 1);
+    // Asked again: nothing more is written.
+    assert!(!store
+        .begin_retire_noting(&a, "cannot", Some(("noted", &note)), 21)
+        .unwrap());
+    assert_eq!(noted(&a), 1);
+    assert_eq!(store.events_of(&a, "retire_requested").unwrap().len(), 1);
+    assert_eq!(store.retire_tombstone(&a).unwrap(), Some((20, None)));
+    // A retire that was asked for with another reason keeps its reason, and
+    // the note is not written: the worker is not excluded.
+    let b = placed(place_on(&store, &ids[1], "w-a", 9)).attempt_id;
+    store.begin_retire(&b, "move", 20).unwrap();
+    assert!(!store
+        .begin_retire_noting(&b, "cannot", Some(("noted", &note)), 21)
+        .unwrap());
+    assert_eq!(noted(&b), 0);
+    store.confirm_retire(&b, 22).unwrap();
+    assert!(store
+        .excluded_workers(&ids[1], "cannot")
+        .unwrap()
+        .is_empty());
+    // Without a note it is the plain retire.
+    assert!(!store.begin_retire_noting(&b, "move", None, 23).unwrap());
+    // An attempt nobody knows.
+    let e = store
+        .begin_retire_noting(&AttemptId::generate(), "cannot", None, 1)
+        .unwrap_err();
+    assert_eq!(e.code(), ErrorCode::NotFound);
+}

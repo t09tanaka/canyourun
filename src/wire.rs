@@ -555,6 +555,15 @@ pub enum WaitReason {
     SharedBuilder,
 }
 
+/// Numbers that rest on a fallback runtime (the target has no history, or
+/// work ahead of it has none). They order candidate workers and are never
+/// shown as a time (spec chapter 9 "不確実な予測").
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ForecastRanking {
+    pub start_in_ms: Option<u64>,
+    pub finish_in_ms: Option<u64>,
+}
+
 /// The forecast for the requested workload on this worker.
 ///
 /// A value that cannot be computed is `null`, and `null_reasons` maps the field
@@ -581,6 +590,12 @@ pub struct ForecastTarget {
     pub assumptions: Vec<String>,
     #[serde(default)]
     pub null_reasons: BTreeMap<ForecastField, Uncertainty>,
+    /// Present when the times above are missing only because a runtime is
+    /// not measured: what the fallback gives, for ordering workers. Absent
+    /// when the worker cannot tell even that (an answer without it and
+    /// without `finish_in_ms` says nothing about how free the worker is).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ranking: Option<ForecastRanking>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1717,6 +1732,10 @@ mod tests {
                 (ForecastField::ExecutionMs, Uncertainty::NoHistory),
                 (ForecastField::FinishInMs, Uncertainty::Overrun),
             ]),
+            ranking: Some(ForecastRanking {
+                start_in_ms: Some(30_000),
+                finish_in_ms: None,
+            }),
         }
     }
 
@@ -2555,9 +2574,16 @@ mod tests {
         assert!(serde_json::from_str::<WaitReason>("\"memory\"").is_err());
         // optional target fields default; wait_reason is omitted when None
         let mut t = target();
+        assert_eq!(
+            serde_json::to_value(&t).unwrap()["ranking"],
+            json!({"start_in_ms": 30_000, "finish_in_ms": null})
+        );
         t.wait_reason = None;
+        t.ranking = None;
         let v = serde_json::to_value(&t).unwrap();
         assert!(v.get("wait_reason").is_none());
+        // An answer without a ranking is what it was before the field existed.
+        assert!(v.get("ranking").is_none());
         let minimal = json!({
             "plan_digest": dg("plan"), "ready_in_ms": null, "queue_wait_after_ready_ms": null,
             "execution_ms": null, "finish_in_ms": null, "confidence": "low",
@@ -2566,6 +2592,7 @@ mod tests {
         let t: ForecastTarget = serde_json::from_value(minimal).unwrap();
         assert!(!t.overrun && t.history_count == 0 && t.assumptions.is_empty());
         assert!(t.null_reasons.is_empty() && t.wait_reason.is_none());
+        assert_eq!(t.ranking, None);
     }
 
     #[test]

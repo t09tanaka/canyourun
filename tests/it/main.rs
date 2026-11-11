@@ -12,6 +12,7 @@ mod coordinator;
 mod forecast;
 mod not_implemented;
 mod protocol;
+mod scheduler;
 mod secrets;
 mod source_capture;
 mod stop;

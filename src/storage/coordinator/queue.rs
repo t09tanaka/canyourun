@@ -17,6 +17,7 @@ use crate::storage::policy::state_path;
 use crate::storage::{to_i64, to_u64, Result, StorageError};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::Value;
+use std::collections::BTreeSet;
 
 /// The most tasks one `enqueue` accepts.
 pub const MAX_TASKS_PER_RUN: usize = 10_000;
@@ -29,6 +30,11 @@ const QUEUED: &str = "t.cancel_requested_at_ms IS NULL
 const QUEUED_V1: &str =
     "EXISTS (SELECT 1 FROM run r WHERE r.run_id = t.run_id AND r.closed_at_ms IS NULL)
     AND NOT EXISTS (SELECT 1 FROM attempt a WHERE a.task_id = t.task_id AND a.retired = 0)";
+
+/// The attempts (`a`) that leave their worker out for their task, given the
+/// reason of their tombstone: the ones whose retire was confirmed. The scan
+/// of the queue and the placement of one task read the same condition.
+const EXCLUDES: &str = "a.retired = 1";
 
 /// A task that may be placed now.
 #[derive(Debug, Clone, PartialEq)]
@@ -209,13 +215,44 @@ impl CoordinatorStore {
     /// The tasks that may be placed, oldest first (insertion order within
     /// the same millisecond).
     pub fn queued_tasks(&self, limit: u32) -> Result<Vec<QueuedTask>> {
+        self.queued_tasks_for(limit, &[], "")
+    }
+
+    /// [`Self::queued_tasks`] for a set of workers: the tasks that every one
+    /// of `workers` is excluded for (see [`Self::excluded_workers`]) come
+    /// after all the others, so that tasks nobody here can take never fill
+    /// the scan in front of one that can be placed. With no workers the
+    /// order is by age alone.
+    pub fn queued_tasks_for(
+        &self,
+        limit: u32,
+        workers: &[WorkerId],
+        retire_reason: &str,
+    ) -> Result<Vec<QueuedTask>> {
+        use rusqlite::types::Value as Sql;
         let queued = if self.task_cancel { QUEUED } else { QUEUED_V1 };
+        let mut args = vec![Sql::Integer(i64::from(limit))];
+        let stranded = if workers.is_empty() {
+            String::new()
+        } else {
+            args.push(Sql::Text(retire_reason.to_string()));
+            args.push(Sql::Integer(to_i64(workers.len() as u64)?));
+            args.extend(workers.iter().map(|w| Sql::Text(w.to_string())));
+            let marks: Vec<String> = (0..workers.len()).map(|i| format!("?{}", i + 4)).collect();
+            let marks = marks.join(",");
+            format!(
+                "(SELECT COUNT(DISTINCT a.worker_id) FROM attempt a
+                  JOIN retire_tombstone rt ON rt.attempt_id = a.attempt_id
+                  WHERE a.task_id = t.task_id AND {EXCLUDES}
+                    AND rt.reason = ?2 AND a.worker_id IN ({marks})) >= ?3, "
+            )
+        };
         self.db.call(move |c| {
             let mut s = c.prepare(&format!(
                 "SELECT t.task_id, t.run_id, t.spec_json, t.created_at_ms FROM task t
-                 WHERE {queued} ORDER BY t.created_at_ms, t.rowid LIMIT ?1"
+                 WHERE {queued} ORDER BY {stranded}t.created_at_ms, t.rowid LIMIT ?1"
             ))?;
-            let rows = s.query_map([limit], |r| {
+            let rows = s.query_map(rusqlite::params_from_iter(args), |r| {
                 Ok((
                     r.get::<_, String>(0)?,
                     r.get::<_, String>(1)?,
@@ -612,6 +649,31 @@ impl CoordinatorStore {
         })
     }
 
+    /// The workers a task is not placed on again: those an attempt of it was
+    /// taken off (its retire confirmed) by a retire asked for with
+    /// `retire_reason`. The reason of the tombstone decides, nothing else: a
+    /// retire for another reason excludes nobody.
+    pub fn excluded_workers(
+        &self,
+        task_id: &TaskId,
+        retire_reason: &str,
+    ) -> Result<BTreeSet<WorkerId>> {
+        let (task, reason) = (task_id.to_string(), retire_reason.to_string());
+        self.db.call(move |c| {
+            let mut s = c.prepare(&format!(
+                "SELECT DISTINCT a.worker_id FROM attempt a
+                 JOIN retire_tombstone rt ON rt.attempt_id = a.attempt_id
+                 WHERE a.task_id = ?1 AND {EXCLUDES} AND rt.reason = ?2"
+            ))?;
+            let rows = s.query_map([&task, &reason], |r| r.get::<_, String>(0))?;
+            let mut out = BTreeSet::new();
+            for row in rows {
+                out.insert(id("worker_id", WorkerId::parse(&row?))?);
+            }
+            Ok(out)
+        })
+    }
+
     /// Every attempt of a task, by generation.
     pub fn attempts_of_task(&self, task_id: &TaskId) -> Result<Vec<AttemptRecord>> {
         let task = task_id.to_string();
@@ -621,6 +683,25 @@ impl CoordinatorStore {
             ))?;
             let rows = s.query_map([&task], |r| Ok(attempt_from_row(r)))?;
             rows.map(|r| r?).collect()
+        })
+    }
+
+    /// What was recorded with the placement of an attempt (the payload that
+    /// was decided, and the decision), acknowledged or not.
+    pub fn placement_demand(&self, attempt_id: &AttemptId) -> Result<Option<Value>> {
+        let aid = attempt_id.to_string();
+        self.db.call(move |c| {
+            let demand: Option<String> = c
+                .query_row(
+                    "SELECT demand_json FROM placement WHERE attempt_id = ?1
+                     ORDER BY placement_id DESC LIMIT 1",
+                    [&aid],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            demand
+                .map(|d| from_json("placement demand", &d))
+                .transpose()
         })
     }
 

@@ -635,7 +635,24 @@ impl CoordinatorStore {
     /// Persist the retire tombstone (idempotent). Do this before asking the
     /// worker to retire, and before creating a new attempt elsewhere.
     pub fn begin_retire(&self, attempt_id: &AttemptId, reason: &str, at_ms: u64) -> Result<()> {
+        self.begin_retire_noting(attempt_id, reason, None, at_ms)
+            .map(|_| ())
+    }
+
+    /// [`Self::begin_retire`], with an event `note` (kind, payload) on the
+    /// attempt that is written in the same transaction as the tombstone: it
+    /// is there exactly when this call wrote the tombstone with `reason`.
+    /// Returns whether it did (`false`: a retire was already asked for, with
+    /// whatever reason it had; nothing was written).
+    pub fn begin_retire_noting(
+        &self,
+        attempt_id: &AttemptId,
+        reason: &str,
+        note: Option<(&str, &Value)>,
+        at_ms: u64,
+    ) -> Result<bool> {
         let (aid, reason) = (attempt_id.to_string(), reason.to_string());
+        let note = note.map(|(kind, payload)| (kind.to_string(), payload.clone()));
         self.db.write(move |tx| {
             let worker: String = tx
                 .query_row(
@@ -660,8 +677,11 @@ impl CoordinatorStore {
                     &Value::Null,
                     at_ms,
                 )?;
+                if let Some((kind, payload)) = &note {
+                    common::append_event(tx, run.as_deref(), Some(&aid), kind, payload, at_ms)?;
+                }
             }
-            Ok(())
+            Ok(n == 1)
         })
     }
 

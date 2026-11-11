@@ -30,19 +30,22 @@ pub use link::{ClientLink, LinkError, WorkerLink};
 
 use crate::error::{ApiError, ConflictReason, ErrorCode};
 use crate::ids::{
-    AttemptId, CoordinatorEpoch, Generation, ManifestDigest, PlanDigest, RequestId, RunId,
-    SourceId, TaskId, WorkerId,
+    AgentEpoch, AttemptId, CoordinatorEpoch, Generation, ManifestDigest, PlanDigest, RequestId,
+    RunId, SourceId, TaskId, WorkerBootId, WorkerId,
 };
 use crate::platform::wall_ms;
+use crate::scheduler::decide::{self, Asked, Candidate, Decision, Excluded, Exclusion, Outlook};
+use crate::scheduler::{self, Scheduler};
 use crate::state::{AttemptState, Observation, Outcome, Termination};
 use crate::storage::{
-    AttemptRecord, CoordinatorStore, LiveAttempt, PlaceInput, PlaceOutcome, QueuedTask, RetireEnd,
-    Seen, StorageError,
+    AttemptRecord, CoordinatorStore, LiveAttempt, PlaceInput, PlaceOutcome, Placement, QueuedTask,
+    RetireEnd, Seen, StorageError, WorkerLoad,
 };
 use crate::wire::{
     payload_hash, ArtifactDecl, AttemptPayload, AttemptStatus, CancelAttemptRequest, CommandSpec,
-    GetAttemptRequest, InspectRequest, InspectResponse, RenewLeaseRequest, Request, Response,
-    RetireAttemptRequest, RetireStatus, SchemaVersion, SubmitAttemptRequest,
+    ForecastRequest, ForecastResponse, GetAttemptRequest, InspectRequest, InspectResponse,
+    RenewLeaseRequest, Request, Response, RetireAttemptRequest, RetireStatus, SchemaVersion,
+    SubmitAttemptRequest,
 };
 use link::Budgeted;
 use policy::{Answer, Ended, Facts, Limits, Refusal, RetireVerdict, Step};
@@ -175,12 +178,66 @@ pub struct TickReport {
     pub settled: Vec<AttemptId>,
 }
 
+impl TickReport {
+    fn absorb(&mut self, part: TickReport) {
+        self.placed.extend(part.placed);
+        self.unknown.extend(part.unknown);
+        self.retired.extend(part.retired);
+        self.settled.extend(part.settled);
+    }
+}
+
 /// A worker that answered `inspect` in this tick.
 struct Reached {
     worker_id: WorkerId,
     link: Arc<dyn WorkerLink>,
     limits: Limits,
     draining: bool,
+    /// Who answered: a forecast from another boot or agent is not used.
+    boot_id: WorkerBootId,
+    agent_epoch: AgentEpoch,
+}
+
+/// The workers of one tick's placements: those a task may still go to, and
+/// those that are out for the rest of the tick, with the reason.
+struct Round {
+    /// Every worker this tick looked at.
+    known: BTreeSet<WorkerId>,
+    open: Vec<Reached>,
+    out: BTreeMap<WorkerId, Exclusion>,
+    deadline: Instant,
+}
+
+impl Round {
+    fn admit(&mut self, mut worker: Reached) {
+        if worker.draining {
+            self.out.insert(worker.worker_id, Exclusion::Draining);
+            return;
+        }
+        worker.link = Arc::new(Budgeted {
+            inner: worker.link,
+            deadline: self.deadline,
+        });
+        self.open.push(worker);
+        self.open.sort_by(|a, b| a.worker_id.cmp(&b.worker_id));
+    }
+
+    fn close(&mut self, worker_id: &WorkerId, why: Exclusion) {
+        self.open.retain(|w| &w.worker_id != worker_id);
+        self.out.insert(worker_id.clone(), why);
+    }
+}
+
+/// What came of asking one worker for a forecast.
+enum Forecast {
+    /// The answer, and when the question was sent.
+    Answer(Instant, Box<ForecastResponse>),
+    /// The worker answered with an error: it says nothing about its queue.
+    Refused,
+    /// No answer in time.
+    Silent,
+    /// A newer coordinator took over.
+    Fenced,
 }
 
 /// What became of an attempt that was just placed.
@@ -233,6 +290,7 @@ pub struct Coordinator {
     /// The queued tasks no payload could be made for, as this process
     /// already recorded.
     unplaceable: Mutex<BTreeSet<TaskId>>,
+    sched: Scheduler,
 }
 
 fn cancelled() -> Termination {
@@ -252,6 +310,15 @@ impl Coordinator {
     /// epoch). Nothing is known first-hand after a start: every attempt that
     /// still needs attention is `reconciling` until its worker was asked.
     pub fn start(store: CoordinatorStore, cfg: CoordinatorConfig) -> Result<Coordinator> {
+        Coordinator::start_with(store, cfg, Scheduler::default())
+    }
+
+    /// [`Coordinator::start`] with the scheduler's settings and estimates.
+    pub fn start_with(
+        store: CoordinatorStore,
+        cfg: CoordinatorConfig,
+        sched: Scheduler,
+    ) -> Result<Coordinator> {
         store.mark_reconciling()?;
         Ok(Coordinator {
             store: Arc::new(store),
@@ -263,7 +330,13 @@ impl Coordinator {
             lease_seq: AtomicU64::new(0),
             fenced: AtomicBool::new(false),
             unplaceable: Mutex::default(),
+            sched,
         })
+    }
+
+    /// The scheduler: priorities, and why a task waits.
+    pub fn scheduler(&self) -> &Scheduler {
+        &self.sched
     }
 
     pub fn store(&self) -> &CoordinatorStore {
@@ -304,7 +377,8 @@ impl Coordinator {
     }
 
     /// A worker is reachable through `link` from now on (its `hello` was
-    /// checked by whoever connected). Replaces an earlier link.
+    /// checked by whoever connected). Replaces an earlier link. The next
+    /// placement decision counts it in, also within a running tick.
     pub fn attach(&self, worker_id: WorkerId, link: Arc<dyn WorkerLink>) {
         let mut workers = self.workers.lock().unwrap_or_else(|e| e.into_inner());
         workers.insert(worker_id, link);
@@ -383,6 +457,7 @@ impl Coordinator {
                 .map(|(w, l)| (w.clone(), Arc::clone(l)))
                 .collect()
         };
+        let known: BTreeSet<WorkerId> = attached.iter().map(|(w, _)| w.clone()).collect();
         let deadline = self.deadline();
         let follows: Vec<Pin<Box<dyn Future<Output = Followed> + Send + '_>>> = attached
             .into_iter()
@@ -397,10 +472,7 @@ impl Coordinator {
         for followed in join_all(follows).await {
             match followed {
                 Ok((worker, part)) => {
-                    report.placed.extend(part.placed);
-                    report.unknown.extend(part.unknown);
-                    report.retired.extend(part.retired);
-                    report.settled.extend(part.settled);
+                    report.absorb(part);
                     reached.extend(worker);
                 }
                 Err(e) => failed = failed.or(Some(e)),
@@ -409,7 +481,7 @@ impl Coordinator {
         if let Some(e) = failed {
             return Err(e);
         }
-        self.dispatch(reached, &mut report).await?;
+        self.dispatch(known, reached, &mut report).await?;
         Ok(report)
     }
 
@@ -456,6 +528,8 @@ impl Coordinator {
                 prefetch_per_worker: inspected.prefetch_per_worker,
             }),
             draining: inspected.draining,
+            boot_id: inspected.worker_boot_id,
+            agent_epoch: inspected.agent_epoch,
         };
         Ok((Some(reached), report))
     }
@@ -494,22 +568,30 @@ impl Coordinator {
         .await
     }
 
-    /// Record why a worker did not take an attempt, once per error code, so
-    /// that an attempt which waits on its worker shows what it waits for.
+    /// Record why a worker did not take an attempt, once per answer (the
+    /// error code and, for `BLOCKED`, its reason), so that an attempt which
+    /// waits on its worker shows what it waits for. Returns whether the
+    /// worker gave this answer for the attempt before.
     async fn note_refusal(
         &self,
         attempt_id: &AttemptId,
         kind: &'static str,
         e: &ApiError,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let a = attempt_id.clone();
-        let code = e.code.to_string();
-        let payload = json!({"code": code, "message": e.message});
-        self.db(move |s| {
-            s.append_events_unseen(None, &a, kind, "code", &[(code, payload)], wall_ms())
-        })
-        .await?;
-        Ok(())
+        let answer = decide::refusal_key(e.code, e.blocked_reason);
+        let payload = json!({
+            "code": e.code.to_string(),
+            "reason": e.blocked_reason,
+            "answer": answer,
+            "message": e.message,
+        });
+        let appended = self
+            .db(move |s| {
+                s.append_events_unseen(None, &a, kind, "answer", &[(answer, payload)], wall_ms())
+            })
+            .await?;
+        Ok(appended == 0)
     }
 
     /// Ask the worker for the attempt. A status that is not about this
@@ -663,8 +745,32 @@ impl Coordinator {
                         Ok(false)
                     }
                     Refusal::Later => {
-                        self.note_refusal(&a.attempt_id, "submit_deferred", &e)
+                        let before = self
+                            .note_refusal(&a.attempt_id, "submit_deferred", &e)
                             .await?;
+                        if decide::moves_elsewhere(e.code, e.blocked_reason, before) {
+                            // The worker keeps refusing for a reason of its
+                            // own: take the attempt off it. The task is free
+                            // once the worker confirmed, and is then placed
+                            // on another worker. The tombstone's reason is
+                            // what leaves this worker out; why is written
+                            // with it, in the same transaction.
+                            let excluded = json!({
+                                "worker": a.worker_id.to_string(),
+                                "code": e.code.to_string(),
+                                "reason": e.blocked_reason,
+                            });
+                            let id = a.attempt_id.clone();
+                            self.db(move |s| {
+                                s.begin_retire_noting(
+                                    &id,
+                                    scheduler::REASON_WORKER_CANNOT_RUN,
+                                    Some((scheduler::EVENT_WORKER_EXCLUDED, &excluded)),
+                                    wall_ms(),
+                                )
+                            })
+                            .await?;
+                        }
                         self.observe(&a.attempt_id, Observation::Known).await?;
                         Ok(false)
                     }
@@ -823,77 +929,333 @@ impl Coordinator {
         }
     }
 
-    /// Place queued tasks, oldest first, each on the first worker (by id)
-    /// that answered in this tick, is not draining and has room. The commit
-    /// counts the worker's load again; the submit follows the commit, and a
-    /// worker that does not take it is left alone for the rest of the tick.
-    async fn dispatch(&self, reached: Vec<Reached>, report: &mut TickReport) -> Result<()> {
-        let deadline = self.deadline();
-        let mut open: Vec<Reached> = reached
-            .into_iter()
-            .filter(|w| !w.draining)
-            .map(|mut w| {
-                w.link = Arc::new(Budgeted {
-                    inner: w.link,
-                    deadline,
-                });
-                w
-            })
-            .collect();
-        if open.is_empty() {
-            return Ok(());
+    /// Place queued tasks, oldest first. For each task the workers that
+    /// answered in this tick, are not draining and have room are asked for
+    /// a forecast side by side, and the scheduler's rules choose among them
+    /// (`scheduler::decide`). The commit counts the winner's load again and
+    /// records the decision with the placement; the submit follows the
+    /// commit, and a worker that does not take it is left alone for the
+    /// rest of the tick.
+    async fn dispatch(
+        &self,
+        known: BTreeSet<WorkerId>,
+        reached: Vec<Reached>,
+        report: &mut TickReport,
+    ) -> Result<()> {
+        let mut round = Round {
+            out: BTreeMap::new(),
+            open: Vec::new(),
+            known,
+            deadline: self.deadline(),
+        };
+        let answered: BTreeSet<WorkerId> = reached.iter().map(|w| w.worker_id.clone()).collect();
+        for missing in round.known.difference(&answered) {
+            round.out.insert(missing.clone(), Exclusion::Unreached);
         }
-        let queued = self.db(|s| s.queued_tasks(DISPATCH_SCAN)).await?;
+        for worker in reached {
+            round.admit(worker);
+        }
+        // Tasks every attached worker is excluded for come last: however
+        // many of them wait, they do not fill the scan in front of a task
+        // that can be placed. A worker that is attached later is not
+        // excluded for them, which puts them back in their place by age.
+        let attached: Vec<WorkerId> = round.known.iter().cloned().collect();
+        let queued = self
+            .db(move |s| {
+                s.queued_tasks_for(
+                    DISPATCH_SCAN,
+                    &attached,
+                    scheduler::REASON_WORKER_CANNOT_RUN,
+                )
+            })
+            .await?;
+        if queued.len() < DISPATCH_SCAN as usize {
+            // The whole queue was read: a task that is not in it waits no
+            // more.
+            let ids = queued.iter().map(|t| t.task_id.clone()).collect();
+            self.sched.keep_waiting(&ids);
+        }
         for task in queued {
-            while let Some(worker) = open.first() {
-                let attempt_id = AttemptId::generate();
-                let (t, w, a) = (
-                    task.task_id.clone(),
-                    worker.worker_id.clone(),
-                    attempt_id.clone(),
-                );
-                let (limits, lease_ms) = (worker.limits, self.cfg.lease_ms);
-                let outcome = self
-                    .db(move |s| {
-                        s.place(
-                            &t,
-                            &w,
-                            &a,
-                            move |load| policy::has_room(load, limits),
-                            move |input| demand_of(input, lease_ms),
-                            wall_ms(),
+            self.join_newcomers(&mut round, report).await?;
+            self.place_one(&task, &mut round, report).await?;
+            if round.open.is_empty() || Instant::now() >= round.deadline {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    /// Workers that were attached since this tick began are looked at like
+    /// the others (their attempts are followed first), so that the next
+    /// decision counts them in.
+    async fn join_newcomers(&self, round: &mut Round, report: &mut TickReport) -> Result<()> {
+        let fresh: Vec<(WorkerId, Arc<dyn WorkerLink>)> = {
+            let workers = self.workers.lock().unwrap_or_else(|e| e.into_inner());
+            workers
+                .iter()
+                .filter(|(w, _)| !round.known.contains(*w))
+                .map(|(w, l)| (w.clone(), Arc::clone(l)))
+                .collect()
+        };
+        for (worker_id, link) in fresh {
+            round.known.insert(worker_id.clone());
+            let (reached, part) = self.follow(worker_id.clone(), link, round.deadline).await?;
+            report.absorb(part);
+            match reached {
+                Some(worker) => round.admit(worker),
+                None => {
+                    round.out.insert(worker_id, Exclusion::Unreached);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The workers a task is not placed on again: those an attempt of it was
+    /// taken off because they kept refusing it.
+    async fn refused_by(&self, task_id: &TaskId) -> Result<BTreeSet<WorkerId>> {
+        let task = task_id.clone();
+        self.db(move |s| s.excluded_workers(&task, scheduler::REASON_WORKER_CANNOT_RUN))
+            .await
+    }
+
+    /// Ask one worker what the task would take there, on top of what the
+    /// parent placed there and the worker has not acknowledged.
+    async fn forecast(
+        &self,
+        worker: &Reached,
+        attempt_id: &AttemptId,
+        spec: &TaskSpec,
+        costs: &decide::Costs,
+        unacked: &[Placement],
+    ) -> Forecast {
+        let request = Request::Forecast(ForecastRequest {
+            schema_version: SchemaVersion::CURRENT,
+            request_id: RequestId::generate(),
+            coordinator_epoch: self.epoch(),
+            workload: scheduler::workload_of(
+                attempt_id,
+                &spec.plan_digest,
+                &spec.commands,
+                decide::ready_delay_ms(costs),
+            ),
+            pending: scheduler::pending_of(unacked, &worker.worker_id),
+        });
+        let wait = Duration::from_millis(self.sched.cfg.forecast_wait_ms);
+        // The age of the answer counts from before the question left.
+        let sent = Instant::now();
+        match tokio::time::timeout(wait, worker.link.call(request)).await {
+            Ok(Ok(Response::Forecast(answer))) => Forecast::Answer(sent, Box::new(answer)),
+            Ok(Err(LinkError::Remote(e))) if e.code == ErrorCode::StaleEpoch => Forecast::Fenced,
+            Ok(Err(LinkError::Remote(_))) => Forecast::Refused,
+            _ => Forecast::Silent,
+        }
+    }
+
+    /// Decide where one task goes, commit that, and send it.
+    async fn place_one(
+        &self,
+        task: &QueuedTask,
+        round: &mut Round,
+        report: &mut TickReport,
+    ) -> Result<()> {
+        let spec: TaskSpec = match serde_json::from_value(task.spec.clone()) {
+            Ok(spec) => spec,
+            // This task only; the ones behind it are placed.
+            Err(e) => return self.note_unplaceable(task, format!("task spec: {e}")).await,
+        };
+        let refused = self.refused_by(&task.task_id).await?;
+        loop {
+            // Who has room, counted from the parent's own record.
+            let ids: Vec<WorkerId> = round.open.iter().map(|w| w.worker_id.clone()).collect();
+            let (loads, unacked) = self
+                .db(move |s| {
+                    let mut loads: BTreeMap<WorkerId, WorkerLoad> = BTreeMap::new();
+                    for w in ids {
+                        let load = s.worker_load(&w)?;
+                        loads.insert(w, load);
+                    }
+                    Ok((loads, s.unacked_demand()?))
+                })
+                .await?;
+            let full: Vec<WorkerId> = round
+                .open
+                .iter()
+                .filter(|w| !policy::has_room(loads[&w.worker_id], w.limits))
+                .map(|w| w.worker_id.clone())
+                .collect();
+            for worker_id in &full {
+                round.close(worker_id, Exclusion::Full);
+            }
+            let mut excluded: Vec<Excluded> = round
+                .out
+                .iter()
+                .map(|(w, why)| Excluded {
+                    worker_id: w.clone(),
+                    why: *why,
+                })
+                .collect();
+            let (asked, left_out): (Vec<&Reached>, Vec<&Reached>) = round
+                .open
+                .iter()
+                .partition(|w| !refused.contains(&w.worker_id));
+            excluded.extend(left_out.into_iter().map(|w| Excluded {
+                worker_id: w.worker_id.clone(),
+                why: Exclusion::RefusedTask,
+            }));
+            let mut costs: Vec<decide::Costs> = asked
+                .iter()
+                .map(|w| self.sched.costs(&w.worker_id, task))
+                .collect();
+            decide::fill_costs(&mut costs);
+            let attempt_id = AttemptId::generate();
+            let questions: Vec<Pin<Box<dyn Future<Output = Forecast> + Send + '_>>> = asked
+                .iter()
+                .zip(&costs)
+                .map(|(w, c)| {
+                    Box::pin(self.forecast(w, &attempt_id, &spec, c, &unacked))
+                        as Pin<Box<dyn Future<Output = Forecast> + Send + '_>>
+                })
+                .collect();
+            let answers = join_all(questions).await;
+            let now = Instant::now();
+            let ttl = self.sched.cfg.rules.forecast_ttl_ms;
+            let mut candidates = Vec::new();
+            let mut silent = Vec::new();
+            for ((w, c), answer) in asked.iter().zip(&costs).zip(answers) {
+                let outlook = match answer {
+                    Forecast::Fenced => return Err(self.fence()),
+                    Forecast::Silent => {
+                        silent.push(w.worker_id.clone());
+                        continue;
+                    }
+                    Forecast::Refused => Outlook::unusable(decide::Unusable::Refused),
+                    Forecast::Answer(sent, answer) => {
+                        let age = now.saturating_duration_since(sent).as_millis();
+                        let asked = Asked {
+                            worker_id: &w.worker_id,
+                            plan_digest: &spec.plan_digest,
+                            boot_id: &w.boot_id,
+                            agent_epoch: w.agent_epoch,
+                        };
+                        decide::outlook_of(
+                            &asked,
+                            &answer,
+                            u64::try_from(age).unwrap_or(u64::MAX),
+                            ttl,
                         )
-                    })
-                    .await?;
-                match outcome {
-                    PlaceOutcome::WorkerFull(_) => {
-                        open.remove(0);
                     }
-                    PlaceOutcome::NotQueued => break,
-                    PlaceOutcome::Unbuildable(why) => {
-                        // This task only; the ones behind it are placed.
-                        self.note_unplaceable(&task, why).await?;
-                        break;
-                    }
-                    PlaceOutcome::Placed(_) => {
-                        report.placed.push(attempt_id.clone());
+                };
+                let load = loads[&w.worker_id];
+                candidates.push(Candidate {
+                    worker_id: w.worker_id.clone(),
+                    priority: self.sched.priority_of(&w.worker_id),
+                    load: load.active.saturating_add(load.pending),
+                    costs: *c,
+                    outlook,
+                });
+            }
+            for worker_id in &silent {
+                // It gets no more questions in this tick: the others do not
+                // wait for it again.
+                round.close(worker_id, Exclusion::NoForecast);
+                excluded.push(Excluded {
+                    worker_id: worker_id.clone(),
+                    why: Exclusion::NoForecast,
+                });
+            }
+            let decision = decide::decide(candidates, excluded, self.sched.cfg.rules);
+            let Some(winner) = decision.winner.clone() else {
+                return self.note_waiting(task, &decision).await;
+            };
+            let Some(limits) = round
+                .open
+                .iter()
+                .find(|w| w.worker_id == winner)
+                .map(|w| w.limits)
+            else {
+                return Ok(());
+            };
+            let (t, w, a) = (task.task_id.clone(), winner.clone(), attempt_id.clone());
+            let lease_ms = self.cfg.lease_ms;
+            let record = json!({
+                "decision": serde_json::to_value(&decision)
+                    .map_err(|e| CoordinatorError::Invalid(e.to_string()))?,
+                "decision_seq": self.sched.next_seq(),
+            });
+            let outcome = self
+                .db(move |s| {
+                    s.place(
+                        &t,
+                        &w,
+                        &a,
+                        move |load| policy::has_room(load, limits),
+                        move |input| {
+                            let (hash, mut demand) = demand_of(input, lease_ms)?;
+                            demand["decision"] = record["decision"].clone();
+                            demand["decision_seq"] = record["decision_seq"].clone();
+                            Ok((hash, demand))
+                        },
+                        wall_ms(),
+                    )
+                })
+                .await?;
+            match outcome {
+                // Counted again in the commit, it has no room after all:
+                // decide once more without it.
+                PlaceOutcome::WorkerFull(_) => round.close(&winner, Exclusion::Full),
+                PlaceOutcome::NotQueued => return Ok(()),
+                PlaceOutcome::Unbuildable(why) => {
+                    // This task only; the ones behind it are placed.
+                    return self.note_unplaceable(task, why).await;
+                }
+                PlaceOutcome::Placed(_) => {
+                    self.sched.clear_waiting(&task.task_id);
+                    report.placed.push(attempt_id.clone());
+                    let link = round
+                        .open
+                        .iter()
+                        .find(|w| w.worker_id == winner)
+                        .map(|w| Arc::clone(&w.link));
+                    if let Some(link) = link {
                         let sent = self
-                            .send_placed(&worker.worker_id, &*worker.link, &attempt_id, report)
+                            .send_placed(&winner, &*link, &attempt_id, report)
                             .await?;
                         if sent == Sent::NotTaken {
                             // A worker that did not take this one gets no
                             // more in this tick: what is placed there cannot
                             // move until it answers.
-                            open.remove(0);
+                            round.close(&winner, Exclusion::NotTaking);
                         }
-                        break;
                     }
+                    return Ok(());
                 }
             }
-            if open.is_empty() {
-                break;
-            }
         }
+    }
+
+    /// No worker could be chosen for a task: keep why, and record it on the
+    /// run when it is news.
+    async fn note_waiting(&self, task: &QueuedTask, decision: &Decision) -> Result<()> {
+        if !self.sched.note_waiting(&task.task_id, decision) {
+            return Ok(());
+        }
+        let run = task.run_id.clone();
+        let payload = json!({
+            "task": task.task_id.to_string(),
+            "decision": serde_json::to_value(decision)
+                .map_err(|e| CoordinatorError::Invalid(e.to_string()))?,
+        });
+        self.db(move |s| {
+            s.append_event(
+                Some(&run),
+                None,
+                scheduler::EVENT_TASK_WAITING,
+                &payload,
+                wall_ms(),
+            )
+        })
+        .await?;
         Ok(())
     }
 

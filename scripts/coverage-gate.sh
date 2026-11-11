@@ -55,6 +55,7 @@ want = {
     "src/platform/process_read.rs",
     "src/coordinator/policy.rs",
     "src/results/plan.rs",
+    "src/scheduler/decide.rs",
 }
 seen = set()
 bad = []
