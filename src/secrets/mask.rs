@@ -86,6 +86,22 @@ impl Masker {
         out
     }
 
+    /// Whether any pattern occurs in `hay`.
+    pub fn contains(&self, hay: &[u8]) -> bool {
+        self.patterns
+            .iter()
+            .any(|p| memchr::memmem::find(hay, p).is_some())
+    }
+
+    /// Looks for the patterns in bytes that arrive in pieces, changing
+    /// nothing.
+    pub fn finder(&self) -> StreamFinder {
+        StreamFinder {
+            masker: self.clone(),
+            held: Vec::new(),
+        }
+    }
+
     pub fn stream(&self) -> StreamMasker {
         self.stream_limited(MAX_HELD_BYTES)
     }
@@ -183,6 +199,35 @@ impl StreamMasker {
     /// The end of the input: release everything that is held.
     pub fn finish(self) -> Vec<u8> {
         self.masker.mask(&self.held)
+    }
+}
+
+/// Tells whether a pattern occurs in bytes arriving in pieces (a file read
+/// in chunks), without keeping them: only the last `longest pattern - 1`
+/// bytes stay between two pieces, so an occurrence cut by any split of the
+/// input is found by the piece that completes it. What a transformed copy
+/// (encoded, compressed, split by whoever wrote it) holds is not recognised,
+/// like in [`StreamMasker`].
+#[derive(Clone)]
+pub struct StreamFinder {
+    masker: Masker,
+    held: Vec<u8>,
+}
+
+impl StreamFinder {
+    /// Bytes kept from the pieces so far (for a bound check).
+    pub fn pending(&self) -> usize {
+        self.held.len()
+    }
+
+    /// Feed the next bytes; whether a pattern ends in them.
+    pub fn push(&mut self, chunk: &[u8]) -> bool {
+        self.held.extend_from_slice(chunk);
+        let found = self.masker.contains(&self.held);
+        let keep = self.masker.longest.saturating_sub(1);
+        let cut = self.held.len().saturating_sub(keep);
+        self.held.drain(..cut);
+        found
     }
 }
 
@@ -555,5 +600,80 @@ mod tests {
         assert_eq!(out, b"aaaaaaaaaaaaaaaaaaaa ");
         assert_eq!(s.pending(), 12);
         assert_eq!(s.finish(), b"***");
+    }
+    fn found_in_pieces(k: &Masker, input: &[u8], cuts: &[usize]) -> bool {
+        let mut f = k.finder();
+        let mut at = 0;
+        let mut found = false;
+        for &c in cuts.iter().chain([&input.len()]) {
+            found |= f.push(&input[at..c]);
+            at = c;
+        }
+        found
+    }
+
+    #[test]
+    fn contains_says_whether_any_pattern_occurs() {
+        let k = m(&["hunter2!", "zz"]);
+        assert!(k.contains(b"pw=hunter2!"));
+        assert!(k.contains(b"hunter2!"));
+        assert!(k.contains(b"a zz b"));
+        assert!(!k.contains(b"hunter2"));
+        assert!(!k.contains(b""));
+        // A pattern longer than the input is not in it.
+        assert!(!m(&["abcdefgh"]).contains(b"abc"));
+        // No pattern occurs anywhere.
+        assert!(!Masker::new([]).contains(b"anything"));
+        assert!(!Masker::new([Vec::new()]).contains(b"anything"));
+    }
+
+    #[test]
+    fn a_finder_finds_a_pattern_cut_at_any_point() {
+        let k = m(&["secret", "xy"]);
+        for input in [
+            &b"a secret b"[..],
+            b"secret",
+            b"..xy",
+            b"xy..",
+            b"sec ret x y",
+        ] {
+            let whole = k.contains(input);
+            for one in 0..=input.len() {
+                assert_eq!(found_in_pieces(&k, input, &[one]), whole, "{one}");
+                for two in one..=input.len() {
+                    assert_eq!(found_in_pieces(&k, input, &[one, two]), whole);
+                }
+            }
+            // Byte by byte.
+            let each: Vec<usize> = (0..input.len()).collect();
+            assert_eq!(found_in_pieces(&k, input, &each), whole);
+        }
+        assert!(k.contains(b"a secret b") && !k.contains(b"sec ret x y"));
+    }
+
+    #[test]
+    fn a_finder_says_found_only_for_the_piece_that_completes_an_occurrence() {
+        let mut f = m(&["secret"]).finder();
+        assert!(!f.push(b"a sec"));
+        assert!(f.push(b"ret b"));
+        // The occurrence is behind: what is kept is too short to hold it.
+        assert!(!f.push(b"c"));
+        assert!(!f.push(b""));
+    }
+
+    #[test]
+    fn a_finder_keeps_exactly_the_longest_pattern_minus_one() {
+        let mut f = m(&["abcd", "xy"]).finder();
+        assert_eq!(f.pending(), 0);
+        f.push(b"1");
+        assert_eq!(f.pending(), 1);
+        f.push(b"23");
+        assert_eq!(f.pending(), 3);
+        f.push(&[b'.'; 100_000]);
+        assert_eq!(f.pending(), 3);
+        // Without patterns nothing is kept and nothing is found.
+        let mut none = Masker::new([]).finder();
+        assert!(!none.push(b"abcd"));
+        assert_eq!(none.pending(), 0);
     }
 }
