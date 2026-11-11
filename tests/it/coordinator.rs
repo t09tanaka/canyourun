@@ -493,7 +493,18 @@ impl Fx {
     /// Start a coordinator on the state directory: the first, or the next
     /// after the one before was dropped.
     fn open(&self, workers: &[&Arc<FakeWorker>]) -> Coordinator {
-        let store = CoordinatorStore::open(self.dir.path(), 1).unwrap();
+        // The lock of the coordinator before is released when it is dropped,
+        // but a child another test forks at that moment holds a copy of the
+        // lock file until it execs: wait that moment out.
+        let started = std::time::Instant::now();
+        let store = loop {
+            match CoordinatorStore::open(self.dir.path(), 1) {
+                Err(StorageError::Locked(_)) if started.elapsed() < Duration::from_secs(5) => {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                other => break other.unwrap(),
+            }
+        };
         let c = Coordinator::start(store, self.cfg).unwrap();
         for w in workers {
             c.attach(w.id.clone(), Arc::clone(w) as Arc<dyn WorkerLink>);
