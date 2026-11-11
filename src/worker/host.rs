@@ -9,6 +9,7 @@ use super::blobs::BlobSink;
 use crate::error::ApiError;
 use crate::ids::AttemptId;
 use crate::secrets::place::Placed;
+use crate::setup::builder::SetupPoll;
 use crate::storage::AcceptedAttempt;
 use crate::wire::{AttemptPayload, SecretFile};
 use crate::workspace::Workspace;
@@ -33,6 +34,27 @@ pub trait Host: Send + Sync {
         attempt: &AcceptedAttempt,
         payload: &AttemptPayload,
     ) -> Result<Workspace, ApiError>;
+    /// Where the setup of the attempt stands (spec chapter 8): its steps
+    /// are prepared once per worker by a builder and copied into the
+    /// attempt's workspace, which the agent calls this about, again and
+    /// again, until it is not `Pending`. `Done` names the ids of the setup
+    /// steps whose result is in the workspace; the agent leaves those
+    /// commands out and runs every other one. The default has no setup.
+    fn setup_poll(
+        &self,
+        _attempt: &AcceptedAttempt,
+        _payload: &AttemptPayload,
+        _workspace: &Workspace,
+    ) -> Result<SetupPoll, ApiError> {
+        Ok(SetupPoll::Done {
+            skip: Default::default(),
+            note: None,
+        })
+    }
+    /// The attempt does not wait for its setup any more (it is stopped, or
+    /// gave up waiting). Its reference to the builder goes; the last one
+    /// stops the builder. Idempotent.
+    fn setup_release(&self, _attempt: &AttemptId) {}
     /// The paths (relative to the workspace root) of the secret files of the
     /// source the payload names: the declared ones and what
     /// `.worktreeinclude` matched. `None` while that source is not in this

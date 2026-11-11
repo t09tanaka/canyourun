@@ -19,6 +19,7 @@ use super::policy::{self, AttemptFacts, Recovery, Settle, Step, SupervisorExit};
 use crate::error::{ApiError, ConflictReason, ErrorCode};
 use crate::ids::*;
 use crate::platform;
+use crate::setup::builder::SetupPoll;
 use crate::state::{
     AttemptState, Outcome, Receipt, Termination, TimeoutInfo, TimeoutKind, TimeoutPhase,
 };
@@ -1109,6 +1110,13 @@ impl Agent {
         write_atomic(&self.workspace_path(attempt), &ws_json)
             .map_err(|e| internal("workspace record", e))?;
 
+        // The prepared setup steps are copied in (or waited for); the
+        // commands that are such a step are left out.
+        let Some(skip) = self.setup_wait(rec, &payload, &ws)? else {
+            return Ok(());
+        };
+        let commands = crate::setup::policy::prune_commands(&payload.commands, &skip);
+
         // The secret bundle arrives by its own request once the workspace is
         // there; the commands do not start before the set is complete.
         //
@@ -1199,9 +1207,9 @@ impl Agent {
         };
 
         // In the order they run: after what they depend on.
-        let order = policy::execution_order(&payload.commands).map_err(invalid)?;
-        let mut nodes = Vec::with_capacity(payload.commands.len());
-        for c in order.into_iter().map(|i| &payload.commands[i]) {
+        let order = policy::execution_order(&commands).map_err(invalid)?;
+        let mut nodes = Vec::with_capacity(commands.len());
+        for c in order.into_iter().map(|i| &commands[i]) {
             let rel = Path::new(&c.cwd);
             check_cwd_relative(rel)?;
             nodes.push(NodeSpec {
@@ -1251,6 +1259,55 @@ impl Agent {
             .transition(attempt, AttemptState::Ready, now())
             .map_err(api)?;
         Ok(())
+    }
+
+    /// Wait for the setup of the attempt (`Host::setup_poll`), as long as
+    /// the preparation may take. `None`: the agent is stopping or the
+    /// attempt is being stopped. An attempt that waited too long, or whose
+    /// template could not be had, runs every step itself.
+    fn setup_wait(
+        &self,
+        rec: &AcceptedAttempt,
+        payload: &AttemptPayload,
+        ws: &Workspace,
+    ) -> Result<Option<std::collections::BTreeSet<String>>, ApiError> {
+        let attempt = &rec.attempt_id;
+        let begun = platform::monotonic_ms();
+        loop {
+            match self.host.setup_poll(rec, payload, ws)? {
+                SetupPoll::Done { skip, note } => {
+                    if let Some(why) = note {
+                        self.note_once(
+                            attempt,
+                            "agent_setup_unavailable",
+                            json!({ "reason": why }),
+                        );
+                    }
+                    return Ok(Some(skip));
+                }
+                SetupPoll::Pending => {
+                    if self.stopping() || self.stop_requested(attempt) {
+                        self.host.setup_release(attempt);
+                        return Ok(None);
+                    }
+                    if platform::monotonic_ms().saturating_sub(begun) >= self.cfg.prepare_timeout_ms
+                    {
+                        self.host.setup_release(attempt);
+                        let why = format!(
+                            "the setup was not ready within {} ms",
+                            self.cfg.prepare_timeout_ms
+                        );
+                        self.note_once(
+                            attempt,
+                            "agent_setup_unavailable",
+                            json!({ "reason": why }),
+                        );
+                        return Ok(Some(Default::default()));
+                    }
+                    self.pause(self.cfg.poll_ms);
+                }
+            }
+        }
     }
 
     fn stop_requested(&self, attempt: &AttemptId) -> bool {
