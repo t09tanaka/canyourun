@@ -606,7 +606,7 @@ workerでは、supervisorがattemptを確定する前にartifactを保存する�
 1. 開始したcommandがすべて終わり、停止を確認した後（未解決のまま残るattemptでは行わない）、一覧のファイルをworkspaceから `<attempt>/artifacts/<name>` へ写す。commandの成否は問わない（失敗したcommandのreportも残す）。commandを1つも開始しなかったattempt（開始前のcancelなど）では何も探さない。
 2. 保存できたartifactの一覧を、event journalの `artifacts_stored`（attemptに1件）として確定する。
 3. その後にterminationとresultを確定する。resultのartifactは、常に `artifacts_stored` の一覧である。確定の途中でsupervisorが落ちても、次に確定する者（workspaceが既に無くてもよい）が同じ一覧をresultに入れる。`artifacts_stored` が読めないときは「artifactなし」とは扱わず、確定を失敗させる。
-4. `artifacts_stored` に載らなかったファイル（一覧の確定前に落ちたsupervisorが写したもの）は、どのresultにも参照にも入らないので、確定の時点で `<attempt>/artifacts` から消す。
+4. `artifacts_stored` に載らなかったファイル（一覧の確定前に落ちたsupervisorが写したもの）は、どのresultにも参照にも入らないので、確定の時点で `<attempt>/artifacts` から消す。spoolを使わずに確定するattempt（resultを持たない）では、保存済みのartifactもすべて消す。
 
 保存できなかったartifact（ファイルが無い、通常ファイルでない、symlinkを経由する、上限を超える、同名で内容が違う等）は一覧から外し、event `artifact_not_stored`（`name`、maskした理由 `why`。nameごとに1回）を書く。attemptのterminationは変えない。必須artifactの欠落でrunを失敗にするかどうかは、何が必須かを知る親が判定する。一覧は1024件までとし、nameが管理領域の相対pathとして使えないもの、nameどうしが衝突するもの、sourceがworkspaceの外を指すものは、commandを開始する前にspecごと拒否する。
 

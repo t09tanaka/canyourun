@@ -359,7 +359,16 @@ pub fn remove_unlisted(
     match fs::symlink_metadata(&dir) {
         Ok(m) if m.is_dir() => {}
         Ok(_) => return Ok(0),
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(0),
+        // Nothing there, also when something that is no directory stands
+        // where the directory of the attempt would be.
+        Err(e)
+            if matches!(
+                e.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+            ) =>
+        {
+            return Ok(0)
+        }
         Err(e) => return Err(e.into()),
     }
     let mut n = 0;

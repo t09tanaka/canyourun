@@ -468,6 +468,9 @@ pub(crate) fn settle_without_spool(
         Err(OutcomeError::Storage(e)) => return Err(e.into()),
         Err(e) => return Err(SupervisorError::State(e.to_string())),
     }
+    // No result will name an artifact, so none is kept: a file that stayed
+    // would be in no reference and never collected.
+    remove_unlisted(root, attempt, &[]).map_err(outcome_error)?;
     let fin = finalize(store, attempt, after_spool_failure(term))?;
     Ok((fin.termination(), fin.won()))
 }

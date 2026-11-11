@@ -1747,6 +1747,40 @@ fn a_spool_that_fails_at_the_end_makes_the_attempt_interrupted_with_an_event() {
 }
 
 #[test]
+fn an_attempt_settled_without_its_spool_keeps_no_artifact_file() {
+    let w = wk();
+    let a = accept(&w);
+    fs::write(w.ws.join("report.txt"), b"report").unwrap();
+    let input = ArtifactInput {
+        name: "report.txt",
+        source: Path::new("report.txt"),
+        source_id: SourceId::generate(),
+        plan_digest: Digest::of_bytes(b"plan"),
+        profile_fingerprint: Digest::of_bytes(b"profile"),
+    };
+    let kept = store_artifact(&w.root, &a, &w.ws, &input, 1 << 20).unwrap();
+    let run = w.store.get(&a).unwrap().unwrap().run_id;
+    w.store
+        .append_event(
+            Some(&run),
+            Some(&a),
+            "artifacts_stored",
+            &super::spool_plan::artifacts_event(std::slice::from_ref(&kept)),
+            5,
+        )
+        .unwrap();
+    let file = w.root.join(a.as_str()).join("artifacts/report.txt");
+    assert!(file.exists());
+    let s = AttemptSpool::open(&w.root, &a, BIG).unwrap();
+    s.writer(Stdout).poison();
+    let (t, _) = settle(&w.store, &w.root, &a, &s, succeeded()).unwrap();
+    assert_eq!(t.outcome(), Outcome::Interrupted);
+    // No result names it, so it is not left for nobody to collect.
+    assert!(w.store.get_result(&a).unwrap().is_none());
+    assert!(!file.exists());
+}
+
+#[test]
 fn a_cancel_stays_a_cancel_when_the_spool_fails() {
     let w = wk();
     let a = accept(&w);

@@ -1113,6 +1113,15 @@ impl Agent {
         // supervisor is started from it again (one that still runs has read
         // it already).
         let _ = fs::remove_file(self.spec_path(attempt));
+        // And what a write of it that was cut short left next to it.
+        if let Ok(rd) = fs::read_dir(self.attempt_dir(attempt)) {
+            for ent in rd.flatten() {
+                let is_file = ent.file_type().is_ok_and(|t| t.is_file());
+                if is_file && ent.file_name().to_string_lossy().starts_with(".tmp") {
+                    let _ = fs::remove_file(ent.path());
+                }
+            }
+        }
         let ws = self.workspace_of(attempt);
         let marker = self.workspace_path(attempt);
         if ws.is_none() && marker.exists() {

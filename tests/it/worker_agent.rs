@@ -884,7 +884,11 @@ fn files_holding(dir: &Path, needle: &[u8]) -> Vec<PathBuf> {
     let mut found = Vec::new();
     let mut stack = vec![dir.to_path_buf()];
     while let Some(d) = stack.pop() {
-        for e in std::fs::read_dir(&d).unwrap().flatten() {
+        // The directory is alive: one that went meanwhile holds nothing.
+        let Ok(entries) = std::fs::read_dir(&d) else {
+            continue;
+        };
+        for e in entries.flatten() {
             let p = e.path();
             let Ok(meta) = std::fs::symlink_metadata(&p) else {
                 continue;
@@ -1713,17 +1717,17 @@ async fn the_lease_counts_from_its_grant_not_from_the_supervisors_start() {
     let mut p = payload(&script);
     p.lease_ms = 4_000;
     let a = AttemptId::generate();
-    let accepted = Instant::now();
     submit(&c, &a, &p).await;
     std::thread::sleep(Duration::from_millis(2_000));
     f.host.block_prepare.store(false, Ordering::SeqCst);
     assert_eq!(f.wait_terminal(&a), Outcome::Interrupted);
-    let took = accepted.elapsed();
     assert_eq!(lines(&marker), 1, "the command did start");
-    assert!(took >= Duration::from_millis(3_500), "{took:?}");
-    assert!(took < Duration::from_millis(5_600), "{took:?}");
-    // The supervisor saw it on its own clock; the agent did not have to.
-    assert_eq!(events(&f, &a, "lease_expired"), 1);
+    // The supervisor saw it on its own clock, when the grant ended: the
+    // time of the expiry itself, however long the stop took after it.
+    let expired = f.store().events_of(&a, "lease_expired").unwrap();
+    assert_eq!(expired.len(), 1);
+    let after = expired[0].at_ms - f.rec(&a).accepted_at_ms;
+    assert!((3_500..5_500).contains(&after), "{after} ms");
     assert_eq!(events(&f, &a, "agent_lease_expired"), 0);
 }
 
@@ -1740,7 +1744,6 @@ async fn a_renewal_before_the_start_seeds_the_supervisor_with_what_is_left_of_it
     let mut p = payload(&script);
     p.lease_ms = 4_000;
     let a = AttemptId::generate();
-    let accepted = Instant::now();
     submit(&c, &a, &p).await;
     std::thread::sleep(Duration::from_millis(1_000));
     let Response::RenewLease(r) = call(
@@ -1760,17 +1763,17 @@ async fn a_renewal_before_the_start_seeds_the_supervisor_with_what_is_left_of_it
         panic!()
     };
     assert!(r.extended);
-    let renewed = accepted.elapsed();
-    std::thread::sleep(Duration::from_millis(3_000).saturating_sub(accepted.elapsed()));
+    let renewed_at = f.store().lease_renewed_at(&a).unwrap().unwrap();
+    std::thread::sleep(Duration::from_millis(2_000));
     f.host.block_prepare.store(false, Ordering::SeqCst);
     assert_eq!(f.wait_terminal(&a), Outcome::Interrupted);
-    let took = accepted.elapsed();
     assert_eq!(lines(&marker), 1, "the command did start");
-    // Not at the first grant's end (the renewal counted) ...
-    assert!(took >= renewed + Duration::from_millis(3_500), "{took:?}");
-    // ... and not a full period after the supervisor's start.
-    assert!(took < Duration::from_millis(6_500), "{took:?}");
-    assert_eq!(events(&f, &a, "lease_expired"), 1);
+    let expired = f.store().events_of(&a, "lease_expired").unwrap();
+    assert_eq!(expired.len(), 1);
+    // One period after the renewal: not at the first grant's end (3 s
+    // after it) and not a full period after the supervisor's start (6 s).
+    let after = expired[0].at_ms - renewed_at;
+    assert!((3_500..5_500).contains(&after), "{after} ms");
 }
 
 // Its own test, not the second half of the one above: both wait out real
