@@ -18,8 +18,8 @@
 
 use super::spool::{AttemptSpool, SpoolError, StreamStatus};
 use super::spool_plan::{
-    artifact_locator, check_artifact_names, is_tmp_name, logs_locator, relative_path,
-    resolve_locator, result_has_artifacts, result_json, sha256_digest, source_under,
+    artifact_locator, check_artifact_names, is_listed_artifact, is_tmp_name, logs_locator,
+    relative_path, resolve_locator, result_has_artifacts, result_json, sha256_digest, source_under,
     ArtifactSetError, StreamSummary,
 };
 use crate::ids::{AttemptId, Digest, PlanDigest, SourceId};
@@ -325,6 +325,45 @@ pub fn sweep_tmp(root: &Path, attempt: &AttemptId) -> Result<u32> {
     }
     let mut n = 0;
     walk(&dir, 0, &mut n)?;
+    Ok(n)
+}
+
+/// Remove every file below `<attempt>/artifacts` that is not one of
+/// `artifacts`: what a supervisor copied before it died without fixing the
+/// list in the journal. Such a file is in no result and no reference, so
+/// nothing else would ever remove it. Below real directories only; a symlink
+/// is removed as a name and never followed. Call it when no `store_artifact`
+/// of this attempt runs. Returns how many were removed.
+pub fn remove_unlisted(
+    root: &Path,
+    attempt: &AttemptId,
+    artifacts: &[ArtifactRecord],
+) -> Result<u32> {
+    fn walk(dir: &Path, rel: &str, keep: &[ArtifactRecord], n: &mut u32) -> io::Result<()> {
+        for entry in fs::read_dir(dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            let name = entry.file_name();
+            let rel = format!("{rel}{}", name.to_string_lossy());
+            if fs::symlink_metadata(&path)?.is_dir() {
+                // Artifact names are at most `MAX_DEPTH` deep, so the walk ends.
+                walk(&path, &format!("{rel}/"), keep, n)?;
+            } else if !is_listed_artifact(keep, &rel) {
+                fs::remove_file(&path)?;
+                *n += 1;
+            }
+        }
+        Ok(())
+    }
+    let dir = artifacts_root(root, attempt);
+    match fs::symlink_metadata(&dir) {
+        Ok(m) if m.is_dir() => {}
+        Ok(_) => return Ok(0),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(0),
+        Err(e) => return Err(e.into()),
+    }
+    let mut n = 0;
+    walk(&dir, "", artifacts, &mut n)?;
     Ok(n)
 }
 

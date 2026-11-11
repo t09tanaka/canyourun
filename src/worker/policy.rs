@@ -5,7 +5,7 @@
 //! wire events, and the order of the startup steps.
 
 use crate::state::{AttemptState, Observation, Receipt};
-use crate::wire::{AttemptPayload, CancelPhase, EventKind, RetireStatus};
+use crate::wire::{AttemptPayload, CancelPhase, CommandSpec, EventKind, RetireStatus};
 use serde_json::Value;
 use std::collections::BTreeSet;
 
@@ -75,14 +75,12 @@ pub fn check_payload(p: &AttemptPayload, poll_ms: u64) -> Result<(), &'static st
         if c.argv.first().is_none_or(|a| a.is_empty()) {
             return Err("a command is empty");
         }
-        // The supervisor has one command timeout for the attempt and runs
-        // the commands in the order given. Anything else would be dropped
-        // silently, so it is refused.
-        if c.timeout_ms.is_some() && c.timeout_ms != p.command_timeout_ms {
-            return Err("a per-command timeout must equal command_timeout_ms");
+        // A command's own limit replaces the default while it runs.
+        if c.timeout_ms == Some(0) {
+            return Err("a timeout of zero is not a timeout");
         }
-        if c.depends_on.iter().any(|d| !seen.contains(d.as_str())) {
-            return Err("depends_on must name an earlier command");
+        if c.timeout_ms.is_some_and(|t| t > MAX_TIMEOUT_MS) {
+            return Err("a timeout is longer than 7 days");
         }
         if !seen.insert(c.node_id.as_str()) {
             return Err("a node_id is used twice");
@@ -101,11 +99,60 @@ pub fn check_payload(p: &AttemptPayload, poll_ms: u64) -> Result<(), &'static st
         bytes += c.cwd.len();
         bytes += c.argv.iter().map(String::len).sum::<usize>();
         bytes += c.env.iter().map(|(k, v)| k.len() + v.len()).sum::<usize>();
+        bytes += c.depends_on.iter().map(|d| d.as_str().len()).sum::<usize>();
     }
     if bytes > MAX_COMMAND_BYTES {
         return Err("the commands are too large");
     }
-    Ok(())
+    execution_order(&p.commands).map(|_| ())
+}
+
+/// The order the commands of an attempt run in, as positions in `commands`:
+/// every command after all the commands its `depends_on` names, wherever
+/// they stand in the list (a later one may be named). Among the commands
+/// that may run next, the one given first runs first, so a list that is
+/// already in order runs as given and the same list always gives the same
+/// order. The supervisor runs them one after another and stops at the first
+/// that does not succeed, so a command never runs after a dependency that
+/// failed.
+///
+/// Refused: a name that is no command of the attempt, and a cycle (a command
+/// naming itself included).
+pub fn execution_order(commands: &[CommandSpec]) -> Result<Vec<usize>, &'static str> {
+    let ids: BTreeSet<&str> = commands.iter().map(|c| c.node_id.as_str()).collect();
+    if commands
+        .iter()
+        .flat_map(|c| &c.depends_on)
+        .any(|d| !ids.contains(d.as_str()))
+    {
+        return Err("depends_on names no command of the attempt");
+    }
+    let mut done: BTreeSet<&str> = BTreeSet::new();
+    let mut placed = vec![false; commands.len()];
+    let mut order = Vec::with_capacity(commands.len());
+    while order.len() < commands.len() {
+        let next = commands.iter().enumerate().position(|(i, c)| {
+            !placed[i] && c.depends_on.iter().all(|d| done.contains(d.as_str()))
+        });
+        let Some(i) = next else {
+            return Err("depends_on forms a cycle");
+        };
+        placed[i] = true;
+        done.insert(commands[i].node_id.as_str());
+        order.push(i);
+    }
+    Ok(order)
+}
+
+/// The secret values as the strings the supervisor's spec carries. A value
+/// that is not UTF-8 text cannot be written there, and a changed copy of it
+/// would match nothing in the output: the attempt is not started rather than
+/// run with a secret that is not masked.
+pub fn mask_strings(values: Vec<Vec<u8>>) -> Result<Vec<String>, &'static str> {
+    values
+        .into_iter()
+        .map(|v| String::from_utf8(v).map_err(|_| "a secret value is not UTF-8 text"))
+        .collect()
 }
 
 /// Whether the machine was restarted since the agent last ran. A first start
@@ -348,9 +395,16 @@ pub fn wire_event(kind: &str, payload: &Value) -> Option<WireEvent> {
             Some(Receipt::Terminal),
         ),
         "log_truncated" => ev(EventKind::LogTruncated, None, None),
-        "supervisor_stop" if payload.get("reason")?.as_str()? == "LeaseExpired" => {
-            ev(EventKind::LeaseExpired, None, None)
+        "attempt_receipt" => {
+            let r: Receipt = serde_json::from_value(payload.get("receipt")?.clone()).ok()?;
+            // Only the two the journal records this way; the others have
+            // their own entries.
+            if !matches!(r, Receipt::CommandRegistered | Receipt::Running) {
+                return None;
+            }
+            ev(EventKind::ReceiptReached, None, Some(r))
         }
+        "lease_expired" => ev(EventKind::LeaseExpired, None, None),
         _ => None,
     }
 }
@@ -432,7 +486,6 @@ pub const STARTUP_ORDER: [Step; 10] = [
 mod tests {
     use super::*;
     use crate::ids::*;
-    use crate::wire::CommandSpec;
     use serde_json::json;
     use std::collections::BTreeMap;
 
@@ -503,33 +556,125 @@ mod tests {
     }
 
     #[test]
-    fn what_the_supervisor_cannot_honour_is_refused() {
-        let timeout = "a per-command timeout must equal command_timeout_ms";
+    fn a_command_may_have_its_own_timeout_within_the_same_bounds() {
         let mut p = payload();
+        // Its own limit, with or without a default, shorter or longer.
         p.commands[0].timeout_ms = Some(5);
-        assert_eq!(check_payload(&p, 0), Err(timeout));
+        assert_eq!(check_payload(&p, 0), Ok(()));
         p.command_timeout_ms = Some(6);
-        assert_eq!(check_payload(&p, 0), Err(timeout));
-        p.command_timeout_ms = Some(5);
         assert_eq!(check_payload(&p, 0), Ok(()));
-        p.commands[0].timeout_ms = None;
+        p.command_timeout_ms = Some(4);
         assert_eq!(check_payload(&p, 0), Ok(()));
+        p.commands[0].timeout_ms = Some(0);
+        assert_eq!(
+            check_payload(&p, 0),
+            Err("a timeout of zero is not a timeout")
+        );
+        p.commands[0].timeout_ms = Some(MAX_TIMEOUT_MS);
+        assert_eq!(check_payload(&p, 0), Ok(()));
+        p.commands[0].timeout_ms = Some(MAX_TIMEOUT_MS + 1);
+        assert_eq!(check_payload(&p, 0), Err("a timeout is longer than 7 days"));
+    }
 
-        let order = "depends_on must name an earlier command";
-        let dep = |of: usize, on: &str| {
+    fn deps(spec: &[(&str, &[&str])]) -> Vec<CommandSpec> {
+        spec.iter()
+            .map(|(id, on)| {
+                let mut c = cmd(id);
+                c.depends_on = on.iter().map(|d| NodeId::parse(d).unwrap()).collect();
+                c
+            })
+            .collect()
+    }
+
+    #[test]
+    fn commands_run_after_what_they_depend_on_wherever_it_stands() {
+        let order = |spec: &[(&str, &[&str])]| execution_order(&deps(spec));
+        // Nothing named, or only earlier ones: as given.
+        assert_eq!(
+            order(&[("a", &[]), ("b", &[]), ("c", &[])]),
+            Ok(vec![0, 1, 2])
+        );
+        assert_eq!(
+            order(&[("a", &[]), ("b", &["a"]), ("c", &["a", "b"])]),
+            Ok(vec![0, 1, 2])
+        );
+        // A later one named: it runs first, the rest keeps its order.
+        assert_eq!(
+            order(&[("a", &["c"]), ("b", &[]), ("c", &[])]),
+            Ok(vec![1, 2, 0])
+        );
+        assert_eq!(
+            order(&[("a", &["b"]), ("b", &["c"]), ("c", &[])]),
+            Ok(vec![2, 1, 0])
+        );
+        // Every one of several: `a` waits for both.
+        assert_eq!(
+            order(&[("a", &["b", "d"]), ("b", &[]), ("c", &[]), ("d", &[])]),
+            Ok(vec![1, 2, 3, 0])
+        );
+        // The same name twice is one dependency.
+        assert_eq!(order(&[("a", &["b", "b"]), ("b", &[])]), Ok(vec![1, 0]));
+        assert_eq!(order(&[]), Ok(vec![]));
+    }
+
+    #[test]
+    fn unknown_names_and_cycles_are_refused() {
+        let order = |spec: &[(&str, &[&str])]| execution_order(&deps(spec));
+        let unknown = Err("depends_on names no command of the attempt");
+        let cycle = Err("depends_on forms a cycle");
+        assert_eq!(order(&[("a", &["nowhere"])]), unknown);
+        assert_eq!(order(&[("a", &[]), ("b", &["a", "x"])]), unknown);
+        assert_eq!(order(&[("a", &["a"])]), cycle);
+        assert_eq!(order(&[("a", &["b"]), ("b", &["a"])]), cycle);
+        assert_eq!(
+            order(&[("a", &[]), ("b", &["d"]), ("c", &["b"]), ("d", &["c"])]),
+            cycle
+        );
+        // The payload check refuses the same, and takes a forward reference.
+        let with = |spec: &[(&str, &[&str])]| {
             let mut p = payload();
-            p.commands.push(cmd("b"));
-            p.commands.push(cmd("c"));
-            p.commands[of].depends_on = vec![NodeId::parse(on).unwrap()];
+            p.commands = deps(spec);
             check_payload(&p, 0)
         };
-        assert_eq!(dep(1, "a"), Ok(()));
-        assert_eq!(dep(2, "a"), Ok(()));
-        assert_eq!(dep(2, "b"), Ok(()));
-        assert_eq!(dep(0, "b"), Err(order));
-        assert_eq!(dep(1, "c"), Err(order));
-        assert_eq!(dep(1, "b"), Err(order));
-        assert_eq!(dep(1, "nowhere"), Err(order));
+        assert_eq!(with(&[("a", &["b"]), ("b", &[])]), Ok(()));
+        assert_eq!(with(&[("a", &["nowhere"])]), unknown.clone().map(|_| ()));
+        assert_eq!(
+            with(&[("a", &["b"]), ("b", &["a"])]),
+            cycle.clone().map(|_| ())
+        );
+    }
+
+    #[test]
+    fn the_names_in_depends_on_count_toward_the_size_of_the_commands() {
+        let mut p = payload();
+        p.commands.push(cmd("b"));
+        p.commands[0].argv = vec!["x".repeat(MAX_COMMAND_BYTES - 1)];
+        p.commands[1].argv = vec![String::new()];
+        p.commands[1].argv[0].push('y');
+        // One byte over with the name `a`.
+        p.commands[1].depends_on = vec![NodeId::parse("a").unwrap()];
+        assert_eq!(check_payload(&p, 0), Err("the commands are too large"));
+        p.commands[1].depends_on.clear();
+        assert_eq!(check_payload(&p, 0), Ok(()));
+    }
+
+    #[test]
+    fn secret_values_become_strings_or_the_start_is_refused() {
+        assert_eq!(mask_strings(vec![]), Ok(vec![]));
+        assert_eq!(
+            mask_strings(vec![
+                b"hunter2-hunter2".to_vec(),
+                "p\u{e4}ssw\u{f6}rd".as_bytes().to_vec()
+            ]),
+            Ok(vec![
+                "hunter2-hunter2".to_string(),
+                "p\u{e4}ssw\u{f6}rd".to_string()
+            ])
+        );
+        assert_eq!(
+            mask_strings(vec![b"fine-value".to_vec(), vec![0xff, 0xfe, 0x41]]),
+            Err("a secret value is not UTF-8 text")
+        );
     }
 
     #[test]
@@ -896,17 +1041,44 @@ mod tests {
             (e.kind, e.state, e.receipt),
             (EventKind::LogTruncated, None, None)
         );
-        let e = wire_event("supervisor_stop", &json!({"reason": "LeaseExpired"})).unwrap();
+        let e = wire_event("lease_expired", &Value::Null).unwrap();
         assert_eq!(
             (e.kind, e.state, e.receipt),
             (EventKind::LeaseExpired, None, None)
         );
+        // The stop the supervisor notes is a diagnostic, whatever it says.
         assert_eq!(
-            wire_event("supervisor_stop", &json!({"reason": "Cancel"})),
+            wire_event("supervisor_stop", &json!({"reason": "LeaseExpired"})),
             None
         );
-        assert_eq!(wire_event("supervisor_stop", &json!({"reason": 1})), None);
-        assert_eq!(wire_event("supervisor_stop", &json!({})), None);
+        for (name, r) in [
+            ("command_registered", Receipt::CommandRegistered),
+            ("running", Receipt::Running),
+        ] {
+            let e = wire_event("attempt_receipt", &json!({ "receipt": name })).unwrap();
+            assert_eq!(
+                (e.kind, e.state, e.receipt),
+                (EventKind::ReceiptReached, None, Some(r))
+            );
+        }
+        // The other receipts have their own journal entries; an entry that
+        // names one of them, or nothing readable, is not a wire event.
+        for other in [
+            "coordinator_accepted",
+            "worker_accepted",
+            "terminal",
+            "collected",
+        ] {
+            assert_eq!(
+                wire_event("attempt_receipt", &json!({ "receipt": other })),
+                None
+            );
+        }
+        assert_eq!(
+            wire_event("attempt_receipt", &json!({ "receipt": 1 })),
+            None
+        );
+        assert_eq!(wire_event("attempt_receipt", &json!({})), None);
         assert_eq!(wire_event("sleep_inhibit", &Value::Null), None);
     }
 

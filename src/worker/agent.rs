@@ -24,6 +24,7 @@ use crate::storage::{
     AcceptedAttempt, CancelOutcome, GcReport, LeaseOutcome, NewAcceptance, ProcessLock,
     StorageError, SubmitOutcome, WorkerStore,
 };
+use crate::supervisor::lease::LeaseSeed;
 use crate::supervisor::lock::SupervisorLock;
 use crate::supervisor::outcome::drain_pending_deletes;
 use crate::supervisor::process::spawn_detached;
@@ -204,14 +205,6 @@ pub struct Agent {
 struct Clock {
     accepted_ms: u64,
     granted_ms: u64,
-}
-
-/// The lease as granted before the supervisor started: when it runs out and
-/// the key the database held then.
-#[derive(Debug, Clone, Copy)]
-struct Seed {
-    key: Option<LeaseKey>,
-    ends_ms: u64,
 }
 
 struct Permits {
@@ -590,7 +583,6 @@ impl Agent {
 
     fn drive(&self, attempt: &AttemptId) {
         let mut child: Option<Child> = None;
-        let mut seed: Option<Seed> = None;
         let mut noted_exit = false;
         // Supervisor starts and supervisors that failed, in a row.
         let mut failures = 0u32;
@@ -616,14 +608,12 @@ impl Agent {
             if let Some(c) = child.as_mut() {
                 match c.try_wait() {
                     Ok(None) => {
-                        self.watch_seed(&rec, &mut seed);
                         self.pause(self.cfg.poll_ms);
                         continue;
                     }
                     Ok(Some(status)) => {
                         let code = status.code();
                         child = None;
-                        seed = None;
                         let exit = policy::supervisor_exit(code);
                         if exit == SupervisorExit::IdentityUnknown {
                             // Nothing was signalled and nothing is known. Not
@@ -669,7 +659,6 @@ impl Agent {
                     }
                     Err(_) => {
                         child = None;
-                        seed = None;
                     }
                 }
             }
@@ -701,7 +690,7 @@ impl Agent {
                     self.after_settle(attempt, done, &mut settle_errors);
                     continue;
                 }
-                Ok(Recovery::Supervise) => self.spawn(&rec).map(|c| Some((c, None))),
+                Ok(Recovery::Supervise) => self.spawn(&rec).map(Some),
                 Ok(Recovery::Resume) => {
                     if rec.state == AttemptState::Ready && self.spec_path(attempt).is_file() {
                         self.launch(&rec)
@@ -728,10 +717,7 @@ impl Agent {
                 }
             };
             match started {
-                Ok(Some((c, s))) => {
-                    child = Some(c);
-                    seed = s;
-                }
+                Ok(Some(c)) => child = Some(c),
                 // Settled instead of started: the next look sees the end.
                 Ok(None) => {}
                 Err(()) => {
@@ -783,9 +769,11 @@ impl Agent {
     /// Start the supervisor that will start the commands of a prepared
     /// attempt. The lease and the deadline have been running since the
     /// acceptance: with the lease run out nothing is started (spec chapter
-    /// 12), and the supervisor is given what is left of the deadline.
+    /// 12), and the supervisor is given what is left of both: the deadline,
+    /// and the lease as a seed for its own lease clock, so that it stops the
+    /// commands when the grant made before its start runs out.
     /// `Ok(None)`: the attempt was settled instead (or will be, next look).
-    fn launch(&self, rec: &AcceptedAttempt) -> Result<Option<(Child, Option<Seed>)>, ()> {
+    fn launch(&self, rec: &AcceptedAttempt) -> Result<Option<Child>, ()> {
         let a = &rec.attempt_id;
         let payload: AttemptPayload = serde_json::from_value(rec.spec.clone()).map_err(|e| {
             self.note_once(
@@ -795,20 +783,18 @@ impl Agent {
             );
         })?;
         // The key first: a renewal that arrives after this read makes the
-        // seed void (the supervisor counts from it), never too short.
+        // seed void (the supervisor then counts that grant in full), never
+        // too short.
         let key = self.store.lease(a).ok().flatten().map(|(k, _)| k);
         let (since_accept, since_grant) = self.elapsed(rec);
         let Some(lease_left) = policy::remaining_ms(payload.lease_ms, since_grant) else {
+            // The journal gets `lease_expired` with it.
             let _ = self.store.expire_lease(a, now());
-            self.note_once(
-                a,
-                "supervisor_stop",
-                json!({ "reason": "LeaseExpired", "by": "agent", "phase": "before_start" }),
-            );
             let t = termination(Some(StopReason::LeaseExpired), None);
             self.settle_unstarted(a, t);
             return Ok(None);
         };
+        let mut deadline_left = None;
         if let Some(total) = payload.deadline_ms {
             let Some(left) = policy::remaining_ms(total, since_accept) else {
                 self.note_once(a, "agent_deadline_before_start", json!({}));
@@ -820,20 +806,21 @@ impl Agent {
                 self.settle_unstarted(a, t);
                 return Ok(None);
             };
-            self.rewrite_deadline(a, left).map_err(|e| {
-                self.note_once(
-                    a,
-                    "agent_spawn_failed",
-                    json!({ "error": format!("supervisor spec: {e}") }),
-                );
-            })?;
+            deadline_left = Some(left);
         }
-        let child = self.spawn(rec)?;
-        let seed = Seed {
+        let seed = LeaseSeed {
+            ends_mono_ms: platform::monotonic_ms().saturating_add(lease_left),
             key,
-            ends_ms: platform::monotonic_ms().saturating_add(lease_left),
         };
-        Ok(Some((child, Some(seed))))
+        // Written at every start: an earlier start's values are stale.
+        self.rewrite_start(a, deadline_left, seed).map_err(|e| {
+            self.note_once(
+                a,
+                "agent_spawn_failed",
+                json!({ "error": format!("supervisor spec: {e}") }),
+            );
+        })?;
+        self.spawn(rec).map(Some)
     }
 
     fn settle_unstarted(&self, attempt: &AttemptId, t: Termination) {
@@ -851,47 +838,21 @@ impl Agent {
         }
     }
 
-    /// The supervisor counts its deadline from its own start.
-    fn rewrite_deadline(&self, attempt: &AttemptId, left_ms: u64) -> Result<(), String> {
+    /// The supervisor counts its deadline from its own start, and its lease
+    /// from the seed.
+    fn rewrite_start(
+        &self,
+        attempt: &AttemptId,
+        deadline_left_ms: Option<u64>,
+        seed: LeaseSeed,
+    ) -> Result<(), String> {
         let path = self.spec_path(attempt);
         let text = fs::read_to_string(&path).map_err(|e| e.to_string())?;
         let mut spec: SuperviseSpec = serde_json::from_str(&text).map_err(|e| e.to_string())?;
-        spec.deadline_ms = Some(left_ms);
+        spec.deadline_ms = deadline_left_ms;
+        spec.lease_seed = Some(seed);
         let bytes = serde_json::to_vec(&spec).map_err(|e| e.to_string())?;
         write_atomic(&path, &bytes).map_err(|e| e.to_string())
-    }
-
-    /// The supervisor starts its lease clock when it starts, with a full
-    /// period. The lease was granted earlier (at the acceptance or the last
-    /// renewal): when that period ends and no renewal has arrived since the
-    /// start, the agent marks the lease expired in the database, which the
-    /// supervisor obeys at its next look. A renewal after the start makes
-    /// the supervisor count from it, and this watch ends.
-    fn watch_seed(&self, rec: &AcceptedAttempt, seed: &mut Option<Seed>) {
-        let Some(s) = *seed else {
-            return;
-        };
-        if platform::monotonic_ms() < s.ends_ms {
-            return;
-        }
-        // Unreadable: look again at the next poll.
-        let Ok(seen) = self.store.lease(&rec.attempt_id) else {
-            return;
-        };
-        let renewed = seen.map(|(k, _)| k) != s.key;
-        let expired = seen.is_some_and(|(_, x)| x);
-        if !renewed && !expired {
-            if self.store.expire_lease(&rec.attempt_id, now()).is_err() {
-                return;
-            }
-            note(
-                &self.store,
-                rec,
-                "agent_lease_expired",
-                json!({ "why": "no renewal since the grant" }),
-            );
-        }
-        *seed = None;
     }
 
     /// How long ago the attempt was accepted and its lease last granted, in
@@ -1056,8 +1017,30 @@ impl Agent {
             waited += self.cfg.poll_ms;
         }
 
+        // The values of the secret files in place, read now that the set is
+        // complete: everything the commands print goes through a masker made
+        // of them before it is stored. They are read from the files, so an
+        // agent that restarted since the bundle arrived masks the same.
+        let secret = self.host.mask_values(rec)?;
+        if !secret.skipped_keys.is_empty() {
+            // Key names are not secret, but the count says enough.
+            self.note_once(
+                attempt,
+                "agent_mask_skipped",
+                json!({ "too_short_to_mask": secret.skipped_keys.len() }),
+            );
+        }
+        let mask = policy::mask_strings(secret.values).map_err(|e| {
+            ApiError::blocked(
+                crate::error::BlockedReason::SecretUnavailable,
+                format!("{e}: its output could not be masked, nothing is started"),
+            )
+        })?;
+
+        // In the order they run: after what they depend on.
+        let order = policy::execution_order(&payload.commands).map_err(invalid)?;
         let mut nodes = Vec::with_capacity(payload.commands.len());
-        for c in &payload.commands {
+        for c in order.into_iter().map(|i| &payload.commands[i]) {
             let rel = Path::new(&c.cwd);
             check_cwd_relative(rel)?;
             nodes.push(NodeSpec {
@@ -1066,6 +1049,7 @@ impl Agent {
                 cwd: ws.cwd.join(rel),
                 env: c.env.clone(),
                 weight: None,
+                timeout_ms: c.timeout_ms,
             });
         }
         let spec = SuperviseSpec {
@@ -1081,16 +1065,20 @@ impl Agent {
             poll_ms: self.cfg.poll_ms,
             command_timeout_ms: payload.command_timeout_ms,
             resource_wait_timeout_ms: payload.resource_wait_timeout_ms,
-            // What is left of it is written when the supervisor is started.
+            // What is left of both is written when the supervisor is started.
             deadline_ms: payload.deadline_ms,
+            lease_seed: None,
             inhibit_sleep: self.cfg.inhibit_sleep,
             // The spool and this file share `<state_dir>/attempts/<attempt>`.
             spool_root: Some(self.cfg.attempts_root()),
             log_limit_bytes: DEFAULT_LOG_LIMIT_BYTES,
             workspace_warnings: ws.warnings.clone(),
-            // Nothing is masked yet: the values of the secret bundle are
-            // passed here once the agent keeps them.
-            mask: MaskValues::default(),
+            // This file therefore holds secrets: it is written 0600 and
+            // removed with the workspace when the attempt has ended.
+            mask: MaskValues(mask),
+            // The payload names no artifacts yet (the coordinator's side of
+            // the declaration is not defined).
+            artifacts: None,
         };
         spec.validate().map_err(|e| invalid(e.to_string()))?;
         let bytes = serde_json::to_vec(&spec).map_err(|e| internal("supervisor spec", e))?;
@@ -1120,6 +1108,11 @@ impl Agent {
     /// and the attempt's watcher both come here.
     fn clean(&self, attempt: &AttemptId) {
         let _one = lock(shard(&self.shards, attempt));
+        // First, and whatever becomes of the rest: the supervisor's spec
+        // carries the secret values to mask. The attempt is terminal, so no
+        // supervisor is started from it again (one that still runs has read
+        // it already).
+        let _ = fs::remove_file(self.spec_path(attempt));
         let ws = self.workspace_of(attempt);
         let marker = self.workspace_path(attempt);
         if ws.is_none() && marker.exists() {
@@ -1129,7 +1122,6 @@ impl Agent {
         match self.host.cleanup(attempt, ws.as_ref()) {
             Ok(()) => {
                 let _ = fs::remove_file(marker);
-                let _ = fs::remove_file(self.spec_path(attempt));
                 let _ = fs::remove_dir(self.attempt_dir(attempt));
                 lock(&self.clocks).remove(attempt.as_str());
                 let mine = format!("{attempt}/");

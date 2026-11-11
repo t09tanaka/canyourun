@@ -1651,6 +1651,56 @@ fn spool_failures(w: &Wk, a: &AttemptId) -> Vec<serde_json::Value> {
 }
 
 #[test]
+fn files_no_list_names_are_removed_from_the_artifacts_and_the_listed_ones_stay() {
+    use super::outcome::remove_unlisted;
+    let w = wk();
+    let a = accept(&w);
+    // Nothing there yet.
+    assert_eq!(remove_unlisted(&w.root, &a, &[]).unwrap(), 0);
+    fs::create_dir_all(w.ws.join("dir")).unwrap();
+    fs::write(w.ws.join("top.txt"), b"top").unwrap();
+    fs::write(w.ws.join("dir/in.txt"), b"in").unwrap();
+    let keep = |name: &str| {
+        let input = ArtifactInput {
+            name,
+            source: Path::new(name),
+            source_id: SourceId::generate(),
+            plan_digest: Digest::of_bytes(b"plan"),
+            profile_fingerprint: Digest::of_bytes(b"profile"),
+        };
+        store_artifact(&w.root, &a, &w.ws, &input, 1 << 20).unwrap()
+    };
+    let listed = [keep("top.txt"), keep("dir/in.txt")];
+    let dir = w.root.join(a.as_str()).join("artifacts");
+    // Left by a supervisor that died: plain files, a temporary one, a file
+    // next to a listed one, and a link (removed as a name, never followed).
+    let outside = w.ws.join("outside");
+    fs::write(&outside, b"not ours").unwrap();
+    fs::write(dir.join("orphan"), b"x").unwrap();
+    fs::write(dir.join(".tmpAbC"), b"x").unwrap();
+    fs::write(dir.join("dir/other.txt"), b"x").unwrap();
+    fs::create_dir_all(dir.join("deep/er")).unwrap();
+    fs::write(dir.join("deep/er/file"), b"x").unwrap();
+    std::os::unix::fs::symlink(&outside, dir.join("link")).unwrap();
+    assert_eq!(remove_unlisted(&w.root, &a, &listed).unwrap(), 5);
+    assert_eq!(fs::read(dir.join("top.txt")).unwrap(), b"top");
+    assert_eq!(fs::read(dir.join("dir/in.txt")).unwrap(), b"in");
+    for gone in ["orphan", ".tmpAbC", "dir/other.txt", "deep/er/file", "link"] {
+        assert!(fs::symlink_metadata(dir.join(gone)).is_err(), "{gone}");
+    }
+    assert_eq!(fs::read(&outside).unwrap(), b"not ours");
+    // Again: nothing left to remove. With no list, everything goes.
+    assert_eq!(remove_unlisted(&w.root, &a, &listed).unwrap(), 0);
+    assert_eq!(remove_unlisted(&w.root, &a, &[]).unwrap(), 2);
+    // An artifacts directory that is a link is not walked.
+    let b = accept(&w);
+    fs::create_dir_all(w.root.join(b.as_str())).unwrap();
+    std::os::unix::fs::symlink(&w.ws, w.root.join(b.as_str()).join("artifacts")).unwrap();
+    assert_eq!(remove_unlisted(&w.root, &b, &[]).unwrap(), 0);
+    assert!(outside.exists());
+}
+
+#[test]
 fn settling_closes_the_spool_and_stores_the_result() {
     let w = wk();
     let a = accept(&w);

@@ -292,6 +292,7 @@ mod tests {
                 cwd: dir.path().to_path_buf(),
                 env: Default::default(),
                 weight: Some(1),
+                timeout_ms: None,
             }],
             lease_ms: 60_000,
             term_grace_ms: 50,
@@ -300,11 +301,13 @@ mod tests {
             command_timeout_ms: None,
             resource_wait_timeout_ms: None,
             deadline_ms: None,
+            lease_seed: None,
             inhibit_sleep: false,
             spool_root: Some(dir.path().join("spool")),
             log_limit_bytes: 1 << 20,
             workspace_warnings: vec![],
             mask: Default::default(),
+            artifacts: None,
         };
         Fx {
             _dir: dir,

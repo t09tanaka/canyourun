@@ -483,6 +483,8 @@ terminal outcomeは `succeeded / failed / cancelled / timed_out / interrupted` �
 
 1秒以内に完了する仕事でも、registeredの観測を待ち損ねたことを理由にlost扱いしない。永続eventとterminalを照会できるようにする。
 
+workerは `command registered` と `running` に初めて到達したとき、receiptの記録と同じtransactionでevent journalへ `attempt_receipt`（payload `receipt`）を1件書く。`watch_events` はこれを `receipt_reached` として返すので、receiptは到達順に、それぞれ1回だけ見える。leaseの失効も同じで、DBのleaseを失効にした最初の書き手（supervisorか、supervisorの起動前ならagent）が同じtransactionで `lease_expired` を1件書き、`watch_events` は `lease_expired` として返す。2回目以降の失効は何も書かない。supervisorが診断用に書く `supervisor_stop` の文言は、通信上のeventの判定に使わない。
+
 # 11. 通信プロトコルと二重実行の防止
 
 SSH上でversion付きの長さprefix JSON frameを使う。stdoutはprotocol専用、診断はstderrへ出す。大きなsource・artifactはchunk転送し、digestとoffsetで中断再開する。ログ転送がcontrol・heartbeatを塞がないよう、別streamまたは優先制御を実装する。
@@ -519,7 +521,14 @@ retire・重複排除の最小記録はclusterの寿命中保持する。大量�
 
 親がworkerの状態を受け取り、workerは親から制御・lease更新を受ける。短い切断では有効leaseの範囲で実行を継続する。期限が切れた場合は新しいuser commandを開始せず、実行中commandと所有serviceをTERM、猶予後KILLで停止する。agentが落ちてもattempt supervisorがleaseを独立して監視する。
 
-leaseとdeadlineは受理の時点から数える。workspaceの準備中にleaseが切れたattemptはuser commandを開始せずinterruptedにし、deadlineが尽きていればtimed_outにする。supervisorには残りのdeadlineを渡す。supervisorの起動後、受理（または最後のrenew）から数えたleaseが更新されないまま切れたら、agentがDBのleaseを失効にしてsupervisorを止める。
+leaseとdeadlineは受理の時点から数える。workspaceの準備中にleaseが切れたattemptはuser commandを開始せずinterruptedにし、deadlineが尽きていればtimed_outにする。supervisorには残りのdeadlineと、leaseの残り（lease seed）を渡す。
+
+lease seedは、agentがsupervisorを起動する直前に測った「受理または最後のrenewから数えたleaseが切れる時刻」（workerの単調時計の値）と、そのとき適用済みだったlease key（`coordinator_epoch`・`lease_seq`）の組である。supervisorは自分のlease clockをこの時刻から始めるので、起動前に与えられたleaseを、起動時点から数え直して延ばすことはない。agentとsupervisorは同じhost・同じbootの同じ時計を読む。規則は次のとおりである。
+
+- seedの残りは、leaseの1期間（`lease_ms`）を上限にする。別のbootの時計の値や誤った値が渡っても、1期間より長いleaseにはならない。pollの遅れ（`poll_ms`）は、通常のgrantと同じく差し引く。
+- supervisorの起動時にDBで適用済みのlease keyがseedのkeyと違えば、seedを測った後にrenewが届いている。このときseedは無効とし、そのrenewを起動時点から1期間として数える（短く数えて、有効なleaseを切らない）。
+- seedはsupervisorを起動するたびに書き直す。seedの無いspecでは、supervisorは起動時点から1期間を数える。
+- 起動後のrenewは従来どおり、supervisorが気付いた時点から1期間として数える。
 
 renewはsequenceとrequest IDで冪等にし、同じrenewの再送で期限を再延長しない。失効・cancel・retireが確定したattemptは、遅延renewで実行許可を復活させない。共有setup builderには独立leaseを設け、少なくとも1つの有効なconsumer参照がある間だけ更新する。全参照の失効時はbuilder自身のsupervisorが停止する。
 
@@ -547,6 +556,10 @@ signalを送る前の確認は次の規則に従う（recovery・timeout・lease
 通常の実行契約はforeground commandと、remote-task-runnerが所有を追跡できるserviceである。独立daemonとして脱離する処理はservice宣言とcleanup契約を必要とする。任意コードの外部サービスへの副作用を取り消せるとは約束しない。
 
 command実行timeout、task全体deadline、資源待ちtimeoutを区別する。実行timeoutにqueue待ちを黙って含めない。全体deadlineは準備・待機・実行・回収のどこで超過したかを記録する。
+
+command実行timeoutは、attemptの既定値（`command_timeout_ms`）と、commandごとの値（`timeout_ms`）を持てる。commandごとの値があるcommandは、その実行中だけ既定値の代わりにそれを使う（既定値より長くても短くてもよく、既定値が無くてもよい）。値の無いcommandは既定値に従う。資源待ちtimeoutとdeadlineはattemptのもので、commandごとには変わらない。0と7日を超える値は受理の時点で拒否する。
+
+1つのattemptのcommandは1つずつ順に実行する。順序は `depends_on` で決まり、commandは自分が `depends_on` に挙げたすべてのcommandの後に走る。挙げる相手は一覧の前後どちらにあってもよい（後ろのcommandを挙げてもよい）。次に走れるcommandが複数あるときは、一覧で先にあるものを先に走らせるので、同じ一覧からは常に同じ順序になり、依存の無い一覧は書かれた順に走る。commandが成功しなかった時点で残りは開始しないので、依存先が失敗したcommandは走らない。attemptに無い名前を挙げた `depends_on` と、循環（自分自身を挙げるものを含む）は、受理の時点で `INVALID_INPUT` として拒否し、何も保存しない。
 
 ## 復旧動作
 
@@ -587,6 +600,17 @@ spoolに関してsupervisorがevent journalへ書くeventは次のとおりで�
 `stage` が `open` または `finish` の `spool_failed` を持つattemptは、spoolを使わずに確定しており、resultを持たない。spoolのdirectoryはlogとして参照され、最後に公開された位置が保存されるので、GCが他のattemptと同じく回収する。それ以外でterminalなのにresultが無いattemptは、supervisorが確定の途中で落ちたものであり、次のsupervisorの起動または回復が、閉じたspoolの最終位置からresultを補う。`workspace_warning` は位置（`index`）で重複を除くので、mask後に同じ文面になる別の警告も1件ずつ残る。
 
 artifactにはname、relative path、size、content digest、source ID、plan digest、attempt ID、profile fingerprintを記録する。親の受取後にhashを検証し、atomicに公開する。必須artifactが揃うまでrunをsuccessにしない。回収失敗で計算済みcommandをやり直さない。
+
+workerでは、supervisorがattemptを確定する前にartifactを保存する。resultは一度保存したら変えず、workspaceはterminalになった時点で消えるためである。supervisorのspecはartifactの一覧（name、workspace内のsource path）と、記録に使うsource ID・plan digest・profile fingerprint、1ファイルの上限（既定1 GiB）を持つ。手順は次のとおりである。
+
+1. 開始したcommandがすべて終わり、停止を確認した後（未解決のまま残るattemptでは行わない）、一覧のファイルをworkspaceから `<attempt>/artifacts/<name>` へ写す。commandの成否は問わない（失敗したcommandのreportも残す）。commandを1つも開始しなかったattempt（開始前のcancelなど）では何も探さない。
+2. 保存できたartifactの一覧を、event journalの `artifacts_stored`（attemptに1件）として確定する。
+3. その後にterminationとresultを確定する。resultのartifactは、常に `artifacts_stored` の一覧である。確定の途中でsupervisorが落ちても、次に確定する者（workspaceが既に無くてもよい）が同じ一覧をresultに入れる。`artifacts_stored` が読めないときは「artifactなし」とは扱わず、確定を失敗させる。
+4. `artifacts_stored` に載らなかったファイル（一覧の確定前に落ちたsupervisorが写したもの）は、どのresultにも参照にも入らないので、確定の時点で `<attempt>/artifacts` から消す。
+
+保存できなかったartifact（ファイルが無い、通常ファイルでない、symlinkを経由する、上限を超える、同名で内容が違う等）は一覧から外し、event `artifact_not_stored`（`name`、maskした理由 `why`。nameごとに1回）を書く。attemptのterminationは変えない。必須artifactの欠落でrunを失敗にするかどうかは、何が必須かを知る親が判定する。一覧は1024件までとし、nameが管理領域の相対pathとして使えないもの、nameどうしが衝突するもの、sourceがworkspaceの外を指すものは、commandを開始する前にspecごと拒否する。
+
+**未定義（artifactの宣言の経路）**: 親からworkerへartifactの一覧を渡す方法（attempt payloadの欄）はまだ定めていない。それまでagentは一覧の無いspecを書き、attemptのartifactは空である。宣言の経路を定めるときは、secret bundleのpathをsourceに指定した宣言をagentが拒否する（secret bundleの内容はartifactに含めない）。
 
 親は検証と永続commit後に冪等な `ack_collected` を送る。workerはそのACKを受理してから回収待ちのGC保護を解除する。単なるdownload完了やSSH正常終了を保存確認には使わない。
 
@@ -963,7 +987,7 @@ workerのprofileは版管理ツールadapter（nodenv、rustup、mise、fvm、co
 - **workerでの配置**: attempt workspaceの該当pathに0600で配置する。workerのobject store、prepared template、cache、log spool、artifact、outputsに保存しない。template keyやcache keyにはHMAC digestを含め、内容の違うbundle間でcacheを共有しない（第8章）。
 - **消去**: attemptがterminalになった時点で、ログ回収の完了を待たずに削除する。worker起動時のreconcileでも、terminal済みattemptに残るsecret_filesを削除する。
 - **復旧**: worker再起動などで実行前にbundleが失われた場合は、親が同じbundleを再送する。親がbundleを失っている場合は `blocked: secret_unavailable` とし、空のファイルや現在のファイルで黙って再開しない。
-- **ログ**: bundleに含まれる `KEY=VALUE` 形式の値を、第14章のmask対象に加える。
+- **ログ**: bundleに含まれる `KEY=VALUE` 形式の値を、第14章のmask対象に加える。workerでは、agentがsecret bundleの全ファイルの配置を確認した後、commandを開始する前に、配置済みのファイルから値を読み取り（memoryに保持しないので、bundleの到着後にagentが再起動しても同じ値になる）、supervisorのspecに入れて渡す。supervisorはcommandの出力をspoolへ保存する前に、すべてこのmaskに通す（出力の区切りをまたぐ値も置き換える）。値を運ぶspecのファイルは0600で書き、attemptの終了時にworkspaceとともに消す。8 bytes未満の値はmaskしない（短い値を置き換えると無関係な出力まで壊すため。該当した数をevent `agent_mask_skipped` に残す）。配置済みのファイルが読めない、配置時の状態でない（通常の0600ファイルでない、linkを経由する）、または値がUTF-8の文字列でない場合は、maskできないままcommandを開始せず、attemptを失敗にする。
 - **status**: secret_filesは公開commitの内容ではないため、第17章の公開commitとの一致判定を妨げない。
 
 ## 22.4 worker上の周辺tool

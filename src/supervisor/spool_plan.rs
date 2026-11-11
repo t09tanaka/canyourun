@@ -274,6 +274,93 @@ pub fn check_artifact_names(names: &[&str]) -> Result<(), ArtifactSetError> {
     Ok(())
 }
 
+/// The most artifacts one attempt may declare.
+pub const MAX_ARTIFACTS: usize = 1024;
+
+/// Why a declared set of artifacts is refused before any command runs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ArtifactPlanError {
+    TooMany,
+    /// Not a plain relative path the store can use.
+    BadName(String),
+    /// Leads out of the workspace (or is the workspace itself).
+    BadSource(String),
+    Set(ArtifactSetError),
+}
+
+impl std::fmt::Display for ArtifactPlanError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ArtifactPlanError::TooMany => write!(f, "more than {MAX_ARTIFACTS} artifacts"),
+            ArtifactPlanError::BadName(n) => {
+                write!(f, "artifact name {n:?} is not a plain relative path")
+            }
+            ArtifactPlanError::BadSource(n) => {
+                write!(
+                    f,
+                    "the source of artifact {n:?} is not inside the workspace"
+                )
+            }
+            ArtifactPlanError::Set(ArtifactSetError::Duplicate(n)) => {
+                write!(f, "artifact name {n:?} is used twice")
+            }
+            ArtifactPlanError::Set(ArtifactSetError::Nested(n)) => {
+                write!(f, "artifact name {n:?} lies below another artifact")
+            }
+        }
+    }
+}
+
+/// Everything about the declared artifacts (`(name, source)` each) that can
+/// be decided without looking at a file: how many, the names one by one and
+/// as a set, and that every source stays inside `workspace`.
+pub fn check_artifact_plan(
+    workspace: &Path,
+    files: &[(&str, &Path)],
+) -> Result<(), ArtifactPlanError> {
+    if files.len() > MAX_ARTIFACTS {
+        return Err(ArtifactPlanError::TooMany);
+    }
+    for (name, source) in files {
+        if relative_path(name).is_none() {
+            return Err(ArtifactPlanError::BadName((*name).to_string()));
+        }
+        if source_under(workspace, source).is_none() {
+            return Err(ArtifactPlanError::BadSource((*name).to_string()));
+        }
+    }
+    let names: Vec<&str> = files.iter().map(|(n, _)| *n).collect();
+    check_artifact_names(&names).map_err(ArtifactPlanError::Set)
+}
+
+/// The journal entry that fixes which artifacts an attempt has, written
+/// before the attempt is settled: whoever settles it (this supervisor, or a
+/// later one after a crash, when the workspace may be gone) stores the same
+/// list in the result.
+pub fn artifacts_event(artifacts: &[ArtifactRecord]) -> Value {
+    json!({ "set": ARTIFACTS_EVENT_KEY, "artifacts": artifacts_json(artifacts) })
+}
+
+/// The one key of the `artifacts_stored` entry: an attempt has one set.
+pub const ARTIFACTS_EVENT_KEY: &str = "attempt";
+
+/// The artifacts an attempt's journal fixed, from the payloads of its
+/// `artifacts_stored` entries: none when there is no entry (nothing was
+/// kept), `None` when an entry cannot be read. An unreadable entry is never
+/// taken for "no artifacts".
+pub fn journaled_artifacts(payloads: &[&Value]) -> Option<Vec<ArtifactRecord>> {
+    let Some(first) = payloads.first() else {
+        return Some(Vec::new());
+    };
+    serde_json::from_value(first["artifacts"].clone()).ok()
+}
+
+/// Whether `rel` (a path below the attempt's artifact directory, `/`
+/// separated) is the file of one of `artifacts`.
+pub fn is_listed_artifact(artifacts: &[ArtifactRecord], rel: &str) -> bool {
+    artifacts.iter().any(|a| a.path == rel)
+}
+
 /// A path the spool or the result store may use under its root: relative,
 /// plain components only. `name` is an artifact name or a path inside it.
 pub fn relative_path(name: &str) -> Option<PathBuf> {
@@ -659,6 +746,159 @@ mod tests {
 
     fn names(n: &[&str]) -> Result<(), ArtifactSetError> {
         check_artifact_names(n)
+    }
+
+    fn record(name: &str) -> ArtifactRecord {
+        ArtifactRecord {
+            name: name.into(),
+            path: name.into(),
+            size: 3,
+            digest: Digest::of_bytes(name.as_bytes()),
+            source_id: SourceId::generate(),
+            plan_digest: Digest::of_bytes(b"plan"),
+            attempt_id: AttemptId::generate(),
+            profile_fingerprint: Digest::of_bytes(b"profile"),
+        }
+    }
+
+    #[test]
+    fn a_declared_set_of_artifacts_is_checked_before_anything_runs() {
+        let ws = Path::new("/ws");
+        let check = |files: &[(&str, &str)]| {
+            let files: Vec<(&str, &Path)> =
+                files.iter().map(|(n, s)| (*n, Path::new(*s))).collect();
+            check_artifact_plan(ws, &files)
+        };
+        assert_eq!(check(&[]), Ok(()));
+        assert_eq!(
+            check(&[("a.txt", "out/a.txt"), ("dir/b.txt", "/ws/b.txt")]),
+            Ok(())
+        );
+        assert_eq!(
+            check(&[("../a", "a")]),
+            Err(ArtifactPlanError::BadName("../a".into()))
+        );
+        assert_eq!(
+            check(&[("ok", "a"), ("", "a")]),
+            Err(ArtifactPlanError::BadName(String::new()))
+        );
+        for source in ["../a", "/elsewhere/a", "", "/ws", "a/../b"] {
+            assert_eq!(
+                check(&[("ok", "fine"), ("a.txt", source)]),
+                Err(ArtifactPlanError::BadSource("a.txt".into())),
+                "{source}"
+            );
+        }
+        assert_eq!(
+            check(&[("a", "x"), ("A", "y")]),
+            Err(ArtifactPlanError::Set(ArtifactSetError::Duplicate(
+                "A".into()
+            )))
+        );
+        assert_eq!(
+            check(&[("a", "x"), ("a/b", "y")]),
+            Err(ArtifactPlanError::Set(ArtifactSetError::Nested(
+                "a/b".into()
+            )))
+        );
+    }
+
+    #[test]
+    fn at_most_1024_artifacts_are_declared() {
+        assert_eq!(MAX_ARTIFACTS, 1024);
+        let names: Vec<String> = (0..=MAX_ARTIFACTS).map(|i| format!("f{i}")).collect();
+        let files: Vec<(&str, &Path)> = names
+            .iter()
+            .map(|n| (n.as_str(), Path::new(n.as_str())))
+            .collect();
+        assert_eq!(
+            check_artifact_plan(Path::new("/ws"), &files[..MAX_ARTIFACTS]),
+            Ok(())
+        );
+        assert_eq!(
+            check_artifact_plan(Path::new("/ws"), &files),
+            Err(ArtifactPlanError::TooMany)
+        );
+    }
+
+    #[test]
+    fn every_refusal_of_a_declared_set_says_which_artifact_and_why() {
+        let text = |e: ArtifactPlanError| e.to_string();
+        assert_eq!(text(ArtifactPlanError::TooMany), "more than 1024 artifacts");
+        assert_eq!(
+            text(ArtifactPlanError::BadName("../a".into())),
+            "artifact name \"../a\" is not a plain relative path"
+        );
+        assert_eq!(
+            text(ArtifactPlanError::BadSource("a".into())),
+            "the source of artifact \"a\" is not inside the workspace"
+        );
+        assert_eq!(
+            text(ArtifactPlanError::Set(ArtifactSetError::Duplicate(
+                "A".into()
+            ))),
+            "artifact name \"A\" is used twice"
+        );
+        assert_eq!(
+            text(ArtifactPlanError::Set(ArtifactSetError::Nested(
+                "a/b".into()
+            ))),
+            "artifact name \"a/b\" lies below another artifact"
+        );
+    }
+
+    #[test]
+    fn the_journal_fixes_the_artifacts_of_an_attempt() {
+        let (a, b) = (record("b.txt"), record("a.txt"));
+        let event = artifacts_event(&[a.clone(), b.clone()]);
+        assert_eq!(event["set"], ARTIFACTS_EVENT_KEY);
+        assert_eq!(ARTIFACTS_EVENT_KEY, "attempt");
+        // By name, like the result: the same set is the same entry.
+        assert_eq!(event, artifacts_event(&[b.clone(), a.clone()]));
+        assert_eq!(
+            journaled_artifacts(&[&event]),
+            Some(vec![b.clone(), a.clone()])
+        );
+        // What it fixed is what the result must list.
+        let none = StreamSummary {
+            bytes: 0,
+            dropped_bytes: 0,
+            last_seq: 0,
+        };
+        let stored = result_json(
+            &Termination::new(Outcome::Succeeded, Some(crate::state::Exit::Code(0)), None).unwrap(),
+            &journaled_artifacts(&[&event]).unwrap(),
+            none,
+            none,
+        );
+        assert!(result_has_artifacts(&stored, &[a.clone(), b.clone()]));
+        // No entry: nothing was kept. An entry that fixed none: none.
+        assert_eq!(journaled_artifacts(&[]), Some(vec![]));
+        assert_eq!(journaled_artifacts(&[&artifacts_event(&[])]), Some(vec![]));
+        // The first entry is the one that holds (there is only ever one).
+        let other = artifacts_event(std::slice::from_ref(&a));
+        assert_eq!(
+            journaled_artifacts(&[&other, &event]),
+            Some(vec![a.clone()])
+        );
+        // Unreadable is not "none".
+        assert_eq!(journaled_artifacts(&[&json!({})]), None);
+        assert_eq!(journaled_artifacts(&[&json!({"artifacts": "x"})]), None);
+        assert_eq!(
+            journaled_artifacts(&[&json!({"artifacts": [{"name": "a"}]})]),
+            None
+        );
+    }
+
+    #[test]
+    fn a_file_is_listed_only_by_its_exact_path() {
+        let kept = [record("a.txt"), record("dir/b.txt")];
+        assert!(is_listed_artifact(&kept, "a.txt"));
+        assert!(is_listed_artifact(&kept, "dir/b.txt"));
+        assert!(!is_listed_artifact(&kept, "b.txt"));
+        assert!(!is_listed_artifact(&kept, "dir"));
+        assert!(!is_listed_artifact(&kept, "A.txt"));
+        assert!(!is_listed_artifact(&[], "a.txt"));
     }
 
     #[test]

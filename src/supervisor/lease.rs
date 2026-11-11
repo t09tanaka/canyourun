@@ -15,6 +15,24 @@
 //! decisions are pure.
 
 use crate::wire::LeaseKey;
+use serde::{Deserialize, Serialize};
+
+/// What the agent tells a supervisor it starts about the lease that is
+/// already running: the grant (the acceptance or the last renewal) was made
+/// before the supervisor existed, so the supervisor counts what is left of it
+/// and not a full period.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LeaseSeed {
+    /// When the grant runs out, on the worker's monotonic clock (suspend
+    /// included). The agent and the supervisor read the same clock of the
+    /// same boot.
+    pub ends_mono_ms: u64,
+    /// The highest key applied when the agent measured that. A different key
+    /// in the database at the supervisor's start means a renewal arrived in
+    /// between, and the seed says nothing about that one.
+    #[serde(default)]
+    pub key: Option<LeaseKey>,
+}
 
 /// Where the lease stands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -47,6 +65,28 @@ impl LeaseClock {
             applied,
             expired: false,
         }
+    }
+
+    /// [`LeaseClock::start`] for a lease that began before the supervisor
+    /// did. With a `seed` measured against the key that is still the applied
+    /// one, the countdown ends where the seed says, never later than a full
+    /// period from now (a seed from another boot would otherwise be a lease
+    /// without end) and less `poll_ms` like every grant. A seed whose key is
+    /// not the applied one is void: a renewal arrived after it was measured,
+    /// and that grant is counted in full from now.
+    pub fn start_seeded(
+        now_ms: u64,
+        duration_ms: u64,
+        poll_ms: u64,
+        applied: Option<LeaseKey>,
+        seed: Option<LeaseSeed>,
+    ) -> Self {
+        let mut clock = Self::start(now_ms, duration_ms, poll_ms, applied);
+        if let Some(seed) = seed.filter(|s| s.key == applied) {
+            let left = seed.ends_mono_ms.saturating_sub(now_ms).min(duration_ms);
+            clock.deadline_ms = now_ms.saturating_add(left.saturating_sub(poll_ms));
+        }
+        clock
     }
 
     /// Look at the database again at `now_ms`. `seen` is the highest key
@@ -197,6 +237,83 @@ mod tests {
     fn a_poll_longer_than_the_lease_expires_it_at_once() {
         let mut c = LeaseClock::start(500, 50, 100, None);
         assert_eq!(c.observe(500, None, false), LeaseStatus::Expired);
+    }
+
+    fn seed(ends: u64, key: Option<LeaseKey>) -> Option<LeaseSeed> {
+        Some(LeaseSeed {
+            ends_mono_ms: ends,
+            key,
+        })
+    }
+
+    #[test]
+    fn a_seed_counts_what_is_left_of_the_grant_not_a_full_period() {
+        // Granted at 0 for 10 s; the supervisor starts at 7 s.
+        let mut c = LeaseClock::start_seeded(7_000, 10_000, 0, None, seed(10_000, None));
+        assert_eq!(c.observe(7_000, None, false), valid(3_000));
+        assert_eq!(c.observe(9_999, None, false), valid(1));
+        assert_eq!(c.observe(10_000, None, false), LeaseStatus::Expired);
+        // The same after a renewal the seed was measured against.
+        let k = Some(key(1, 3));
+        let mut c = LeaseClock::start_seeded(7_000, 10_000, 0, k, seed(10_000, k));
+        assert_eq!(c.observe(7_000, k, false), valid(3_000));
+        // A renewal noticed later is a full period again.
+        assert_eq!(c.observe(8_000, Some(key(1, 4)), false), valid(10_000));
+        // Without a seed, the start is a full period as before.
+        let mut c = LeaseClock::start_seeded(7_000, 10_000, 0, k, None);
+        assert_eq!(c.observe(7_000, k, false), valid(10_000));
+    }
+
+    #[test]
+    fn the_noticing_delay_is_taken_off_a_seed_too() {
+        let mut c = LeaseClock::start_seeded(7_000, 10_000, 100, None, seed(10_000, None));
+        assert_eq!(c.observe(7_000, None, false), valid(2_900));
+        assert_eq!(c.observe(9_900, None, false), LeaseStatus::Expired);
+        // Less left than one poll: nothing is left.
+        let mut c = LeaseClock::start_seeded(9_950, 10_000, 100, None, seed(10_000, None));
+        assert_eq!(c.observe(9_950, None, false), LeaseStatus::Expired);
+    }
+
+    #[test]
+    fn a_seed_that_ran_out_expires_the_lease_at_once() {
+        let mut c = LeaseClock::start_seeded(10_000, 10_000, 0, None, seed(10_000, None));
+        assert_eq!(c.observe(10_000, None, false), LeaseStatus::Expired);
+        let mut c = LeaseClock::start_seeded(50_000, 10_000, 0, None, seed(10_000, None));
+        assert_eq!(
+            c.observe(50_000, Some(key(1, 1)), false),
+            LeaseStatus::Expired
+        );
+    }
+
+    #[test]
+    fn a_seed_is_never_worth_more_than_one_period() {
+        // A value of another boot's clock, or a wrong one.
+        let mut c = LeaseClock::start_seeded(1_000, 10_000, 100, None, seed(u64::MAX, None));
+        assert_eq!(c.observe(1_000, None, false), valid(9_900));
+        let mut c = LeaseClock::start_seeded(1_000, 10_000, 0, None, seed(11_001, None));
+        assert_eq!(c.observe(1_000, None, false), valid(10_000));
+        let mut c = LeaseClock::start_seeded(1_000, 10_000, 0, None, seed(10_999, None));
+        assert_eq!(c.observe(1_000, None, false), valid(9_999));
+    }
+
+    #[test]
+    fn a_seed_measured_before_a_renewal_is_void() {
+        // The agent measured against (1, 3); (1, 4) was applied before the
+        // supervisor started: that grant is counted in full.
+        let mut c = LeaseClock::start_seeded(
+            7_000,
+            10_000,
+            0,
+            Some(key(1, 4)),
+            seed(7_500, Some(key(1, 3))),
+        );
+        assert_eq!(c.observe(7_000, Some(key(1, 4)), false), valid(10_000));
+        // Also the first renewal after a grant without one, and a seed that
+        // names a key the database does not have.
+        let mut c = LeaseClock::start_seeded(7_000, 10_000, 0, Some(key(1, 1)), seed(7_500, None));
+        assert_eq!(c.observe(7_000, Some(key(1, 1)), false), valid(10_000));
+        let mut c = LeaseClock::start_seeded(7_000, 10_000, 0, None, seed(7_500, Some(key(1, 1))));
+        assert_eq!(c.observe(7_000, None, false), valid(10_000));
     }
 
     #[test]

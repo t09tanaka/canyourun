@@ -10,6 +10,7 @@ use crate::error::{ApiError, ErrorCode};
 use crate::ids::AttemptId;
 use crate::platform;
 use crate::secrets::capture::sweep_store_copies;
+use crate::secrets::envfile::Values;
 use crate::secrets::key;
 use crate::secrets::place::WorkerSecrets;
 use crate::secrets::vault::Vault;
@@ -185,6 +186,12 @@ impl Host for Machine {
             Err(SecretError::PathSetMismatch) => Ok(false),
             Err(e) => Err(e.to_api()),
         }
+    }
+
+    fn mask_values(&self, attempt: &AcceptedAttempt) -> Result<Values, ApiError> {
+        self.secrets
+            .mask_values(&attempt.attempt_id)
+            .map_err(|e| e.to_api())
     }
 
     fn cleanup(&self, attempt: &AttemptId, workspace: Option<&Workspace>) -> Result<(), ApiError> {

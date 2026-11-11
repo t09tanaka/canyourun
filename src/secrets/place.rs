@@ -29,8 +29,11 @@
 //! [`WorkerSecrets::place`] already, since its files are not in this
 //! attempt's manifest.
 
+use super::envfile::{secret_values, Values};
 use super::key::ClusterKey;
-use super::plan::{check_limits, check_paths, ct_eq, to_wire_digest, Limit, MAX_FILES};
+use super::plan::{
+    check_limits, check_paths, ct_eq, to_wire_digest, Limit, MAX_FILES, MAX_FILE_BYTES,
+};
 use super::vault::{read_private, sweep_stale_tmp, write_private, STALE_TMP_AGE};
 use super::{Result, SecretError};
 use crate::ids::AttemptId;
@@ -324,6 +327,64 @@ impl WorkerSecrets {
             }
         }
         Ok(())
+    }
+
+    /// The strings to mask in what the attempt's commands print: the
+    /// `KEY=VALUE` values of every file placed for it (the same rule as the
+    /// coordinator's [`super::vault::HeldBundle::mask_values`]), read from the
+    /// files as they are in the workspace now. Read from the files and not
+    /// kept in memory, so an agent that restarted after the bundle arrived
+    /// masks the same values. Call it after [`WorkerSecrets::ensure_placed`]
+    /// and before the commands start. A file that is missing, not a regular
+    /// 0600 file, reached through a link or larger than a placed file can be
+    /// is an error: the attempt is not started with something unmasked.
+    pub fn mask_values(&self, attempt: &AttemptId) -> Result<Values> {
+        let mut all = Values::default();
+        let Some(rec) = self.load_record(attempt)? else {
+            return Ok(all);
+        };
+        let root = PathBuf::from(&rec.workspace);
+        let mut skipped = BTreeSet::new();
+        for p in &rec.paths {
+            let gone = || placement(format!("{p} is not in the workspace"));
+            let (last, parents) = split_rel(p)?;
+            let Walk::Dir(dir) = walk_existing(&root, &parents, p)? else {
+                return Err(gone());
+            };
+            let flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK;
+            let fd = rustix::fs::openat(dir.as_fd(), last, flags, Mode::empty()).map_err(|e| {
+                if e == Errno::NOENT || is_not_dir(e) {
+                    gone()
+                } else {
+                    SecretError::io(format!("secret file {p}"), errno_io(e))
+                }
+            })?;
+            let file = File::from(fd);
+            let meta = file
+                .metadata()
+                .map_err(|e| SecretError::io(format!("secret file {p}"), e))?;
+            if !meta.is_file() || meta.mode() & 0o777 != 0o600 {
+                return Err(placement(format!(
+                    "{p} is not a regular file with mode 0600"
+                )));
+            }
+            let mut content = Vec::new();
+            file.take(MAX_FILE_BYTES as u64 + 1)
+                .read_to_end(&mut content)
+                .map_err(|e| SecretError::io(format!("secret file {p}"), e))?;
+            if content.len() > MAX_FILE_BYTES {
+                return Err(placement(format!("{p} grew since it was placed")));
+            }
+            let v = secret_values(&content);
+            for x in v.values {
+                if !all.values.contains(&x) {
+                    all.values.push(x);
+                }
+            }
+            skipped.extend(v.skipped_keys);
+        }
+        all.skipped_keys = skipped.into_iter().collect();
+        Ok(all)
     }
 
     /// Remove the files placed for `attempt` and forget them. Idempotent.
@@ -800,6 +861,96 @@ mod tests {
             Err(SecretError::Io { .. })
         ));
         assert!(!e.ws.join(".env").exists());
+    }
+
+    #[test]
+    fn the_values_to_mask_are_read_from_the_files_in_place() {
+        let e = env();
+        let a = AttemptId::generate();
+        // Nothing placed: nothing to mask.
+        assert_eq!(e.ws_secrets.mask_values(&a).unwrap(), Values::default());
+        let files = [
+            file(&e.key, ".env", "TOKEN=aaaa-1111-bbbb\nPORT=80\n"),
+            file(
+                &e.key,
+                "conf/db.env",
+                "PASSWORD=cccc-2222-dddd\nTOKEN=aaaa-1111-bbbb\n",
+            ),
+        ];
+        e.ws_secrets.put(&e.key, &a, &e.ws, &files).unwrap();
+        let v = e.ws_secrets.mask_values(&a).unwrap();
+        let mut values = v.values.clone();
+        values.sort();
+        // Every file's values, each once; the short one is named, not masked.
+        assert_eq!(
+            values,
+            [b"aaaa-1111-bbbb".to_vec(), b"cccc-2222-dddd".to_vec()]
+        );
+        assert_eq!(v.skipped_keys, ["PORT"]);
+        // A second instance (an agent that restarted) reads the same.
+        let again = WorkerSecrets::open(&e.state).unwrap();
+        assert_eq!(again.mask_values(&a).unwrap(), v);
+        // Another attempt has none of them.
+        assert_eq!(
+            e.ws_secrets.mask_values(&AttemptId::generate()).unwrap(),
+            Values::default()
+        );
+    }
+
+    #[test]
+    fn a_placed_file_that_is_not_as_placed_gives_no_values_but_an_error() {
+        let placed = |e: &Env| {
+            let a = AttemptId::generate();
+            let files = [file(&e.key, "conf/.env", "TOKEN=aaaa-1111-bbbb")];
+            e.ws_secrets.put(&e.key, &a, &e.ws, &files).unwrap();
+            a
+        };
+        let target = |e: &Env| e.ws.join("conf/.env");
+        // Gone.
+        let e = env();
+        let a = placed(&e);
+        fs::remove_file(target(&e)).unwrap();
+        assert!(matches!(
+            e.ws_secrets.mask_values(&a),
+            Err(SecretError::Placement(_))
+        ));
+        // Replaced by a link to another file.
+        let e = env();
+        let a = placed(&e);
+        fs::remove_file(target(&e)).unwrap();
+        fs::write(e.state.join("elsewhere"), b"TOKEN=zzzz-9999-yyyy").unwrap();
+        symlink(e.state.join("elsewhere"), target(&e)).unwrap();
+        assert!(e.ws_secrets.mask_values(&a).is_err());
+        // Its directory replaced by a link.
+        let e = env();
+        let a = placed(&e);
+        fs::rename(e.ws.join("conf"), e.state.join("moved")).unwrap();
+        symlink(e.state.join("moved"), e.ws.join("conf")).unwrap();
+        assert!(matches!(
+            e.ws_secrets.mask_values(&a),
+            Err(SecretError::Placement(_))
+        ));
+        // Opened to others.
+        let e = env();
+        let a = placed(&e);
+        fs::set_permissions(target(&e), fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(matches!(
+            e.ws_secrets.mask_values(&a),
+            Err(SecretError::Placement(_))
+        ));
+        // Grown beyond what can be placed.
+        let e = env();
+        let a = placed(&e);
+        fs::write(target(&e), vec![b'x'; MAX_FILE_BYTES + 1]).unwrap();
+        assert!(matches!(
+            e.ws_secrets.mask_values(&a),
+            Err(SecretError::Placement(_))
+        ));
+        // Exactly the largest is read.
+        let e = env();
+        let a = placed(&e);
+        fs::write(target(&e), vec![b'x'; MAX_FILE_BYTES]).unwrap();
+        assert!(e.ws_secrets.mask_values(&a).is_ok());
     }
 
     #[test]

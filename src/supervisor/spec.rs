@@ -2,8 +2,10 @@
 //! attempt, the nodes to run in order, the timing, and where output goes.
 
 use super::error::{Result, SupervisorError};
+use super::lease::LeaseSeed;
+use super::spool_plan::check_artifact_plan;
 use super::timeouts::TimeoutPolicy;
-use crate::ids::{AttemptId, NodeId, WorkerId};
+use crate::ids::{AttemptId, NodeId, PlanDigest, SourceId, WorkerId};
 use crate::secrets::mask::Masker;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -17,6 +19,8 @@ pub const DEFAULT_LEASE_MS: u64 = 60_000;
 pub const DEFAULT_TERM_GRACE_MS: u64 = 10_000;
 /// The spec's default cap on the log bytes one task may store on a worker.
 pub const DEFAULT_LOG_LIMIT_BYTES: u64 = 1 << 30;
+/// The largest single artifact kept, unless the spec says otherwise (1 GiB).
+pub const DEFAULT_ARTIFACT_BYTES: u64 = 1_073_741_824;
 const DEFAULT_KILL_WAIT_MS: u64 = 10_000;
 const DEFAULT_POLL_MS: u64 = 200;
 
@@ -38,6 +42,9 @@ fn d_true() -> bool {
 fn d_log_limit() -> u64 {
     DEFAULT_LOG_LIMIT_BYTES
 }
+fn d_artifact_bytes() -> u64 {
+    DEFAULT_ARTIFACT_BYTES
+}
 
 /// One command of the attempt (a step, a setup builder, ...). Its stdout and
 /// stderr go to the attempt's log spool (stdin is `/dev/null`). `Debug` shows
@@ -53,6 +60,10 @@ pub struct NodeSpec {
     pub env: BTreeMap<String, String>,
     #[serde(default)]
     pub weight: Option<u32>,
+    /// This command's own run-time limit; replaces the attempt's
+    /// `command_timeout_ms` while it runs.
+    #[serde(default)]
+    pub timeout_ms: Option<u64>,
 }
 
 impl std::fmt::Debug for NodeSpec {
@@ -63,6 +74,7 @@ impl std::fmt::Debug for NodeSpec {
             .field("cwd", &self.cwd)
             .field("env", &self.env.keys().collect::<Vec<_>>())
             .field("weight", &self.weight)
+            .field("timeout_ms", &self.timeout_ms)
             .finish()
     }
 }
@@ -85,6 +97,34 @@ impl MaskValues {
     pub fn masker(&self) -> Masker {
         Masker::new(self.0.iter().map(|v| v.clone().into_bytes()))
     }
+}
+
+/// A file the commands leave in the workspace, to be kept as an artifact.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ArtifactFile {
+    /// The artifact's name and its relative path in the attempt's store.
+    pub name: String,
+    /// Where the commands leave it: below `workspace` (relative to it, or
+    /// absolute and inside it).
+    pub source: PathBuf,
+}
+
+/// The artifacts of the attempt. The supervisor copies them out of the
+/// workspace once the commands have ended and before it settles the attempt:
+/// the result names them and is never changed afterwards, and the workspace
+/// is removed as soon as the attempt is terminal.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ArtifactsSpec {
+    /// The attempt's workspace root; no source may lead out of it.
+    pub workspace: PathBuf,
+    /// Recorded with every artifact (spec chapter 13).
+    pub source_id: SourceId,
+    pub plan_digest: PlanDigest,
+    pub profile_fingerprint: crate::ids::Digest,
+    /// A file larger than this is not kept.
+    #[serde(default = "d_artifact_bytes")]
+    pub max_bytes: u64,
+    pub files: Vec<ArtifactFile>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -119,6 +159,11 @@ pub struct SuperviseSpec {
     /// agent passes what is left of it).
     #[serde(default)]
     pub deadline_ms: Option<u64>,
+    /// The lease as it stood when the agent started this supervisor (it
+    /// began at the acceptance or the last renewal). Without it the
+    /// supervisor counts a full `lease_ms` from its own start.
+    #[serde(default)]
+    pub lease_seed: Option<LeaseSeed>,
     /// Hold an idle-sleep inhibition while running.
     #[serde(default = "d_true")]
     pub inhibit_sleep: bool,
@@ -139,6 +184,9 @@ pub struct SuperviseSpec {
     /// in the workspace warnings. Required, so that a writer who forgot it is
     /// told; an explicit empty list means nothing is masked.
     pub mask: MaskValues,
+    /// The files to keep as artifacts; none when absent.
+    #[serde(default)]
+    pub artifacts: Option<ArtifactsSpec>,
 }
 
 impl SuperviseSpec {
@@ -172,6 +220,22 @@ impl SuperviseSpec {
             }
             if !seen.insert(n.node_id.as_str()) {
                 return bad("duplicate node_id");
+            }
+            if n.timeout_ms == Some(0) {
+                return bad("a timeout of zero is not a timeout");
+            }
+        }
+        if let Some(a) = &self.artifacts {
+            if !a.workspace.is_absolute() {
+                return bad("the artifacts' workspace must be an absolute path");
+            }
+            let files: Vec<(&str, &Path)> = a
+                .files
+                .iter()
+                .map(|f| (f.name.as_str(), f.source.as_path()))
+                .collect();
+            if let Err(e) = check_artifact_plan(&a.workspace, &files) {
+                return Err(SupervisorError::Spec(e.to_string()));
             }
         }
         Ok(())
@@ -261,6 +325,7 @@ mod tests {
             cwd: "/".into(),
             env: BTreeMap::new(),
             weight: None,
+            timeout_ms: None,
         }
     }
 
@@ -279,11 +344,13 @@ mod tests {
             command_timeout_ms: None,
             resource_wait_timeout_ms: None,
             deadline_ms: None,
+            lease_seed: None,
             inhibit_sleep: false,
             spool_root: Some("/spool".into()),
             log_limit_bytes: DEFAULT_LOG_LIMIT_BYTES,
             workspace_warnings: vec![],
             mask: MaskValues::default(),
+            artifacts: None,
         }
     }
 
