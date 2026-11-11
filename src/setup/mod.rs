@@ -3,4 +3,6 @@
 //!
 //! - [`policy`]: the decisions, free of I/O (coverage and mutation gates)
 
+pub mod builder;
 pub mod policy;
+pub mod store;

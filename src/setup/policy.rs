@@ -80,9 +80,6 @@ pub fn validate(spec: &SetupSpec) -> Result<(), String> {
         if s.run.contains('\0') {
             return Err(format!("step {}: the script holds a NUL", s.id));
         }
-        if shell_argv(s.shell.as_deref(), &s.run).is_none() {
-            return Err(format!("step {}: unsupported shell", s.id));
-        }
         let bytes: usize = s.env.iter().map(|(k, v)| k.len() + v.len()).sum();
         if s.env.len() > MAX_ENV_ENTRIES || bytes > MAX_ENV_BYTES {
             return Err(format!("step {}: too much environment", s.id));
@@ -98,13 +95,13 @@ pub fn validate(spec: &SetupSpec) -> Result<(), String> {
 }
 
 /// The steps a builder prepares: the leading ones whose environment is all
-/// known. A step with an environment only known at run time stays with its
+/// known and whose shell this worker runs. Any other step stays with its
 /// consumer, and so does every step after it (it may depend on it).
 pub fn hoisted(spec: &SetupSpec) -> &[SetupStep] {
     let n = spec
         .steps
         .iter()
-        .position(|s| !s.unresolved_env.is_empty())
+        .position(|s| !s.unresolved_env.is_empty() || shell_argv(s.shell.as_deref(), "").is_none())
         .unwrap_or(spec.steps.len());
     &spec.steps[..n]
 }
@@ -654,8 +651,8 @@ mod tests {
         assert!(validate(&one(&|s| s.run = "x".repeat(MAX_RUN_BYTES))).is_ok());
         assert!(bad(&one(&|s| s.run = "x".repeat(MAX_RUN_BYTES + 1))).contains("script"));
         assert!(bad(&one(&|s| s.run = "a\0b".into())).contains("NUL"));
-        assert!(bad(&one(&|s| s.shell = Some("zsh".into()))).contains("shell"));
-        assert!(validate(&one(&|s| s.shell = Some("sh".into()))).is_ok());
+        // a shell the worker does not run is not an error: the step stays
+        assert!(validate(&one(&|s| s.shell = Some("pwsh".into()))).is_ok());
         // environment
         let env = |n: usize| -> BTreeMap<String, String> {
             (0..n).map(|i| (format!("K{i}"), "v".to_string())).collect()
@@ -687,6 +684,12 @@ mod tests {
         s.steps[0].unresolved_env = vec!["X".into()];
         assert!(ids(&s).is_empty());
         assert!(hoisted(&spec(&[])).is_empty());
+        // a shell this worker does not run: that step and the ones after it
+        let mut t = spec(&["a", "b", "c"]);
+        t.steps[1].shell = Some("pwsh".into());
+        assert_eq!(ids(&t), ["a"]);
+        t.steps[1].shell = Some("sh".into());
+        assert_eq!(ids(&t), ["a", "b", "c"]);
     }
 
     #[test]
