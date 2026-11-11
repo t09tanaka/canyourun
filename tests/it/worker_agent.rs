@@ -8,7 +8,7 @@ use crate::common::{alive, read_pid};
 use crate::proto_common;
 
 use proto_common::client_cfg;
-use remote_task_runner::error::{ApiError, ErrorCode};
+use remote_task_runner::error::{ApiError, ConflictReason, ErrorCode};
 use remote_task_runner::ids::*;
 use remote_task_runner::protocol::transport::duplex_pair;
 use remote_task_runner::protocol::{connect, CallError, Client};
@@ -484,6 +484,7 @@ async fn the_same_attempt_with_another_payload_is_a_conflict() {
     other.commands[0].argv[2] = "echo other".into();
     let e = call(&c, submit_req(&a, &other)).await.unwrap_err();
     assert_eq!(e.code, ErrorCode::Conflict);
+    assert_eq!(e.conflict_reason, Some(ConflictReason::PayloadMismatch));
 
     // A hash that is not the payload's is refused before anything is stored.
     let fresh = AttemptId::generate();
