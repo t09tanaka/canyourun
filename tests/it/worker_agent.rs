@@ -1657,6 +1657,11 @@ async fn a_watcher_that_panics_fails_its_attempt_and_frees_it() {
     submit(&c, &a, &payload("true")).await;
     assert_eq!(f.wait_terminal(&a), Outcome::Failed);
     assert_eq!(events(&f, &a, "agent_drive_panicked"), 1);
+    // `give_up` settles the attempt first and notes the event after: the
+    // event is waited for, not read the moment the attempt is terminal.
+    wait_for("the agent_gave_up event", || {
+        events(&f, &a, "agent_gave_up") >= 1
+    });
     assert_eq!(events(&f, &a, "agent_gave_up"), 1);
     wait_for("the cleanup", || f.host.count(&format!("cleanup {a}")) > 0);
     // The agent goes on: the next attempt runs.
@@ -2020,6 +2025,11 @@ async fn a_supervisor_that_cannot_be_started_is_tried_five_times_then_the_attemp
     submit(&c, &a, &payload("true")).await;
     assert_eq!(f.wait_terminal(&a), Outcome::Interrupted);
     assert_eq!(events(&f, &a, "agent_spawn_failed"), 5);
+    // `give_up` settles the attempt first and notes the event after: the
+    // event is waited for, not read the moment the attempt is terminal.
+    wait_for("the agent_gave_up event", || {
+        events(&f, &a, "agent_gave_up") >= 1
+    });
     assert_eq!(events(&f, &a, "agent_gave_up"), 1);
     wait_for("the cleanup", || f.host.count(&format!("cleanup {a}")) > 0);
 }
