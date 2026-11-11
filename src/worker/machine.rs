@@ -42,6 +42,9 @@ fn internal(what: &str, e: impl std::fmt::Display) -> ApiError {
 impl Machine {
     /// `env` is what Git, fast-worktree and the project's hooks run with
     /// (`HOME` and `PATH` at least); `key_path` is the cluster key file.
+    ///
+    /// Refused (`BLOCKED`, `environment_mismatch`) when that Git cannot be
+    /// run or is older than 2.31.
     pub fn open(
         state_dir: &Path,
         env: BTreeMap<String, String>,
@@ -50,6 +53,10 @@ impl Machine {
         let store = SourceStore::open(state_dir).map_err(|e| internal("source store", e))?;
         let secrets = WorkerSecrets::open(state_dir).map_err(|e| e.to_api())?;
         let fw = Arc::new(CliFastWorktree::new(env.clone()));
+        let workspaces = Workspaces::new(state_dir.to_path_buf(), env.clone(), fw.clone());
+        // Before anything is served: a Git that cannot unpack a bundle would
+        // answer for every source as if the source were at fault.
+        workspaces.check_git()?;
         let incoming = Incoming::new(
             state_dir,
             store.clone(),
@@ -60,7 +67,7 @@ impl Machine {
             incoming,
             state_dir: state_dir.to_path_buf(),
             store,
-            workspaces: Workspaces::new(state_dir.to_path_buf(), env, fw),
+            workspaces,
             secrets,
             key_path,
         })

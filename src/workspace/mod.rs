@@ -30,7 +30,7 @@ pub mod plan;
 pub use fastwt::{CliFastWorktree, FastWorktree, DEFAULT_TIMEOUT as DEFAULT_PREPARE_TIMEOUT};
 pub use plan::FwFailure;
 
-use crate::error::{ApiError, ErrorCode};
+use crate::error::{ApiError, BlockedReason, ErrorCode};
 use crate::ids::AttemptId;
 use crate::source::classify::api_error_of;
 use crate::source::{ObjectsRepo, SourceStore};
@@ -103,6 +103,18 @@ fn io_err(what: &str, e: std::io::Error) -> ApiError {
 impl Workspaces {
     pub fn new(state_dir: PathBuf, env: Env, fw: Arc<dyn FastWorktree>) -> Self {
         Workspaces { state_dir, env, fw }
+    }
+
+    /// What a worker asks of its Git before it serves anything: that it
+    /// runs, and is 2.31 or newer (`git fetch --atomic`). An older one would fail
+    /// every bundle it is sent, whatever the bundle.
+    pub fn check_git(&self) -> Result<(), ApiError> {
+        git::check_version(&self.env).map_err(|e| {
+            ApiError::blocked(
+                BlockedReason::EnvironmentMismatch,
+                format!("this worker cannot start: {e:#}"),
+            )
+        })
     }
 
     pub fn workspaces_root(&self) -> PathBuf {
