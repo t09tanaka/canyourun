@@ -8,7 +8,7 @@
 use super::blobs::BlobSink;
 use crate::error::ApiError;
 use crate::ids::AttemptId;
-use crate::secrets::envfile::Values;
+use crate::secrets::place::Placed;
 use crate::storage::AcceptedAttempt;
 use crate::wire::{AttemptPayload, SecretFile};
 use crate::workspace::Workspace;
@@ -51,10 +51,11 @@ pub trait Host: Send + Sync {
     /// arrived yet, an error when what is there is wrong.
     fn secrets_ready(&self, attempt: &AcceptedAttempt) -> Result<bool, ApiError>;
     /// The secret values to mask in the output of the attempt's commands,
-    /// from the secret files in place. Called after [`Host::secrets_ready`]
+    /// from the secret files in place, and which files those are (what no
+    /// artifact may be, under any name). Called after [`Host::secrets_ready`]
     /// said `true` and before the commands start; an error keeps them from
     /// starting.
-    fn mask_values(&self, attempt: &AcceptedAttempt) -> Result<Values, ApiError>;
+    fn placed_secrets(&self, attempt: &AcceptedAttempt) -> Result<Placed, ApiError>;
     /// The attempt ended: erase its secret files and remove its workspace.
     /// Idempotent.
     fn cleanup(&self, attempt: &AttemptId, workspace: Option<&Workspace>) -> Result<(), ApiError>;

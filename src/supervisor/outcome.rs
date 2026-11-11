@@ -23,6 +23,8 @@ use super::spool_plan::{
     sha256_digest, source_under, with_not_stored, ArtifactSetError, StreamSummary,
 };
 use crate::ids::{AttemptId, Digest, PlanDigest, SourceId};
+use crate::secrets::mask::Masker;
+use crate::secrets::place::FileIdentity;
 use crate::state::Termination;
 use crate::storage::{BlobKind, LogPosition, NewBlobRef, StorageError, WorkerStore};
 use crate::wire::{ArtifactNotStored, ArtifactRecord};
@@ -60,6 +62,17 @@ pub enum OutcomeError {
     BadSource(PathBuf),
     #[error("artifact source {} is not a regular file", .0.display())]
     NotRegular(PathBuf),
+    /// Nothing is at the declared source: the file, or a directory on the
+    /// way to it, does not exist. Only the source side says this; a
+    /// destination that is not there is an [`OutcomeError::Io`].
+    #[error("artifact source {} does not exist", .0.display())]
+    SourceMissing(PathBuf),
+    /// The source is one of the attempt's secret files, under whatever name.
+    #[error("artifact source {} is one of the attempt's secret files", .0.display())]
+    SecretFile(PathBuf),
+    /// The content holds a secret value. The value is not said.
+    #[error("artifact {0} contains a secret value of the attempt")]
+    SecretContent(String),
     #[error("artifact names clash: {0:?}")]
     NameClash(String),
     /// A recorded artifact is missing or is not what its record says.
@@ -73,6 +86,25 @@ pub enum OutcomeError {
 
 pub type Result<T, E = OutcomeError> = std::result::Result<T, E>;
 
+/// What is never kept as an artifact, whatever its declaration is called.
+#[derive(Debug, Clone)]
+pub struct Forbidden {
+    /// The attempt's secret files as they were placed in the workspace.
+    pub files: Vec<FileIdentity>,
+    /// The attempt's secret values (the ones masked in its output).
+    pub values: Masker,
+}
+
+impl Forbidden {
+    /// For an attempt without secrets.
+    pub fn nothing() -> Self {
+        Forbidden {
+            files: Vec::new(),
+            values: Masker::new([]),
+        }
+    }
+}
+
 /// An artifact the command produced, to be copied into the attempt's store.
 #[derive(Debug, Clone)]
 pub struct ArtifactInput<'a> {
@@ -82,6 +114,15 @@ pub struct ArtifactInput<'a> {
     pub source_id: SourceId,
     pub plan_digest: PlanDigest,
     pub profile_fingerprint: Digest,
+    pub forbidden: &'a Forbidden,
+}
+
+/// `NotFound` on the way to the source is "nothing is there".
+fn source_io(source: &Path) -> impl Fn(io::Error) -> OutcomeError + '_ {
+    |e| match e.kind() {
+        io::ErrorKind::NotFound => OutcomeError::SourceMissing(source.to_path_buf()),
+        _ => e.into(),
+    }
 }
 
 fn artifacts_root(root: &Path, attempt: &AttemptId) -> PathBuf {
@@ -101,12 +142,15 @@ fn checked_source(workspace: &Path, source: &Path) -> Result<(PathBuf, fs::Metad
     let mut cur = workspace.to_path_buf();
     for c in dirs {
         cur.push(c);
-        if !fs::symlink_metadata(&cur)?.is_dir() {
+        if !fs::symlink_metadata(&cur)
+            .map_err(source_io(source))?
+            .is_dir()
+        {
             return Err(OutcomeError::BadSource(source.to_path_buf()));
         }
     }
     cur.push(last);
-    let meta = fs::symlink_metadata(&cur)?;
+    let meta = fs::symlink_metadata(&cur).map_err(source_io(source))?;
     if !meta.file_type().is_file() {
         return Err(OutcomeError::NotRegular(source.to_path_buf()));
     }
@@ -123,6 +167,16 @@ fn checked_source(workspace: &Path, source: &Path) -> Result<(PathBuf, fs::Metad
 /// the same content is a replay (the existing file is kept); with other content
 /// it is a conflict. Call it after the command has exited: a directory swapped
 /// for a symlink between the check and the open is not defended against.
+///
+/// Secrets (`input.forbidden`): the file that was opened is compared, by
+/// device and inode of the open handle, with the secret files placed for the
+/// attempt, so a secret file is refused under any name that reaches it (a
+/// spelling the file system folds to it, a hard link, a rename). The content
+/// is searched for the attempt's secret values while it is copied, so a
+/// plain copy of such a value is refused too and nothing of it is kept. That
+/// is all: a secret file whose values are not masked (not `KEY=VALUE`, or
+/// too short or too common to mask) is not recognised in a copy, and neither
+/// is a transformed one (encoded, compressed, split).
 pub fn store_artifact(
     root: &Path,
     attempt: &AttemptId,
@@ -133,11 +187,16 @@ pub fn store_artifact(
     let rel =
         relative_path(input.name).ok_or_else(|| OutcomeError::BadName(input.name.to_string()))?;
     let (source, meta) = checked_source(workspace, input.source)?;
-    let mut src = File::open(&source)?;
+    let mut src = File::open(&source).map_err(source_io(input.source))?;
     let opened = src.metadata()?;
     if !opened.is_file() || (opened.dev(), opened.ino()) != (meta.dev(), meta.ino()) {
         return Err(OutcomeError::NotRegular(input.source.to_path_buf()));
     }
+    // The file behind the handle, not what a name says.
+    if input.forbidden.files.contains(&FileIdentity::of(&opened)) {
+        return Err(OutcomeError::SecretFile(input.source.to_path_buf()));
+    }
+    let mut secret = input.forbidden.values.finder();
     let dest = artifacts_root(root, attempt).join(&rel);
     let parent = dest.parent().expect("a joined path has a parent");
     let comps: Vec<&std::ffi::OsStr> = Path::new(attempt.as_str())
@@ -163,6 +222,11 @@ pub fn store_artifact(
                 name: input.name.to_string(),
                 max: max_bytes,
             });
+        }
+        // Before the piece is written; the temporary file goes with the
+        // error.
+        if secret.push(&buf[..n]) {
+            return Err(OutcomeError::SecretContent(input.name.to_string()));
         }
         hasher.update(&buf[..n]);
         tmp.write_all(&buf[..n])?;

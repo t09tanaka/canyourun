@@ -85,6 +85,33 @@ pub struct WorkerSecrets {
     index_dir: PathBuf,
 }
 
+/// A file as the file system knows it, whatever name leads to it: another
+/// spelling the file system folds to the same entry, or a hard link, is the
+/// same file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct FileIdentity {
+    pub dev: u64,
+    pub ino: u64,
+}
+
+impl FileIdentity {
+    pub fn of(meta: &fs::Metadata) -> Self {
+        FileIdentity {
+            dev: meta.dev(),
+            ino: meta.ino(),
+        }
+    }
+}
+
+/// What [`WorkerSecrets::placed`] reads from the files in place: the values
+/// to mask, and which files they are (one per placed file, taken from the
+/// handle the values were read through).
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct Placed {
+    pub values: Values,
+    pub files: Vec<FileIdentity>,
+}
+
 fn placement(msg: impl Into<String>) -> SecretError {
     SecretError::Placement(msg.into())
 }
@@ -339,9 +366,17 @@ impl WorkerSecrets {
     /// 0600 file, reached through a link or larger than a placed file can be
     /// is an error: the attempt is not started with something unmasked.
     pub fn mask_values(&self, attempt: &AttemptId) -> Result<Values> {
+        Ok(self.placed(attempt)?.values)
+    }
+
+    /// [`WorkerSecrets::mask_values`], and with them the identity of every
+    /// file they were read from: what the supervisor refuses to keep as an
+    /// artifact under any name.
+    pub fn placed(&self, attempt: &AttemptId) -> Result<Placed> {
         let mut all = Values::default();
+        let mut files = Vec::new();
         let Some(rec) = self.load_record(attempt)? else {
-            return Ok(all);
+            return Ok(Placed::default());
         };
         let root = PathBuf::from(&rec.workspace);
         let mut skipped = BTreeSet::new();
@@ -368,6 +403,7 @@ impl WorkerSecrets {
                     "{p} is not a regular file with mode 0600"
                 )));
             }
+            files.push(FileIdentity::of(&meta));
             let mut content = Vec::new();
             file.take(MAX_FILE_BYTES as u64 + 1)
                 .read_to_end(&mut content)
@@ -384,7 +420,7 @@ impl WorkerSecrets {
             skipped.extend(v.skipped_keys);
         }
         all.skipped_keys = skipped.into_iter().collect();
-        Ok(all)
+        Ok(Placed { values: all, files })
     }
 
     /// Remove the files placed for `attempt` and forget them. Idempotent.
@@ -887,6 +923,21 @@ mod tests {
             [b"aaaa-1111-bbbb".to_vec(), b"cccc-2222-dddd".to_vec()]
         );
         assert_eq!(v.skipped_keys, ["PORT"]);
+        // With the values, which files they were read from: every placed
+        // file, as the file system knows it.
+        let placed = e.ws_secrets.placed(&a).unwrap();
+        assert_eq!(placed.values, v);
+        let id = |p: &str| FileIdentity::of(&fs::symlink_metadata(e.ws.join(p)).unwrap());
+        let mut ids = placed.files.clone();
+        ids.sort();
+        let mut want = vec![id(".env"), id("conf/db.env")];
+        want.sort();
+        assert_eq!(ids, want);
+        assert_ne!(want[0], want[1]);
+        assert_eq!(
+            e.ws_secrets.placed(&AttemptId::generate()).unwrap(),
+            Placed::default()
+        );
         // A second instance (an agent that restarted) reads the same.
         let again = WorkerSecrets::open(&e.state).unwrap();
         assert_eq!(again.mask_values(&a).unwrap(), v);

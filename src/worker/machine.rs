@@ -11,8 +11,8 @@ use crate::error::{ApiError, ErrorCode};
 use crate::ids::AttemptId;
 use crate::platform;
 use crate::secrets::capture::sweep_store_copies;
-use crate::secrets::envfile::Values;
 use crate::secrets::key;
+use crate::secrets::place::Placed;
 use crate::secrets::place::WorkerSecrets;
 use crate::secrets::vault::Vault;
 use crate::secrets::SecretError;
@@ -218,9 +218,9 @@ impl Host for Machine {
         }
     }
 
-    fn mask_values(&self, attempt: &AcceptedAttempt) -> Result<Values, ApiError> {
+    fn placed_secrets(&self, attempt: &AcceptedAttempt) -> Result<Placed, ApiError> {
         self.secrets
-            .mask_values(&attempt.attempt_id)
+            .placed(&attempt.attempt_id)
             .map_err(|e| e.to_api())
     }
 

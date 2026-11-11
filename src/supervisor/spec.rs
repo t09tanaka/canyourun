@@ -7,6 +7,7 @@ use super::spool_plan::check_artifact_plan;
 use super::timeouts::TimeoutPolicy;
 use crate::ids::{AttemptId, NodeId, PlanDigest, SourceId, WorkerId};
 use crate::secrets::mask::Masker;
+use crate::secrets::place::FileIdentity;
 use crate::wire::MissingPolicy;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -130,6 +131,12 @@ pub struct ArtifactsSpec {
     #[serde(default = "d_artifact_bytes")]
     pub max_bytes: u64,
     pub files: Vec<ArtifactFile>,
+    /// The secret files placed in the workspace, as the file system knew
+    /// them before the commands started. A declared source that turns out to
+    /// be one of them (by another spelling of its name, or a hard link) is
+    /// not kept. Like `mask`, the writer of the spec must say it: an
+    /// explicit empty list means no secret file was placed.
+    pub secret_files: Vec<FileIdentity>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

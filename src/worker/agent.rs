@@ -1129,7 +1129,8 @@ impl Agent {
         // complete: everything the commands print goes through a masker made
         // of them before it is stored. They are read from the files, so an
         // agent that restarted since the bundle arrived masks the same.
-        let secret = self.host.mask_values(rec)?;
+        let placed = self.host.placed_secrets(rec)?;
+        let (secret, secret_files) = (placed.values, placed.files);
         if !secret.skipped_keys.is_empty() {
             // Key names are not secret, but the count says enough.
             self.note_once(
@@ -1178,6 +1179,9 @@ impl Agent {
                         if_missing: d.if_missing,
                     })
                     .collect(),
+                // What the names above may not lead to, by any spelling or
+                // link: the files the mask was read from.
+                secret_files,
             })
         };
 
@@ -1541,9 +1545,11 @@ impl Agent {
             // supervisor's spec is written ([`Self::prepare`]): a
             // declaration that names a secret file never starts a command.
             if !r.payload.artifacts.is_empty() {
-                // A source that cannot be read here is not this request's
-                // fault to answer for: the later check fails the attempt.
-                if let Ok(Some(secrets)) = self.host.secret_paths(&r.payload) {
+                // Only a source that is not here yet (`None`) waits for the
+                // later check. One that is here with another manifest than
+                // the payload names, or a store that cannot be read, is the
+                // answer: nothing is accepted.
+                if let Some(secrets) = self.host.secret_paths(&r.payload)? {
                     check_artifacts_not_secret(&r.payload, &secrets)?;
                 }
             }

@@ -1,7 +1,8 @@
 use super::outcome::{
     drain_pending_deletes, finish_attempt, is_duplicate, store_artifact, sweep_tmp,
-    sync_log_position, ArtifactInput, OutcomeError,
+    sync_log_position, ArtifactInput, Forbidden, OutcomeError,
 };
+use super::run::not_stored_reason;
 use super::spool::{AttemptSpool, SpoolError, SpoolReader, StreamStatus};
 use super::spool_plan::{logs_locator, MAX_READ_BYTES, MIN_RECORD_BYTES};
 use crate::ids::{
@@ -10,6 +11,7 @@ use crate::ids::{
 use crate::state::{AttemptState, Outcome, Termination};
 use crate::storage::{NewAcceptance, StorageError, SubmitOutcome, WorkerStore};
 use crate::wire::LogStream::{Stderr, Stdout};
+use crate::wire::NotStoredReason;
 use serde_json::json;
 use std::fs;
 use std::io::Write;
@@ -538,6 +540,12 @@ fn accept(w: &Wk) -> AttemptId {
     a
 }
 
+/// For the attempts of these tests that have no secrets.
+fn no_secrets() -> &'static Forbidden {
+    static NONE: std::sync::OnceLock<Forbidden> = std::sync::OnceLock::new();
+    NONE.get_or_init(Forbidden::nothing)
+}
+
 fn input<'a>(name: &'a str, src: &'a Path) -> ArtifactInput<'a> {
     ArtifactInput {
         name,
@@ -545,6 +553,7 @@ fn input<'a>(name: &'a str, src: &'a Path) -> ArtifactInput<'a> {
         source_id: SourceId::generate(),
         plan_digest: Digest::of_bytes(b"plan"),
         profile_fingerprint: Digest::of_bytes(b"prof"),
+        forbidden: no_secrets(),
     }
 }
 
@@ -628,7 +637,10 @@ fn bad_artifacts_are_refused_before_anything_is_kept() {
     let e = store_artifact(&w.root, &a, &w.ws, &input("l", &src.join("link")), 100);
     assert!(matches!(e, Err(OutcomeError::NotRegular(_))));
     let e = store_artifact(&w.root, &a, &w.ws, &input("gone", &src.join("nope")), 100);
-    assert!(matches!(e, Err(OutcomeError::Io(_))));
+    assert!(matches!(e, Err(OutcomeError::SourceMissing(_))), "{e:?}");
+    let deep = src.join("no/such/dir/f");
+    let e = store_artifact(&w.root, &a, &w.ws, &input("gone", &deep), 100);
+    assert!(matches!(e, Err(OutcomeError::SourceMissing(_))), "{e:?}");
     // The too-large one left no partial file behind.
     let art = w.root.join(a.as_str()).join("artifacts");
     let leftovers: Vec<_> = walk(&art);
@@ -1667,6 +1679,7 @@ fn files_no_list_names_are_removed_from_the_artifacts_and_the_listed_ones_stay()
             source_id: SourceId::generate(),
             plan_digest: Digest::of_bytes(b"plan"),
             profile_fingerprint: Digest::of_bytes(b"profile"),
+            forbidden: no_secrets(),
         };
         store_artifact(&w.root, &a, &w.ws, &input, 1 << 20).unwrap()
     };
@@ -1757,6 +1770,7 @@ fn an_attempt_settled_without_its_spool_keeps_no_artifact_file() {
         source_id: SourceId::generate(),
         plan_digest: Digest::of_bytes(b"plan"),
         profile_fingerprint: Digest::of_bytes(b"profile"),
+        forbidden: no_secrets(),
     };
     let kept = store_artifact(&w.root, &a, &w.ws, &input, 1 << 20).unwrap();
     let run = w.store.get(&a).unwrap().unwrap().run_id;
@@ -2014,4 +2028,139 @@ fn the_pump_masks_secrets_also_across_reads_and_at_the_very_end() {
     s.finish().unwrap();
     let r = SpoolReader::open(dir.path(), &a).unwrap();
     assert_eq!(read_all(&r, Stdout), b"a *** b *** hunter2-");
+}
+
+// ------------------------------------------------- secrets and artifacts
+
+fn identity(path: &Path) -> crate::secrets::place::FileIdentity {
+    crate::secrets::place::FileIdentity::of(&fs::symlink_metadata(path).unwrap())
+}
+
+fn values(v: &[&str]) -> crate::secrets::mask::Masker {
+    crate::secrets::mask::Masker::new(v.iter().map(|s| s.as_bytes().to_vec()))
+}
+
+fn nothing_kept(w: &Wk, a: &AttemptId) {
+    let kept = walk(&w.root.join(a.as_str()).join("artifacts"));
+    assert!(kept.is_empty(), "{kept:?}");
+}
+
+#[test]
+fn a_secret_file_is_refused_under_another_spelling_of_its_name_and_as_a_hard_link() {
+    let w = wk();
+    let a = AttemptId::generate();
+    let secret = w.ws.join("secrets.json");
+    fs::write(&secret, br#"{"token":"t"}"#).unwrap();
+    let forbidden = Forbidden {
+        files: vec![identity(&secret)],
+        values: values(&[]),
+    };
+    let store = |name: &str, src: &Path| {
+        let mut i = input(name, src);
+        i.forbidden = &forbidden;
+        store_artifact(&w.root, &a, &w.ws, &i, 100)
+    };
+    // U+017F (long s) is its own lower case, so a comparison of lower-cased
+    // names tells `ſecrets.json` from `secrets.json`. A file system that
+    // folds case (APFS, by default) opens the secret file by that name.
+    // Where the file system keeps the two names apart, a hard link stands
+    // in: either way the name is new and the file is the secret one.
+    let alias = w.ws.join("\u{17f}ecrets.json");
+    if fs::symlink_metadata(&alias).is_err() {
+        fs::hard_link(&secret, &alias).unwrap();
+    }
+    assert_eq!(identity(&alias), identity(&secret));
+    let e = store("leak.json", &alias);
+    assert!(matches!(e, Err(OutcomeError::SecretFile(_))), "{e:?}");
+    // A hard link the command made, under a name nothing would suspect.
+    fs::create_dir_all(w.ws.join("out")).unwrap();
+    let link = w.ws.join("out/report.txt");
+    fs::hard_link(&secret, &link).unwrap();
+    let e = store("report.txt", &link);
+    assert!(matches!(e, Err(OutcomeError::SecretFile(_))), "{e:?}");
+    // The secret file by its own name (the acceptance refuses that
+    // declaration; this is the same answer one step later), and renamed.
+    let e = store("own", &secret);
+    assert!(matches!(e, Err(OutcomeError::SecretFile(_))), "{e:?}");
+    let moved = w.ws.join("out/moved");
+    fs::rename(&link, &moved).unwrap();
+    let e = store("moved", &moved);
+    assert!(matches!(e, Err(OutcomeError::SecretFile(_))), "{e:?}");
+    nothing_kept(&w, &a);
+    assert_eq!(not_stored_reason(&e.unwrap_err()), NotStoredReason::Refused);
+
+    // Another file is kept, whatever the list says about the secret one.
+    fs::write(w.ws.join("out/fine.txt"), b"fine").unwrap();
+    let kept = store("fine.txt", &w.ws.join("out/fine.txt")).unwrap();
+    assert_eq!(kept.size, 4);
+}
+
+#[test]
+fn an_artifact_that_holds_a_secret_value_is_refused_and_nothing_of_it_is_kept() {
+    const VALUE: &str = "hunter2-hunter2-hunter2";
+    let w = wk();
+    let a = AttemptId::generate();
+    let forbidden = Forbidden {
+        files: Vec::new(),
+        values: values(&[VALUE, "another-secret-value"]),
+    };
+    let store = |name: &str, content: &[u8]| {
+        let src = w.ws.join(name);
+        fs::write(&src, content).unwrap();
+        let mut i = input(name, &src);
+        i.forbidden = &forbidden;
+        store_artifact(&w.root, &a, &w.ws, &i, 1 << 20)
+    };
+    // A plain copy of the secret file.
+    let e = store("copy.env", format!("TOKEN={VALUE}\n").as_bytes());
+    assert!(matches!(e, Err(OutcomeError::SecretContent(_))), "{e:?}");
+    let e = e.unwrap_err();
+    assert!(!e.to_string().contains("hunter2"), "{e}");
+    assert_eq!(not_stored_reason(&e), NotStoredReason::Refused);
+    // The value cut by the pieces the file is read in (64 KiB), at every
+    // point of the value, and wholly in a later piece.
+    const PIECE: usize = 64 << 10;
+    for before in (PIECE - VALUE.len()..=PIECE).chain([0, 3 * PIECE + 7]) {
+        let mut content = vec![b'x'; before];
+        content.extend_from_slice(VALUE.as_bytes());
+        content.extend_from_slice(b" and more");
+        let e = store("report.txt", &content);
+        assert!(
+            matches!(e, Err(OutcomeError::SecretContent(_))),
+            "{before}: {e:?}"
+        );
+    }
+    nothing_kept(&w, &a);
+
+    // What only looks like it is kept: a part of the value, and the value
+    // with something in between.
+    let mut near = vec![b'x'; PIECE - 4];
+    near.extend_from_slice(&VALUE.as_bytes()[..VALUE.len() - 1]);
+    near.extend_from_slice(b"\nhunter2-hunter2 -hunter2");
+    assert_eq!(store("near.txt", &near).unwrap().size, near.len() as u64);
+}
+
+#[test]
+fn only_a_source_that_is_not_there_is_a_missing_artifact() {
+    let w = wk();
+    let a = AttemptId::generate();
+    fs::write(w.ws.join("f"), b"12345").unwrap();
+    // Nothing at the source, or no directory on the way to it.
+    for gone in ["nope", "no/such/f"] {
+        let e = store_artifact(&w.root, &a, &w.ws, &input("a", &w.ws.join(gone)), 100).unwrap_err();
+        assert!(matches!(e, OutcomeError::SourceMissing(_)), "{e:?}");
+        assert_eq!(not_stored_reason(&e), NotStoredReason::Missing);
+    }
+    // The source is there and the store is not: `NotFound` again, from the
+    // other side, and no missing artifact.
+    let no_root = w.root.join("gone/spool");
+    let e = store_artifact(&no_root, &a, &w.ws, &input("a", &w.ws.join("f")), 100).unwrap_err();
+    assert!(
+        matches!(&e, OutcomeError::Io(io) if io.kind() == std::io::ErrorKind::NotFound),
+        "{e:?}"
+    );
+    assert_eq!(not_stored_reason(&e), NotStoredReason::Refused);
+    // Any other refusal is one too.
+    let e = store_artifact(&w.root, &a, &w.ws, &input("a", &w.ws), 100).unwrap_err();
+    assert_eq!(not_stored_reason(&e), NotStoredReason::Refused);
 }

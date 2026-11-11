@@ -182,8 +182,17 @@ pub fn check_artifacts(decls: &[ArtifactDecl]) -> Result<(), &'static str> {
 /// (`secret_paths`: the secret files of its source manifest, which hold the
 /// declared ones and what `.worktreeinclude` matched; relative to the
 /// workspace root like the declarations). Compared folded, like the
-/// declarations among themselves. Such a declaration is refused: the content
-/// of a secret file is never kept as an artifact.
+/// declarations among themselves. Such a declaration is refused.
+///
+/// This is the early answer to the plain mistake, and not the guarantee: the
+/// folding (NFC and lower case) is not the file system's, so a name the file
+/// system opens as the secret file can pass here (`ſ` for `s`, `ß` for `ss`),
+/// and a command can link or copy the file to any name. What is guaranteed
+/// is decided when the file is stored, by the supervisor
+/// ([`crate::supervisor::outcome::store_artifact`]): the secret file itself
+/// under any name (device and inode of the opened file), and a file holding
+/// one of the masked values, are not kept. A transformed copy, or a copy of
+/// a secret file without masked values, is not recognised.
 pub fn artifact_is_secret<S: AsRef<str>>(decls: &[ArtifactDecl], secret_paths: &[S]) -> bool {
     let secrets: BTreeSet<Vec<u8>> = secret_paths
         .iter()

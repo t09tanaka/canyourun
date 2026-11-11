@@ -35,7 +35,7 @@ use super::identity::Leader;
 use super::members::ManagedMembers;
 use super::outcome::{
     add_ref, finish_attempt_with, remove_unlisted, store_artifact, sweep_tmp, sync_log_position,
-    ArtifactInput, OutcomeError, SpoolEnd,
+    ArtifactInput, Forbidden, OutcomeError, SpoolEnd,
 };
 use super::pump::{pump, Pipe};
 use super::spec::{command_id, spec_digest, NodeSpec, SuperviseSpec};
@@ -362,12 +362,11 @@ const ARTIFACTS_EVENT: &str = "artifacts_stored";
 
 /// Why a declared artifact was not stored, for the result: `missing` only
 /// when nothing is at the declared path (the file, or a directory on the way
-/// to it, does not exist).
-fn not_stored_reason(e: &OutcomeError) -> NotStoredReason {
+/// to it, does not exist). A store that is not there is not a missing
+/// artifact.
+pub(super) fn not_stored_reason(e: &OutcomeError) -> NotStoredReason {
     match e {
-        OutcomeError::Io(io) if io.kind() == std::io::ErrorKind::NotFound => {
-            NotStoredReason::Missing
-        }
+        OutcomeError::SourceMissing(_) => NotStoredReason::Missing,
         _ => NotStoredReason::Refused,
     }
 }
@@ -379,7 +378,8 @@ fn not_stored_reason(e: &OutcomeError) -> NotStoredReason {
 /// is terminal.
 ///
 /// A file that cannot be kept (missing, not a regular file, reached through
-/// a symlink, too large, ...) is left out and said in the journal
+/// a symlink, too large, one of the attempt's secret files, holding one of
+/// its secret values, ...) is left out and said in the journal
 /// (`artifact_not_stored`, once per name, with the masked reason); the
 /// attempt's termination is not changed by it. Whether a missing artifact
 /// fails the run is the coordinator's decision, which knows what was
@@ -406,6 +406,10 @@ pub(crate) fn keep_artifacts(
     let mut kept = Vec::new();
     let mut not_stored = Vec::new();
     let mut refused = Vec::new();
+    let forbidden = Forbidden {
+        files: plan.secret_files.clone(),
+        values: masker.clone(),
+    };
     for f in &plan.files {
         let input = ArtifactInput {
             name: &f.name,
@@ -413,6 +417,7 @@ pub(crate) fn keep_artifacts(
             source_id: plan.source_id.clone(),
             plan_digest: plan.plan_digest.clone(),
             profile_fingerprint: plan.profile_fingerprint.clone(),
+            forbidden: &forbidden,
         };
         match store_artifact(&root, attempt, &plan.workspace, &input, plan.max_bytes) {
             Ok(record) => kept.push(record),

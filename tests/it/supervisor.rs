@@ -930,6 +930,7 @@ fn artifacts(f: &Fx, files: &[(&str, &str)]) -> ArtifactsSpec {
                 if_missing: MissingPolicy::Required,
             })
             .collect(),
+        secret_files: Vec::new(),
     }
 }
 
@@ -1006,6 +1007,92 @@ fn artifacts_are_stored_before_the_attempt_is_settled_and_the_result_names_them(
     assert_eq!(again.termination, Some(t));
     assert_eq!(f.store.get_result(f.attempt()).unwrap(), Some(result));
     assert_eq!(f.events(f.attempt(), "artifacts_stored").len(), 1);
+}
+
+#[test]
+fn a_secret_file_and_a_copy_of_a_secret_value_are_not_kept_whatever_they_are_called() {
+    use remote_task_runner::secrets::place::FileIdentity;
+    const VALUE: &str = "hunter2-hunter2-hunter2";
+    let mut f = fx(vec![]);
+    // `ſecrets.env` is the secret file itself where the file system folds
+    // case, and a hard link the command makes where it does not.
+    let mut plan = artifacts(
+        &f,
+        &[
+            ("alias.env", "\u{17f}ecrets.env"),
+            ("link.txt", "out/link.txt"),
+            ("copy.txt", "out/copy.txt"),
+            ("fine.txt", "out/fine.txt"),
+        ],
+    );
+    // The secret file as the agent placed it before the commands started.
+    let secret = f.path("ws/secrets.env");
+    std::fs::write(&secret, format!("TOKEN={VALUE}\n")).unwrap();
+    plan.secret_files = vec![FileIdentity::of(
+        &std::fs::symlink_metadata(&secret).unwrap(),
+    )];
+    f.spec.mask = remote_task_runner::supervisor::spec::MaskValues(vec![VALUE.to_string()]);
+    f.spec.nodes = vec![in_ws(
+        &f,
+        "mkdir out && ln secrets.env out/link.txt && cp secrets.env out/copy.txt && \
+         { [ -e \u{17f}ecrets.env ] || ln secrets.env \u{17f}ecrets.env; } && \
+         printf fine > out/fine.txt",
+    )];
+    f.spec.artifacts = Some(plan);
+    let t = settled(&run(&f.spec).unwrap());
+    assert_eq!(t.outcome(), Outcome::Succeeded);
+
+    let result = f.store.get_result(f.attempt()).unwrap().unwrap();
+    let listed = result["artifacts"].as_array().unwrap();
+    assert_eq!(listed.len(), 1, "{result}");
+    assert_eq!(listed[0]["name"], "fine.txt");
+    let mut not_stored: Vec<(String, String)> = result["artifacts_not_stored"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|n| {
+            (
+                n["name"].as_str().unwrap().to_string(),
+                n["reason"].as_str().unwrap().to_string(),
+            )
+        })
+        .collect();
+    not_stored.sort();
+    let refused = |n: &str| (n.to_string(), "refused".to_string());
+    assert_eq!(
+        not_stored,
+        [
+            refused("alias.env"),
+            refused("copy.txt"),
+            refused("link.txt")
+        ]
+    );
+    // Nothing of the secret is in the attempt's store or in what the journal
+    // says about the refusals.
+    let kept = f
+        .spec
+        .spool_dir()
+        .join(f.attempt().as_str())
+        .join("artifacts");
+    let names: Vec<_> = std::fs::read_dir(&kept)
+        .unwrap()
+        .map(|e| e.unwrap().file_name())
+        .collect();
+    assert_eq!(names, ["fine.txt"]);
+    let said = f.events(f.attempt(), "artifact_not_stored");
+    assert_eq!(said.len(), 3);
+    // Each for its own reason: the file by what it is (its content would
+    // give it away too, which is not what refuses it), the copy by what it
+    // holds.
+    for e in &said {
+        let why = e["why"].as_str().unwrap();
+        let want = match e["name"].as_str().unwrap() {
+            "copy.txt" => "contains a secret value",
+            _ => "is one of the attempt's secret files",
+        };
+        assert!(why.contains(want), "{e}");
+    }
+    assert!(!format!("{said:?}{result}").contains("hunter2"));
 }
 
 #[test]
