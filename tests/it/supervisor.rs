@@ -655,9 +655,13 @@ fn a_cooperative_command_stops_on_term_within_the_grace() {
     f.spec.nodes = vec![n];
     let second = f.open_second();
     let attempt = f.attempt().clone();
-    let bgp = bg.clone();
+    let (bgp, ldp) = (bg.clone(), leader.clone());
     let canceller = std::thread::spawn(move || {
-        wait_for("the command", || read_pid(&bgp).is_some());
+        // Both files: the script writes the leader's after the background
+        // child's, and a cancel in between would leave it never written.
+        wait_for("the command", || {
+            read_pid(&bgp).is_some() && read_pid(&ldp).is_some()
+        });
         second.cancel(&attempt, CoordinatorEpoch(1), 100).unwrap();
     });
     let started = Instant::now();

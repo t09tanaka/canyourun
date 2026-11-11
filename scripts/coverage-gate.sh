@@ -3,7 +3,20 @@
 # Add a file to `want` when a module becomes pure and tested.
 set -euo pipefail
 cd "$(dirname "$0")/.."
-cargo llvm-cov --json --output-path target/llvm-cov.json >/dev/null
+# The test run's stdout is where the harness names a failing test, so it is
+# kept in a file: shown (the failed tests and their output) when the run
+# fails, dropped when it passes.
+log=$(mktemp)
+trap 'rm -f "$log"' EXIT
+if ! cargo llvm-cov --json --output-path target/llvm-cov.json >"$log"; then
+  echo "coverage run failed" >&2
+  grep -E '^test .* \.\.\. FAILED$' "$log" >&2 || true
+  # each "failures:" section: the output of every failed test, then its list
+  awk '/^failures:$/ { show = 1 } show { print } /^test result:/ { show = 0 }' "$log" >&2
+  # no failed test in the log: the build or the harness failed, say how
+  grep -q '^test result: FAILED' "$log" || tail -n 40 "$log" >&2
+  exit 1
+fi
 python3 - <<'PY'
 import json, os, sys
 root = os.getcwd()

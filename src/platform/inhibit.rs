@@ -83,6 +83,12 @@ pub fn acquire(who: &str, why: &str) -> Inhibit {
 /// program). The helper counts as holding only if it is still running after a
 /// short settle time.
 pub fn acquire_with(argv: &[String]) -> Inhibit {
+    acquire_within(argv, SETTLE)
+}
+
+/// [`acquire_with`] with the settle time given. A helper that exits returns
+/// at once whatever the window, so only a helper that stays alive waits it out.
+fn acquire_within(argv: &[String], settle: Duration) -> Inhibit {
     let Some((prog, args)) = argv.split_first() else {
         return Inhibit::Unavailable("no helper command".into());
     };
@@ -96,7 +102,7 @@ pub fn acquire_with(argv: &[String]) -> Inhibit {
         Ok(c) => c,
         Err(e) => return Inhibit::Unavailable(format!("{prog}: {e}")),
     };
-    let until = Instant::now() + SETTLE;
+    let until = Instant::now() + settle;
     loop {
         match child.try_wait() {
             Ok(Some(status)) => return Inhibit::Unavailable(format!("{prog} exited: {status}")),
@@ -148,7 +154,10 @@ mod tests {
 
     #[test]
     fn a_helper_that_exits_at_once_is_unavailable() {
-        match acquire_with(&argv(&["false"])) {
+        // The window is only how long to wait for the exit to show; a helper
+        // that is starved of CPU for longer than the production window would
+        // otherwise be taken for one that stays.
+        match acquire_within(&argv(&["false"]), Duration::from_secs(30)) {
             Inhibit::Unavailable(why) => assert!(why.contains("exited"), "{why}"),
             Inhibit::Held(_) => panic!("must not hold"),
         }

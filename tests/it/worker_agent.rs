@@ -314,9 +314,23 @@ impl Fx {
     }
     fn wait_terminal(&self, a: &AttemptId) -> Outcome {
         let store = self.store();
-        wait_for("the attempt to end", || {
-            store.get(a).unwrap().unwrap().state == AttemptState::Terminal
-        });
+        let end = Instant::now() + T;
+        while store.get(a).unwrap().unwrap().state != AttemptState::Terminal {
+            // Say where it stopped, not only that it did: the journal of the
+            // attempt is what tells a stuck recovery from a slow one.
+            assert!(
+                Instant::now() < end,
+                "timed out waiting for the attempt to end: {:?}; events: {:?}",
+                store.get(a).unwrap().unwrap().state,
+                store
+                    .events_of_attempt(a, 200)
+                    .unwrap()
+                    .iter()
+                    .map(|e| format!("{}@{} {}", e.kind, e.at_ms, e.payload))
+                    .collect::<Vec<_>>()
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
         self.rec(a).termination.unwrap().outcome()
     }
     fn supervisors(&self, a: &AttemptId) -> Vec<i32> {
