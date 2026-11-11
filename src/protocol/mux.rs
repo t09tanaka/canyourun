@@ -53,6 +53,10 @@ pub enum Unconfirmed {
     Disconnected,
     /// The request was sent and no answer came within the timeout.
     TimedOut,
+    /// An answer came that this side cannot take as one: it is of another
+    /// schema version, or it answers another operation. The peer may have
+    /// done what was asked; this is not the peer's refusal.
+    Unreadable,
 }
 
 #[derive(Debug, Error)]
@@ -670,19 +674,15 @@ fn dispatch(
                 |w| matches!(w, Waiter::Request { request_id: id, .. } if *id == request_id),
             );
             if let Some(Waiter::Request { op, tx, .. }) = waiter {
-                let result = if response.operation() != op {
-                    Err(CallError::Remote(ApiError::new(
-                        ErrorCode::Internal,
-                        "response operation does not match the request",
-                    )))
-                } else if let Err(e) = response.ensure_current_schema() {
-                    Err(CallError::Remote(ApiError::new(
-                        ErrorCode::ProtocolIncompatible,
-                        e.to_string(),
-                    )))
-                } else {
-                    Ok(response)
-                };
+                // An answer that cannot be read is made here, not by the
+                // peer: the caller must not take it for the peer's word (a
+                // refusal it could count), and the request may have run.
+                let result =
+                    if response.operation() != op || response.ensure_current_schema().is_err() {
+                        Err(CallError::Unconfirmed(Unconfirmed::Unreadable))
+                    } else {
+                        Ok(response)
+                    };
                 let _ = tx.send(result);
             }
         }

@@ -1057,3 +1057,35 @@ async fn an_upload_that_keeps_going_backwards_stalls_but_one_restart_is_tolerate
         .unwrap();
     assert!(done.complete);
 }
+
+#[tokio::test]
+async fn an_answer_that_cannot_be_read_is_unconfirmed_and_not_the_peers_refusal() {
+    // The worker may have done what was asked: what this side makes of an
+    // answer of another schema version, or to another operation, is not an
+    // error the worker gave.
+    let another_schema: Handler = Arc::new(|req| {
+        let Response::AckCollected(mut r) = ack_response(&req) else {
+            unreachable!()
+        };
+        r.schema_version = SchemaVersion(99);
+        Some(Ok(Response::AckCollected(r)))
+    });
+    let another_operation: Handler = Arc::new(|_| {
+        Some(Ok(Response::BlobPut(BlobPutResponse {
+            schema_version: SchemaVersion::CURRENT,
+            digest: Digest::of_bytes(b"x"),
+            received: 0,
+            complete: false,
+        })))
+    });
+    for handler in [another_schema, another_operation] {
+        let cluster = ClusterId::generate();
+        let (conn, srv) = pair(&cluster).await;
+        serve(srv.incoming, handler);
+        let err = conn.client.call(ack_request(), T).await.unwrap_err();
+        assert!(
+            matches!(err, CallError::Unconfirmed(Unconfirmed::Unreadable)),
+            "{err:?}"
+        );
+    }
+}
