@@ -1380,17 +1380,6 @@ async fn the_lease_counts_from_its_grant_not_from_the_supervisors_start() {
     let f = fx();
     let agent = f.start("boot-a");
     let c = f.connect(&agent).await;
-    let renew = |a: &AttemptId| {
-        Request::RenewLease(RenewLeaseRequest {
-            schema_version: SchemaVersion::CURRENT,
-            request_id: RequestId::generate(),
-            coordinator_epoch: CoordinatorEpoch(1),
-            attempt_id: a.clone(),
-            generation: Generation(1),
-            lease_seq: 1,
-            lease_ms: 4_000,
-        })
-    };
     // Never renewed: the supervisor starts 1.5 s into a 3 s lease and would
     // count 3 s of its own. The agent ends the lease when the grant ends.
     f.host.block_prepare.store(true, Ordering::SeqCst);
@@ -1403,7 +1392,27 @@ async fn the_lease_counts_from_its_grant_not_from_the_supervisors_start() {
     f.host.block_prepare.store(false, Ordering::SeqCst);
     assert_eq!(f.wait_terminal(&a), Outcome::Interrupted);
     assert_eq!(events(&f, &a, "agent_lease_expired"), 1);
+}
 
+// Its own test, not the second half of the one above: both wait out real
+// leases, and apart they overlap.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_renewal_after_the_start_moves_the_lease_and_the_first_grants_watch_ends_quietly() {
+    let f = fx();
+    let agent = f.start("boot-a");
+    let c = f.connect(&agent).await;
+    let renew = |a: &AttemptId| {
+        Request::RenewLease(RenewLeaseRequest {
+            schema_version: SchemaVersion::CURRENT,
+            request_id: RequestId::generate(),
+            coordinator_epoch: CoordinatorEpoch(1),
+            attempt_id: a.clone(),
+            generation: Generation(1),
+            lease_seq: 1,
+            lease_ms: 4_000,
+        })
+    };
+    let (script, _, _) = stay(&f);
     // Renewed after the start: the supervisor counts from the renewal and
     // the agent's watch of the first grant ends without a word.
     f.host.block_prepare.store(true, Ordering::SeqCst);

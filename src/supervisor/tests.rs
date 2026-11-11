@@ -984,6 +984,26 @@ fn a_crash_between_result_and_event_is_repaired_by_the_next_call() {
 
 /// A small deterministic generator (xorshift64*), so the property tests are
 /// the same on every run and every machine.
+/// Runs the cases `0..n` on a few threads. Each case has its own directory
+/// and its own seed, and most of its time goes to `fsync`, which waits on the
+/// disk, so the cases overlap. All of them run; a failing one panics with its
+/// own `case` in the message and fails the test.
+fn par_cases(n: u64, f: impl Fn(u64) + Sync) {
+    let next = std::sync::atomic::AtomicU64::new(0);
+    let workers = std::thread::available_parallelism().map_or(4, |p| p.get().clamp(2, 8));
+    std::thread::scope(|s| {
+        for _ in 0..workers {
+            s.spawn(|| loop {
+                let case = next.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if case >= n {
+                    break;
+                }
+                f(case);
+            });
+        }
+    });
+}
+
 struct Rng(u64);
 
 impl Rng {
@@ -1402,7 +1422,7 @@ fn random_writes(rng: &mut Rng, s: &AttemptSpool, max_steps: u64) -> [Vec<u8>; 2
 
 #[test]
 fn any_crash_point_resumes_with_a_prefix_and_never_goes_back() {
-    for case in 0..80u64 {
+    par_cases(80, |case| {
         let mut rng = Rng::new(case + 1);
         let dir = tempfile::tempdir().unwrap();
         let a = AttemptId::generate();
@@ -1505,12 +1525,12 @@ fn any_crash_point_resumes_with_a_prefix_and_never_goes_back() {
             assert!(r.read(stream, 0, 10).unwrap().eof || status.end > 10);
         }
         assert!(r.finished());
-    }
+    });
 }
 
 #[test]
 fn stored_plus_dropped_is_what_came_in_and_never_exceeds_the_limit() {
-    for case in 0..150u64 {
+    par_cases(150, |case| {
         let mut rng = Rng::new(1000 + case);
         let limit = [0, 1, 2, 5, 64, 500, 5000][rng.below(7) as usize];
         let dir = tempfile::tempdir().unwrap();
@@ -1539,7 +1559,7 @@ fn stored_plus_dropped_is_what_came_in_and_never_exceeds_the_limit() {
             assert_eq!(status.end + status.dropped, given[i], "case {case}");
         }
         assert!(dr == 0 || st == limit, "case {case}");
-    }
+    });
 }
 
 #[test]

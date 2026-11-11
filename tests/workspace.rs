@@ -149,6 +149,19 @@ impl Backend {
     }
 }
 
+/// Runs `f` against every backend at once: the backends share nothing (each
+/// body makes its own fixture and its own HOME), so their checks overlap
+/// instead of queueing behind one another.
+fn each_backend(f: impl Fn(&Backend) + Sync) {
+    let all = backends(&common_home());
+    std::thread::scope(|s| {
+        for b in &all {
+            let f = &f;
+            s.spawn(move || f(b));
+        }
+    });
+}
+
 fn real_available(home: &Path) -> bool {
     Command::new("fast-worktree")
         .arg("--version")
@@ -325,7 +338,7 @@ fn branches(f: &Fixture, clone: &Path) -> Vec<String> {
 
 #[test]
 fn add_and_remove_a_commit_workspace() {
-    for b in backends(&common_home()) {
+    each_backend(|b| {
         let f = fixture();
         let store = f.store();
         let m = f.capture_commit(&store, "HEAD");
@@ -365,7 +378,7 @@ fn add_and_remove_a_commit_workspace() {
         }
         // removing again is fine
         ws.remove(&w).unwrap();
-    }
+    });
 }
 
 fn common_home() -> PathBuf {
@@ -402,7 +415,7 @@ fn a_subdirectory_is_the_working_directory() {
 
 #[test]
 fn the_original_is_never_written() {
-    for b in backends(&common_home()) {
+    each_backend(|b| {
         let f = fixture();
         // dirty: a tracked change, an untracked file, an ignored file to take
         std::fs::write(f.dir.join("a.txt"), "dirty\n").unwrap();
@@ -451,12 +464,12 @@ fn the_original_is_never_written() {
             "{}: the original changed",
             b.name
         );
-    }
+    });
 }
 
 #[test]
 fn a_failed_unpack_leaves_nothing_behind() {
-    for b in backends(&common_home()) {
+    each_backend(|b| {
         let f = fixture();
         let store = f.store();
         let m = f.capture_commit(&store, "HEAD");
@@ -478,7 +491,7 @@ fn a_failed_unpack_leaves_nothing_behind() {
         // the same attempt can be tried again with the right store
         let w = ws.create(&att, &store, &m, Some(&repo)).unwrap();
         ws.remove(&w).unwrap();
-    }
+    });
 }
 
 #[test]
@@ -540,7 +553,7 @@ fn a_git_source_needs_its_clone_with_the_commit() {
 
 #[test]
 fn concurrent_attempts_of_one_repository_do_not_collide() {
-    for b in backends(&common_home()) {
+    each_backend(|b| {
         let f = fixture();
         let store = Arc::new(f.store());
         let first = f.git(&f.dir, &["rev-parse", "HEAD"]);
@@ -601,7 +614,7 @@ fn concurrent_attempts_of_one_repository_do_not_collide() {
         });
         assert!(branches(&f, &clone).is_empty(), "{}", b.name);
         assert_eq!(worktrees(&f, &clone).len(), 1);
-    }
+    });
 }
 
 #[test]
@@ -719,7 +732,7 @@ fn the_clone_is_made_once_and_updated_from_origin() {
 
 #[test]
 fn a_create_after_a_crash_clears_the_stale_branch_and_registration() {
-    for b in backends(&common_home()) {
+    each_backend(|b| {
         let f = fixture();
         let store = f.store();
         let m = f.capture_commit(&store, "HEAD");
@@ -748,7 +761,7 @@ fn a_create_after_a_crash_clears_the_stale_branch_and_registration() {
         assert!(w.root.join("a.txt").exists(), "{}", b.name);
         ws.remove(&w).unwrap();
         assert!(branches(&f, repo.dir()).is_empty());
-    }
+    });
 }
 
 // ---- review fixes -----------------------------------------------------
@@ -772,7 +785,7 @@ fn dirty_capture(f: &Fixture, store: &SourceStore) -> CiManifest {
 
 #[test]
 fn head_and_index_are_the_originals() {
-    for b in backends(&common_home()) {
+    each_backend(|b| {
         let f = fixture();
         let store = f.store();
         let m = dirty_capture(&f, &store);
@@ -805,7 +818,7 @@ fn head_and_index_are_the_originals() {
             .contains("a.txt"));
         ws.remove(&w).unwrap();
         assert!(branches(&f, repo.dir()).is_empty());
-    }
+    });
 }
 
 #[test]
@@ -961,7 +974,7 @@ fn a_symlink_at_the_workspaces_place_is_not_followed() {
 
 #[test]
 fn a_create_over_a_dead_creates_directory_starts_over() {
-    for b in backends(&common_home()) {
+    each_backend(|b| {
         let f = fixture();
         let store = f.store();
         let m = f.capture_commit(&store, "HEAD");
@@ -1004,12 +1017,12 @@ fn a_create_over_a_dead_creates_directory_starts_over() {
         let e = ws.create(&att2, &store, &m, Some(&repo)).unwrap_err();
         assert_eq!(e.code, ErrorCode::Conflict);
         assert!(other.exists());
-    }
+    });
 }
 
 #[test]
 fn remove_after_the_directory_is_gone_clears_the_branch() {
-    for b in backends(&common_home()) {
+    each_backend(|b| {
         let f = fixture();
         let store = f.store();
         let m = f.capture_commit(&store, "HEAD");
@@ -1023,7 +1036,7 @@ fn remove_after_the_directory_is_gone_clears_the_branch() {
         ws.remove(&w).unwrap();
         assert!(branches(&f, repo.dir()).is_empty(), "{}", b.name);
         assert_eq!(worktrees(&f, repo.dir()).len(), 1);
-    }
+    });
 }
 
 #[test]
@@ -1257,7 +1270,10 @@ fn adds_of_one_commit_do_not_starve_an_add_of_another() {
             let (f, store, slow, m1, stop) = (&f, &store, &slow, &m1, &stop);
             s.spawn(move || {
                 let started = std::time::Instant::now();
-                while !stop.load(Ordering::SeqCst) && started.elapsed().as_secs() < 40 {
+                // The adds of the first commit go on until the other add is done. The
+                // cap only ends them when it is starved; it is just above the 15 s the
+                // assertion allows, so a starved add fails at once, not after 40 s.
+                while !stop.load(Ordering::SeqCst) && started.elapsed().as_secs() < 17 {
                     let ws = Workspaces::new(f.state.clone(), f.env(), slow.clone());
                     let repo = f.clone_of(&ws);
                     let w = ws
