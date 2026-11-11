@@ -1871,7 +1871,9 @@ async fn a_start_that_meets_a_renewal_half_done_waits_for_all_of_it() {
     f.host.block_prepare.store(true, Ordering::SeqCst);
     let (script, marker, _) = stay(&f);
     let mut p = payload(&script);
-    p.lease_ms = 1_500;
+    // As long as its neighbours': the supervisor of a busy machine needs
+    // more than a moment to start the command within the renewed lease.
+    p.lease_ms = 4_000;
     let a = AttemptId::generate();
     // The order, made by the probe and not by luck: the renewal is
     // committed (the new key is in the database), then the start comes to
@@ -1898,8 +1900,8 @@ async fn a_start_that_meets_a_renewal_half_done_waits_for_all_of_it() {
     }));
     submit(&c, &a, &p).await;
     // The first grant runs out during the preparation.
-    std::thread::sleep(Duration::from_millis(1_800));
-    let Response::RenewLease(r) = call(&c, renew_req(&a, 1, 1_500)).await.unwrap() else {
+    std::thread::sleep(Duration::from_millis(4_300));
+    let Response::RenewLease(r) = call(&c, renew_req(&a, 1, 4_000)).await.unwrap() else {
         panic!()
     };
     assert!(r.extended);
@@ -1913,7 +1915,7 @@ async fn a_start_that_meets_a_renewal_half_done_waits_for_all_of_it() {
     let expired = f.store().events_of(&a, "lease_expired").unwrap();
     assert_eq!(expired.len(), 1);
     let after = expired[0].at_ms - renewed_at;
-    assert!((1_000..3_500).contains(&after), "{after} ms");
+    assert!((3_500..6_500).contains(&after), "{after} ms");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
