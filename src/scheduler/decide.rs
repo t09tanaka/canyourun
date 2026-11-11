@@ -294,10 +294,9 @@ pub struct Decision {
 }
 
 fn word<T: Serialize>(t: &T) -> String {
-    match serde_json::to_value(t) {
-        Ok(serde_json::Value::String(s)) => s,
-        _ => String::new(),
-    }
+    let value = serde_json::to_value(t).ok();
+    let text = value.as_ref().and_then(|v| v.as_str());
+    text.unwrap_or_default().to_string()
 }
 
 impl Decision {
