@@ -72,8 +72,8 @@ pub struct LiveAttempt {
     pub record: AttemptRecord,
     /// The demand recorded when it was placed (the payload to send).
     pub placement: Option<Placement>,
-    /// A retire was asked for and is not confirmed.
-    pub retire_requested: bool,
+    /// Why a retire was asked for, while it is not confirmed.
+    pub retire_reason: Option<String>,
 }
 
 /// What a worker reported about an attempt.
@@ -337,15 +337,17 @@ impl CoordinatorStore {
             let mut out = Vec::with_capacity(records.len());
             for record in records {
                 let aid = record.attempt_id.to_string();
-                let retire_requested: bool = c.query_row(
-                    "SELECT EXISTS (SELECT 1 FROM retire_tombstone
-                                    WHERE attempt_id = ?1 AND confirmed_at_ms IS NULL)",
-                    [&aid],
-                    |r| r.get(0),
-                )?;
+                let retire_reason: Option<String> = c
+                    .query_row(
+                        "SELECT reason FROM retire_tombstone
+                         WHERE attempt_id = ?1 AND confirmed_at_ms IS NULL",
+                        [&aid],
+                        |r| r.get(0),
+                    )
+                    .optional()?;
                 out.push(LiveAttempt {
                     placement: placement_of(c, &aid)?,
-                    retire_requested,
+                    retire_reason,
                     record,
                 });
             }
@@ -404,6 +406,14 @@ impl CoordinatorStore {
                     }
                 }
             }
+            // An attempt that ended puts no demand on its worker any more,
+            // acknowledged or not.
+            tx.execute(
+                "UPDATE placement SET acked_at_ms = COALESCE(acked_at_ms, ?1)
+                 WHERE attempt_id = ?2 AND EXISTS
+                    (SELECT 1 FROM attempt a WHERE a.attempt_id = ?2 AND a.state = 'terminal')",
+                params![to_i64(at_ms)?, aid],
+            )?;
             if before.observation != observation {
                 tx.execute(
                     "UPDATE attempt SET observation = ?1 WHERE attempt_id = ?2",

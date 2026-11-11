@@ -2583,8 +2583,8 @@ fn a_task_is_queued_again_only_once_its_attempt_is_confirmed_retired() {
         ids_now,
         vec![live.attempt_id.clone(), asked.attempt_id.clone()]
     );
-    assert!(!live_now[0].retire_requested);
-    assert!(live_now[1].retire_requested);
+    assert_eq!(live_now[0].retire_reason, None);
+    assert_eq!(live_now[1].retire_reason.as_deref(), Some("move"));
     assert!(live_now[0]
         .placement
         .as_ref()

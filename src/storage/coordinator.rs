@@ -609,6 +609,12 @@ impl CoordinatorStore {
                  WHERE attempt_id = ?1",
                 params![aid, to_i64(at_ms)?],
             )?;
+            // A retired attempt puts no demand on its worker any more.
+            tx.execute(
+                "UPDATE placement SET acked_at_ms = COALESCE(acked_at_ms, ?2)
+                 WHERE attempt_id = ?1",
+                params![aid, to_i64(at_ms)?],
+            )?;
             let run = run_of(tx, &aid)?;
             common::append_event(
                 tx,
@@ -676,6 +682,9 @@ impl CoordinatorStore {
         })
     }
 
+    /// The demand of placements no worker acknowledged yet. A placement
+    /// leaves this list when its worker accepted the attempt, and also when
+    /// the attempt ended or its retire was confirmed without that.
     pub fn unacked_demand(&self) -> Result<Vec<Placement>> {
         self.db.call(|c| {
             let mut s = c.prepare(
