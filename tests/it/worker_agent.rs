@@ -10,7 +10,6 @@ use crate::proto_common;
 use proto_common::client_cfg;
 use remote_task_runner::error::{ApiError, ErrorCode};
 use remote_task_runner::ids::*;
-use remote_task_runner::platform::signal_pid;
 use remote_task_runner::protocol::transport::duplex_pair;
 use remote_task_runner::protocol::{connect, CallError, Client};
 use remote_task_runner::state::{AttemptState, Outcome};
@@ -206,18 +205,19 @@ impl Drop for Fx {
                 }
             }
         }
-        for pid in pgrep(&state.to_string_lossy()) {
-            kill_pid(pid);
+        // What a search by the fixture's directory finds is killed only
+        // while it still is the process with that directory in its command
+        // line: a number alone is not signalled.
+        let pattern = state.to_string_lossy().into_owned();
+        for pid in pgrep(&pattern) {
+            crate::common::kill_if_command(pid, &pattern);
         }
     }
 }
 
-/// SIGKILL through the guarded helpers only: they refuse pid 0, 1 and
-/// anything that would wrap to a negative pid.
-fn kill_pid(pid: i32) {
-    if let Ok(p) = u32::try_from(pid) {
-        signal_pid(p, libc::SIGKILL);
-    }
+/// What only the command line of the attempt's supervisor contains.
+fn supervisor_pattern(a: &AttemptId) -> String {
+    format!("{}/supervise.json", a.as_str())
 }
 
 fn pgrep(pattern: &str) -> Vec<i32> {
@@ -296,7 +296,16 @@ impl Fx {
         self.rec(a).termination.unwrap().outcome()
     }
     fn supervisors(&self, a: &AttemptId) -> Vec<i32> {
-        pgrep(&format!("{}/supervise.json", a.as_str()))
+        pgrep(&supervisor_pattern(a))
+    }
+    /// SIGKILL the attempt's supervisors: each only while it still is the
+    /// process the search found (its identity and command line are read
+    /// again right before the signal).
+    fn kill_supervisors(&self, a: &AttemptId) {
+        let pattern = supervisor_pattern(a);
+        for pid in pgrep(&pattern) {
+            crate::common::kill_if_command(pid, &pattern);
+        }
     }
 }
 
@@ -640,9 +649,7 @@ async fn a23_a_dead_supervisor_is_recovered_and_the_command_is_not_started_again
     });
     let pid = read_pid(&pidfile).unwrap();
     agent.shutdown();
-    for s in f.supervisors(&a) {
-        kill_pid(s);
-    }
+    f.kill_supervisors(&a);
     wait_for("the supervisor to die", || f.supervisors(&a).is_empty());
     assert!(alive(pid), "the command outlives its supervisor");
 
@@ -687,9 +694,7 @@ async fn a24_a_changed_boot_id_interrupts_everything_and_a_retry_runs() {
     // The machine restarts: nothing survives. (Simulated: the processes are
     // killed and the next agent is told another boot ID.)
     agent.shutdown();
-    for s in f.supervisors(&running) {
-        kill_pid(s);
-    }
+    f.kill_supervisors(&running);
     crate::common::kill_recorded_group(pid as u32, &pid_start);
     wait_for("the processes to die", || {
         f.supervisors(&running).is_empty() && !alive(pid)
@@ -1451,6 +1456,36 @@ async fn a_supervisor_that_cannot_be_started_is_tried_five_times_then_the_attemp
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_supervisor_that_cannot_tell_an_identity_is_started_again_and_never_given_up() {
+    let f = fx();
+    let mut cfg = f.cfg("boot-a");
+    // A supervisor that only ever says "an identity could not be told".
+    let stub = f.path("identity-unknown-supervisor");
+    crate::common::write_executable(&stub, "#!/bin/sh\nexit 5\n");
+    cfg.supervisor_exe = stub;
+    cfg.retry_ms = 10;
+    let agent = f.start_with(cfg);
+    let c = f.connect(&agent).await;
+    let a = AttemptId::generate();
+    submit(&c, &a, &payload("true")).await;
+    // Said at the first one and when the pause stops growing (the sixth):
+    // well past the five failures after which a failing supervisor is
+    // given up.
+    wait_for("the longest pause", || {
+        events(&f, &a, "agent_identity_unknown") == 2
+    });
+    assert_eq!(events(&f, &a, "agent_gave_up"), 0);
+    assert_eq!(events(&f, &a, "agent_supervisor_exit"), 0);
+    assert_ne!(f.rec(&a).state, AttemptState::Terminal);
+    assert_eq!(f.rec(&a).termination, None);
+    // It goes on, without another word in the log.
+    std::thread::sleep(Duration::from_millis(700));
+    assert_eq!(events(&f, &a, "agent_identity_unknown"), 2);
+    assert_eq!(events(&f, &a, "agent_gave_up"), 0);
+    assert_ne!(f.rec(&a).state, AttemptState::Terminal);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_lost_boot_record_next_to_live_attempts_counts_as_a_reboot() {
     let f = fx();
     let agent = f.start("boot-a");
@@ -1595,9 +1630,7 @@ async fn an_attempt_nobody_can_recover_is_unknown_until_a_retire_after_a_reboot(
         f.rec(&a).state == AttemptState::Active
     });
     agent.shutdown();
-    for s in f.supervisors(&a) {
-        kill_pid(s);
-    }
+    f.kill_supervisors(&a);
     wait_for("the supervisor to die", || f.supervisors(&a).is_empty());
     std::fs::remove_file(
         f.state()
