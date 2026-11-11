@@ -87,7 +87,7 @@ jobs:
       matrix:
         shard: [0, 1, 2, 3]
     env:
-      PURE: "src/ids.rs src/state.rs src/error.rs src/wire.rs src/config/legacy.rs src/config/parse.rs src/config/paths.rs src/config/resolve.rs src/source/safety.rs src/source/classify.rs src/source/diff.rs src/storage/policy.rs src/protocol/frame.rs src/protocol/sched.rs src/protocol/hello.rs src/protocol/chunk.rs src/protocol/ssh.rs src/supervisor/spool_plan.rs src/workspace/plan.rs src/secrets/plan.rs src/secrets/envfile.rs src/secrets/mask.rs src/supervisor/lease.rs src/supervisor/timeouts.rs src/supervisor/escalation.rs src/supervisor/identity.rs src/supervisor/termination.rs src/worker/policy.rs src/worker/blob_policy.rs src/forecast/plan.rs src/platform/process_read.rs"
+      PURE: "src/ids.rs src/state.rs src/error.rs src/wire.rs src/config/legacy.rs src/config/parse.rs src/config/paths.rs src/config/resolve.rs src/source/safety.rs src/source/classify.rs src/source/diff.rs src/storage/policy.rs src/protocol/frame.rs src/protocol/sched.rs src/protocol/hello.rs src/protocol/chunk.rs src/protocol/ssh.rs src/supervisor/spool_plan.rs src/workspace/plan.rs src/secrets/plan.rs src/secrets/envfile.rs src/secrets/mask.rs src/supervisor/lease.rs src/supervisor/timeouts.rs src/supervisor/escalation.rs src/supervisor/identity.rs src/supervisor/termination.rs src/worker/policy.rs src/worker/blob_policy.rs src/forecast/plan.rs src/platform/process_read.rs src/coordinator/policy.rs"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -118,7 +118,7 @@ jobs:
     if: always()
     runs-on: ubuntu-latest
     env:
-      PURE: "src/ids.rs src/state.rs src/error.rs src/wire.rs src/config/legacy.rs src/config/parse.rs src/config/paths.rs src/config/resolve.rs src/source/safety.rs src/source/classify.rs src/source/diff.rs src/storage/policy.rs src/protocol/frame.rs src/protocol/sched.rs src/protocol/hello.rs src/protocol/chunk.rs src/protocol/ssh.rs src/supervisor/spool_plan.rs src/workspace/plan.rs src/secrets/plan.rs src/secrets/envfile.rs src/secrets/mask.rs src/supervisor/lease.rs src/supervisor/timeouts.rs src/supervisor/escalation.rs src/supervisor/identity.rs src/supervisor/termination.rs src/worker/policy.rs src/worker/blob_policy.rs src/forecast/plan.rs src/platform/process_read.rs"
+      PURE: "src/ids.rs src/state.rs src/error.rs src/wire.rs src/config/legacy.rs src/config/parse.rs src/config/paths.rs src/config/resolve.rs src/source/safety.rs src/source/classify.rs src/source/diff.rs src/storage/policy.rs src/protocol/frame.rs src/protocol/sched.rs src/protocol/hello.rs src/protocol/chunk.rs src/protocol/ssh.rs src/supervisor/spool_plan.rs src/workspace/plan.rs src/secrets/plan.rs src/secrets/envfile.rs src/secrets/mask.rs src/supervisor/lease.rs src/supervisor/timeouts.rs src/supervisor/escalation.rs src/supervisor/identity.rs src/supervisor/termination.rs src/worker/policy.rs src/worker/blob_policy.rs src/forecast/plan.rs src/platform/process_read.rs src/coordinator/policy.rs"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
