@@ -38,11 +38,14 @@ jobs:
         run: cargo clippy --all-targets -- -D warnings
       - name: install fast-worktree
         run: command -v fast-worktree || cargo install fast-worktree --locked --version 0.3.2
-      - name: cargo test
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: nextest@0.9.151
+      - name: cargo nextest
         env:
           # the workspace tests run the real tool; its absence is a failure
           RTR_REQUIRE_FAST_WORKTREE: "1"
-        run: cargo test
+        run: cargo nextest run --workspace --all-targets
 
   msrv:
     name: MSRV (1.89)
