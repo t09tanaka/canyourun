@@ -395,6 +395,9 @@ impl Host for RealButCore {
     fn prepare(&self, a: &AcceptedAttempt, p: &AttemptPayload) -> Result<Workspace, ApiError> {
         self.0.prepare(a, p)
     }
+    fn secret_paths(&self, p: &AttemptPayload) -> Result<Option<Vec<String>>, ApiError> {
+        self.0.secret_paths(p)
+    }
     fn place_secrets(
         &self,
         a: &AcceptedAttempt,
@@ -601,6 +604,7 @@ fn payload(p: &Parcel, script: &str) -> AttemptPayload {
         deadline_ms: None,
         resource_wait_timeout_ms: None,
         has_secret_bundle: false,
+        artifacts: Vec::new(),
     }
 }
 
