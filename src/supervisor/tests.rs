@@ -203,15 +203,20 @@ fn sequence_counts_index_records_not_appends() {
 
 #[test]
 fn tiny_writes_do_not_grow_the_index_per_append() {
-    let (dir, a, s) = spool(BIG);
+    // A small threshold instead of the production 1 MiB, so the test does
+    // not have to write a million bytes one at a time.
+    const RECORD: u64 = 4096;
+    let dir = tempfile::tempdir().unwrap();
+    let a = AttemptId::generate();
+    let s = AttemptSpool::open_with_record_bytes(dir.path(), &a, BIG, RECORD).unwrap();
     let w = s.writer(Stdout);
-    let n = MIN_RECORD_BYTES as usize + 1000;
+    let n = RECORD as usize + 100;
     for _ in 0..n {
         w.append(b"x").unwrap();
     }
     s.finish().unwrap();
     let idx = fs::metadata(dir.path().join(a.as_str()).join("logs/stdout.idx")).unwrap();
-    // A million one-byte writes: one record per MIN_RECORD_BYTES and one at
+    // Thousands of one-byte writes: one record per RECORD bytes and one at
     // the end, not one per write.
     assert_eq!(idx.len(), 16 * 2, "{}", idx.len());
     let r = SpoolReader::open(dir.path(), &a).unwrap();

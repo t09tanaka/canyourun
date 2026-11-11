@@ -82,10 +82,16 @@ pub fn drop_needs_record(recorded_dropped: u64, dropped: u64) -> bool {
         || dropped.saturating_sub(recorded_dropped) >= DROP_RECORD_STEP
 }
 
-/// Whether an append must publish a record now: enough stored bytes wait
-/// (`unrecorded`), or the drops are worth one.
-pub fn record_needed(unrecorded: u64, recorded_dropped: u64, dropped: u64) -> bool {
-    unrecorded >= MIN_RECORD_BYTES || drop_needs_record(recorded_dropped, dropped)
+/// Whether an append must publish a record now: `min_record` or more stored
+/// bytes wait (`unrecorded`; production passes [`MIN_RECORD_BYTES`]), or the
+/// drops are worth one.
+pub fn record_needed(
+    unrecorded: u64,
+    min_record: u64,
+    recorded_dropped: u64,
+    dropped: u64,
+) -> bool {
+    unrecorded >= min_record || drop_needs_record(recorded_dropped, dropped)
 }
 
 /// The cap on what one attempt may store (both streams): the task's limit
@@ -378,12 +384,21 @@ mod tests {
 
     #[test]
     fn a_record_waits_for_enough_bytes_or_a_drop_worth_recording() {
-        assert!(!record_needed(0, 0, 0));
-        assert!(!record_needed(MIN_RECORD_BYTES - 1, 0, 0));
-        assert!(record_needed(MIN_RECORD_BYTES, 0, 0));
-        assert!(record_needed(0, 0, 1));
-        assert!(!record_needed(1, 3, 4));
-        assert!(record_needed(1, 3, 3 + DROP_RECORD_STEP));
+        let m = MIN_RECORD_BYTES;
+        assert!(!record_needed(0, m, 0, 0));
+        assert!(!record_needed(m - 1, m, 0, 0));
+        assert!(record_needed(m, m, 0, 0));
+        assert!(record_needed(0, m, 0, 1));
+        assert!(!record_needed(1, m, 3, 4));
+        assert!(record_needed(1, m, 3, 3 + DROP_RECORD_STEP));
+        // The threshold is the caller's.
+        assert!(!record_needed(15, 16, 0, 0));
+        assert!(record_needed(16, 16, 0, 0));
+    }
+
+    #[test]
+    fn the_production_record_threshold_is_one_mebibyte() {
+        assert_eq!(MIN_RECORD_BYTES, 1 << 20);
     }
 
     #[test]
