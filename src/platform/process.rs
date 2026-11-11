@@ -4,66 +4,72 @@
 //! identity)`. The start identity is an opaque string that is equal for the
 //! same process and (practically) never equal for a later process that got
 //! the same PID.
+//!
+//! This file makes the system calls; what their answers mean is decided in
+//! [`super::process_read`].
 
-/// The start identity of `pid`, or `None` when no live, non-zombie process
-/// has that PID (or the OS does not tell).
+pub use super::process_read::{GroupSignal, ProcessRead, StartIdentity};
+
+/// The start identity of `pid` ([`read_process`] without the parent).
+pub fn process_start_identity(pid: u32) -> StartIdentity {
+    read_process(pid).start
+}
+
+/// One read of `pid`: its start identity and its parent.
 ///
-/// Linux: the `starttime` field of `/proc/<pid>/stat` (clock ticks since
-/// boot). macOS: `proc_pidinfo(PROC_PIDTBSDINFO)` start seconds and
-/// microseconds.
-pub fn process_start_identity(pid: u32) -> Option<String> {
+/// Linux: the `starttime` and `ppid` fields of `/proc/<pid>/stat` (clock
+/// ticks since boot). macOS: `sysctl(KERN_PROC_PID)` start seconds and
+/// microseconds and the parent. Both report a zombie with its start time.
+pub fn read_process(pid: u32) -> ProcessRead {
+    if libc::pid_t::try_from(pid).is_err() {
+        // Not a PID the system hands out; say nothing about it.
+        return ProcessRead::of(StartIdentity::Unknown);
+    }
     #[cfg(target_os = "linux")]
     {
-        let text = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-        parse_proc_stat(&text)
+        let read = std::fs::read_to_string(format!("/proc/{pid}/stat"));
+        super::process_read::classify_proc_stat(
+            read.as_deref().map_err(std::io::Error::raw_os_error),
+            &|| std::fs::metadata("/proc/self/stat").is_ok(),
+        )
     }
     #[cfg(target_os = "macos")]
     {
-        let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
-        let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
-        // SAFETY: `info` is a valid buffer of `size` bytes.
-        let got = unsafe {
-            libc::proc_pidinfo(
-                pid as libc::c_int,
-                libc::PROC_PIDTBSDINFO,
+        let mut record = [0u8; super::process_read::KINFO_PROC_SIZE];
+        let mut len = record.len();
+        let mut mib = [
+            libc::CTL_KERN,
+            libc::KERN_PROC,
+            libc::KERN_PROC_PID,
+            pid as libc::c_int,
+        ];
+        // SAFETY: `record` is a valid buffer of `len` bytes and `mib` has
+        // the four names passed.
+        let rc = unsafe {
+            libc::sysctl(
+                mib.as_mut_ptr(),
+                mib.len() as libc::c_uint,
+                record.as_mut_ptr().cast(),
+                &mut len,
+                std::ptr::null_mut(),
                 0,
-                (&mut info as *mut libc::proc_bsdinfo).cast(),
-                size,
             )
         };
-        if got != size || info.pbi_status == libc::SZOMB || info.pbi_start_tvsec == 0 {
-            return None;
-        }
-        Some(format!(
-            "mac:{}.{:06}",
-            info.pbi_start_tvsec, info.pbi_start_tvusec
-        ))
+        super::process_read::classify_kinfo(pid, rc == 0, len, &record)
     }
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     {
-        let _ = pid;
-        None
+        ProcessRead::of(StartIdentity::Unknown)
     }
 }
 
-/// The start identity out of the text of `/proc/<pid>/stat`. `None` for a
-/// zombie (it has exited) or a line that does not parse.
-///
-/// The command name is in parentheses and may itself contain spaces and
-/// parentheses, so fields are counted from the last `)`.
-pub fn parse_proc_stat(text: &str) -> Option<String> {
-    let rest = text.get(text.rfind(')')? + 1..)?;
-    let mut fields = rest.split_whitespace();
-    let state = fields.next()?;
-    if state == "Z" || state == "X" {
-        return None;
-    }
-    // After the state: ppid pgrp session tty_nr tpgid flags minflt cminflt
-    // majflt cmajflt utime stime cutime cstime priority nice num_threads
-    // itrealvalue, then starttime (field 22 overall, the 19th after state).
-    let start = fields.nth(18)?;
-    start.parse::<u64>().ok()?;
-    Some(format!("linux:{start}"))
+/// The process group `pid` is in now, when the system says. Asks only; no
+/// signal is involved.
+pub fn process_group_of(pid: u32) -> Option<i32> {
+    let p = libc::pid_t::try_from(pid).ok().filter(|p| *p > 1)?;
+    // SAFETY: plain syscall with an integer argument.
+    let pgid = unsafe { libc::getpgid(p) };
+    (pgid > 1).then_some(pgid)
 }
 
 /// Send `sig` to `pid` alone. True when the signal was delivered (or the
@@ -80,17 +86,6 @@ pub fn signal_pid(pid: u32, sig: i32) -> bool {
     }
     // SAFETY: plain syscall with integer arguments.
     unsafe { libc::kill(p, sig) == 0 }
-}
-
-/// What a signal to a process group reached.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum GroupSignal {
-    /// At least one member got it (`sig == 0`: the group has members).
-    Delivered,
-    /// The group has no members.
-    Empty,
-    /// The group exists but belongs to someone we cannot signal.
-    Denied,
 }
 
 /// Send `sig` to every member of the group `pgid`. Signal 0 only probes.
@@ -115,28 +110,66 @@ mod tests {
     use super::*;
 
     #[test]
-    fn proc_stat_start_time_is_counted_from_the_last_paren() {
-        let line = "42 (we ird) name) S 1 42 42 0 -1 4194560 100 0 0 0 1 2 0 0 20 0 1 0 987654 1000 10 18446744073709551615";
-        assert_eq!(parse_proc_stat(line).as_deref(), Some("linux:987654"));
-    }
-
-    #[test]
-    fn proc_stat_zombie_and_garbage_have_no_identity() {
-        let z = "42 (x) Z 1 42 42 0 -1 4194560 100 0 0 0 1 2 0 0 20 0 1 0 987654 1000 10 0";
-        assert_eq!(parse_proc_stat(z), None);
-        let dead = "42 (x) X 1 42 42 0 -1 4194560 100 0 0 0 1 2 0 0 20 0 1 0 987654 1000 10 0";
-        assert_eq!(parse_proc_stat(dead), None);
-        assert_eq!(parse_proc_stat("no parens"), None);
-        assert_eq!(parse_proc_stat("42 (x) S 1 2"), None);
-        let nan = "42 (x) S 1 42 42 0 -1 4194560 100 0 0 0 1 2 0 0 20 0 1 0 abc 1000 10 0";
-        assert_eq!(parse_proc_stat(nan), None);
-    }
-
-    #[test]
-    fn own_identity_is_stable() {
+    fn own_identity_is_stable_and_an_impossible_pid_is_unknown() {
         let me = std::process::id();
-        let a = process_start_identity(me).expect("this process has an identity");
-        assert_eq!(process_start_identity(me).unwrap(), a);
+        let a = read_process(me);
+        assert!(a.start.identity().is_some(), "{a:?}");
+        assert_eq!(read_process(me), a);
+        assert_eq!(process_start_identity(me), a.start);
+        // SAFETY: plain syscall without arguments.
+        assert_eq!(a.ppid, Some(unsafe { libc::getppid() } as u32));
+        assert_eq!(process_start_identity(u32::MAX), StartIdentity::Unknown);
+        assert_eq!(
+            process_start_identity(i32::MAX as u32 + 1),
+            StartIdentity::Unknown
+        );
+        // A PID that can be asked about and that nothing has.
+        assert_eq!(
+            process_start_identity(i32::MAX as u32 - 1),
+            StartIdentity::NoProcess
+        );
+    }
+
+    /// The identity recorded by earlier versions came from `proc_pidinfo`:
+    /// the record read now must give the same one, or every recorded
+    /// process would look like a reused PID.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn the_start_identity_is_the_one_proc_pidinfo_gives() {
+        let me = std::process::id();
+        let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+        let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+        // SAFETY: `info` is a valid buffer of `size` bytes.
+        let got = unsafe {
+            libc::proc_pidinfo(
+                me as libc::c_int,
+                libc::PROC_PIDTBSDINFO,
+                0,
+                (&mut info as *mut libc::proc_bsdinfo).cast(),
+                size,
+            )
+        };
+        assert_eq!(got, size);
+        let read = read_process(me);
+        assert_eq!(
+            read.start,
+            StartIdentity::Identity(format!(
+                "mac:{}.{:06}",
+                info.pbi_start_tvsec, info.pbi_start_tvusec
+            ))
+        );
+        assert_eq!(read.ppid, Some(info.pbi_ppid));
+    }
+
+    #[test]
+    fn the_group_of_a_process_is_asked_only_for_a_pid_that_can_be_one() {
+        // SAFETY: plain syscall without arguments.
+        let mine = unsafe { libc::getpgrp() };
+        assert_eq!(process_group_of(std::process::id()), Some(mine));
+        assert_eq!(process_group_of(0), None);
+        assert_eq!(process_group_of(1), None);
+        assert_eq!(process_group_of(u32::MAX), None);
+        assert_eq!(process_group_of(i32::MAX as u32 - 1), None);
     }
 
     #[test]

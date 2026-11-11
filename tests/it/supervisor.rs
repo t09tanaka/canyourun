@@ -1,7 +1,7 @@
 //! The supervisor against real processes: lease, cancel, timeouts, stop,
 //! recovery, and survival of the agent's death.
 
-use crate::common::{alive, read_pid};
+use crate::common::{alive, identity_of, kill_recorded, kill_recorded_group, read_pid};
 use remote_task_runner::ids::*;
 use remote_task_runner::platform;
 use remote_task_runner::platform::{signal_pid, signal_process_group};
@@ -24,8 +24,9 @@ use tempfile::TempDir;
 
 struct Fx {
     /// Processes this test started that must not outlive it (they would write
-    /// into the directory while it is being removed): (pid, whole group).
-    strays: std::sync::Mutex<Vec<(i32, bool)>>,
+    /// into the directory while it is being removed): (pid, the start
+    /// identity read when it was started, whole group).
+    strays: std::sync::Mutex<Vec<(u32, String, bool)>>,
     dir: TempDir,
     store: WorkerStore,
     spec: SuperviseSpec,
@@ -113,16 +114,17 @@ impl Drop for Fx {
             .unwrap_or_default();
         for (_, _, ident) in launched {
             if let Some(i) = ident {
-                all.push((i.pid as i32, true));
+                all.push((i.pid, i.start_identity, true));
             }
         }
-        for (pid, group) in all {
-            // Only through the guarded helpers: pid 0, 1 or a wrapped negative
-            // would reach our own group, init or every process of the user.
+        for (pid, start, group) in all {
+            // Never by the number alone: the PID may be another process's by
+            // now. Only what still has the recorded start identity (or, for
+            // a group, what a leader that is definitely gone left behind).
             if group {
-                signal_process_group(pid, libc::SIGKILL);
-            } else if let Ok(p) = u32::try_from(pid) {
-                signal_pid(p, libc::SIGKILL);
+                kill_recorded_group(pid, &start);
+            } else {
+                kill_recorded(pid, &start);
             }
         }
     }
@@ -130,10 +132,16 @@ impl Drop for Fx {
 
 impl Fx {
     fn track(&self, pid: u32) {
-        self.strays.lock().unwrap().push((pid as i32, false));
+        // Without an identity it has ended already: nothing to clean up, and
+        // nothing that could be told from a later process with its PID.
+        if let Some(start) = identity_of(pid) {
+            self.strays.lock().unwrap().push((pid, start, false));
+        }
     }
     fn track_group(&self, pid: u32) {
-        self.strays.lock().unwrap().push((pid as i32, true));
+        if let Some(start) = identity_of(pid) {
+            self.strays.lock().unwrap().push((pid, start, true));
+        }
     }
     fn path(&self, name: &str) -> PathBuf {
         self.dir.path().join(name)
@@ -832,7 +840,10 @@ fn spawn_sleeper() -> (std::process::Child, ProcessIdentityParts) {
         .unwrap();
     let parts = ProcessIdentityParts {
         pid: child.id(),
-        start: platform::process_start_identity(child.id()).unwrap(),
+        start: platform::process_start_identity(child.id())
+            .identity()
+            .expect("the identity of a live child")
+            .to_string(),
     };
     (child, parts)
 }
@@ -933,7 +944,10 @@ fn a_dead_leader_with_a_surviving_descendant_is_stopped_by_recovery() {
     wait_for("the descendant", || read_pid(&bg).is_some());
     let p = ProcessIdentityParts {
         pid: child.id(),
-        start: platform::process_start_identity(child.id()).unwrap(),
+        start: platform::process_start_identity(child.id())
+            .identity()
+            .expect("the identity of a live child")
+            .to_string(),
     };
     claim(&f, "n", Some((&platform::boot_id().unwrap(), &p)));
     // The leader dies (and is reaped); its background child stays.
@@ -941,9 +955,52 @@ fn a_dead_leader_with_a_surviving_descendant_is_stopped_by_recovery() {
     child.wait().unwrap();
     let bgp = read_pid(&bg).unwrap();
     assert!(alive(bgp));
+    // Nothing says that what is left under the dead leader's number is the
+    // command's: the number may be another group's by now. Nothing is
+    // signalled, and the attempt stays unresolved for that reason alone.
+    let r = recover(&recover_spec(&f), &f.store).unwrap();
+    assert!(r.unresolved.is_some() && r.identity_unknown, "{r:?}");
+    assert_eq!(r.termination, None);
+    assert!(alive(bgp), "left alone");
+    // The supervisor process says so with its own exit code, which its
+    // parent does not count as a failure.
+    let spec_path = write_spec(&f, &recover_spec(&f));
+    let mut sup = spawn_detached(&exe(), &spec_path).unwrap();
+    assert_eq!(
+        sup.wait().unwrap().code(),
+        Some(code::IDENTITY_UNKNOWN),
+        "unresolved by identity alone"
+    );
+    assert!(alive(bgp), "left alone");
+    // With the descendant recorded while the command ran (as the tracker of
+    // a managed command does: PID and start time), it is the command's.
+    record_descendant(&f, 0, bgp as u32);
     let t = settled(&recover(&recover_spec(&f), &f.store).unwrap());
     assert_eq!(t.outcome(), Outcome::Interrupted);
     wait_for("the descendant to be gone", || !alive(bgp));
+}
+
+/// Write the record a managed command's tracker keeps of a descendant of
+/// node `index`: its PID and start time, read here from the live process.
+fn record_descendant(f: &Fx, index: usize, pid: u32) {
+    use task_traffic_controller::{managed, process, Context, Paths};
+    let id = remote_task_runner::supervisor::spec::command_id(f.attempt(), index);
+    let start = process::start_time(pid).expect("the descendant is running");
+    let sidecar: managed::Sidecar = serde_json::from_value(serde_json::json!({
+        "version": 1,
+        "command_id": id,
+        "spec_digest": "test",
+        // Settled for the controller: only the stop is looked at here.
+        "phase": "terminal",
+        "boot_id": null,
+        "registered_at": "2026-01-01T00:00:00Z",
+        "owner_pid": std::process::id(),
+        "owner_start_time": null,
+        "descendants": [{ "pid": pid, "start_time": start }],
+    }))
+    .unwrap();
+    let paths = Paths::new(&f.spec.traffic_state_dir, f.spec.traffic_config_path());
+    managed::write_sidecar(&Context::new(paths), &sidecar).unwrap();
 }
 
 #[test]

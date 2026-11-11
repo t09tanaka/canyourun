@@ -37,6 +37,7 @@ want = {
     "src/supervisor/identity.rs",
     "src/supervisor/termination.rs",
     "src/worker/policy.rs",
+    "src/platform/process_read.rs",
 }
 seen = set()
 bad = []

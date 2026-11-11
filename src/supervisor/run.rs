@@ -26,9 +26,13 @@
 //! and node). Trying again is the parent's job, not this process's: the
 //! parent's reconcile sees the supervisor lock free and the attempt not
 //! terminal, starts `supervise` again, and [`super::recover::recover`] redoes
-//! the stop of the group (S10/S12 implement that loop).
+//! the stop of the group (S10/S12 implement that loop). When the only reason
+//! is that whose a process or group is could not be told, the exit code is
+//! `IDENTITY_UNKNOWN` instead, which the parent does not count as a failure.
 
 use super::error::{Result, SupervisorError};
+use super::identity::Leader;
+use super::members::ManagedMembers;
 use super::outcome::{add_ref, finish_attempt, sync_log_position, OutcomeError, SpoolEnd};
 use super::pump::{pump, Pipe};
 use super::spec::{command_id, spec_digest, NodeSpec, SuperviseSpec};
@@ -37,14 +41,14 @@ use super::spool_plan::{
     attempt_limit, logs_locator, warning_texts, MAX_WARNINGS, MAX_WARNING_BYTES,
 };
 use super::stop::{
-    group_alive, retries_for, stop_group_retrying, StopResult, StopTarget, StopTimes,
+    retries_for, stop_group_retrying_on, Os, StopResult, StopTarget, StopTimes, System,
 };
 use super::termination::{
     after_output, after_spool_failure, may_continue, pick_reason, termination, StopReason,
 };
 use super::{lease::LeaseClock, lease::LeaseStatus, timeouts};
 use crate::ids::{AttemptId, NodeId, WorkerBootId};
-use crate::platform::{self, Inhibit};
+use crate::platform::{self, Inhibit, StartIdentity};
 use crate::secrets::mask::Masker;
 use crate::state::{AttemptState, Exit, Receipt, Termination};
 use crate::storage::{
@@ -78,6 +82,11 @@ pub struct Report {
     /// by starting the supervisor again (it recovers and redoes the stop);
     /// this process does not wait for that.
     pub unresolved: Option<String>,
+    /// The attempt is unresolved for no other reason than that whose a
+    /// process or group is could not be told (nothing of it was signalled).
+    /// That can clear up by itself, so the parent keeps looking again
+    /// instead of counting it as a failure.
+    pub identity_unknown: bool,
     /// What came of the idle-sleep inhibition ("held via ..." or
     /// "unavailable: ...", "disabled").
     pub sleep_inhibit: String,
@@ -90,6 +99,9 @@ pub(crate) struct NodeEnd {
     pub exit: Option<Exit>,
     /// The command's group could not be confirmed stopped.
     pub unconfirmed: bool,
+    /// It could not be confirmed because the identity of the command's
+    /// process could not be read: nothing was signalled.
+    pub identity_unknown: bool,
 }
 
 pub(crate) fn exit_of(e: TtcExit) -> Option<Exit> {
@@ -124,8 +136,8 @@ pub(crate) fn stop_times(spec: &SuperviseSpec) -> StopTimes {
 }
 
 /// Stop the group, with the bounded retries when it cannot be confirmed.
-pub(crate) fn stop_confirmed(t: &StopTarget, spec: &SuperviseSpec) -> StopResult {
-    stop_group_retrying(t, stop_times(spec), retries_for(spec.kill_wait_ms))
+pub(crate) fn stop_confirmed_on(os: &dyn Os, t: &StopTarget, spec: &SuperviseSpec) -> StopResult {
+    stop_group_retrying_on(os, t, stop_times(spec), retries_for(spec.kill_wait_ms))
 }
 
 /// A retryable storage error is not a fault: the same look may work next time.
@@ -143,6 +155,7 @@ pub(crate) fn unresolved_report(
     attempt: &crate::ids::AttemptId,
     nodes: &[String],
     reason: String,
+    identity_unknown: bool,
     sleep_inhibit: String,
 ) -> Result<Report> {
     if let Some(a) = store.get(attempt)? {
@@ -150,7 +163,11 @@ pub(crate) fn unresolved_report(
             Some(&a.run_id),
             Some(attempt),
             "supervisor_unresolved",
-            &json!({ "reason": reason, "nodes": nodes }),
+            &json!({
+                "reason": reason,
+                "nodes": nodes,
+                "identity_unknown": identity_unknown,
+            }),
             platform::wall_ms(),
         )?;
     }
@@ -158,6 +175,7 @@ pub(crate) fn unresolved_report(
         termination: None,
         finalized_here: false,
         unresolved: Some(reason),
+        identity_unknown,
         sleep_inhibit,
     })
 }
@@ -577,6 +595,7 @@ impl Control<'_> {
                     reason: Some(StopReason::SpoolFailed),
                     exit: None,
                     unconfirmed: false,
+                    identity_unknown: false,
                 });
             }
         };
@@ -613,6 +632,7 @@ impl Control<'_> {
                     reason: None,
                     exit: None,
                     unconfirmed: false,
+                    identity_unknown: false,
                 })
             }
         };
@@ -743,6 +763,7 @@ impl Control<'_> {
             reason: Some(reason),
             exit: None,
             unconfirmed: false,
+            identity_unknown: false,
         })
     }
 
@@ -757,6 +778,10 @@ impl Control<'_> {
         let run_since = platform::monotonic_ms();
         let ctx = self.traffic.ctx.clone();
         let mut watch = Watch::default();
+        // What the command leaves under its group number once its leader has
+        // ended is signalled only with evidence that a member is its own.
+        let members = ManagedMembers::new(&ctx, id);
+        let os = System(&members);
         let ran = std::thread::scope(|s| {
             let handle = s.spawn(|| managed::run_command(&ctx, &guard, opts, limits));
             while !handle.is_finished() {
@@ -769,9 +794,11 @@ impl Control<'_> {
                     }
                 }
                 if let (Some(_), Some(t), false) = (watch.reason, &watch.target, watch.stopped) {
-                    watch.stopped = true;
-                    if stop_confirmed(t, self.spec) == StopResult::Unconfirmed {
-                        watch.unconfirmed = true;
+                    let (pid, result) = (t.pid, stop_confirmed_on(&os, t, self.spec));
+                    if watch.after_stop(result) {
+                        // Nothing was signalled; the stop is tried again on
+                        // the next look. Said once in the event log.
+                        watch.deferred_noted = self.note_identity_unknown(&node.node_id, pid);
                     }
                 }
                 std::thread::sleep(Duration::from_millis(self.spec.poll_ms));
@@ -783,20 +810,24 @@ impl Control<'_> {
         // The leader has been reaped (even when it ended before its identity
         // could be read); whatever it left in its group is stopped too before
         // anything is recorded. The group is found from the sidecar's pid and
-        // pgid, and judged by the group alone.
-        let leftover = child_target(&ctx, id)
-            .or_else(|| watch.target.take())
-            .map(|t| StopTarget {
-                start_identity: None,
-                ..t
+        // pgid. The leader is judged by what was read of it while it ran,
+        // never by a new read: its PID may be another process's by now.
+        let seen = watch.target.take();
+        let leftover = sidecar_child(&ctx, id)
+            .or_else(|| seen.as_ref().map(|t| (t.pid, t.pgid)))
+            .map(|(pid, pgid)| StopTarget {
+                pid,
+                pgid,
+                leader: reaped_leader(seen.as_ref(), pid),
             });
         if let (Some(t), false, false) = (&leftover, watch.recorded, watch.noted) {
             // The command ended before the watch saw it at all.
             self.note_not_recorded(&node.node_id, t.pid)?;
         }
         if let Some(t) = &leftover {
-            if group_alive(t) && stop_confirmed(t, self.spec) == StopResult::Unconfirmed {
-                watch.unconfirmed = true;
+            let result = stop_confirmed_on(&os, t, self.spec);
+            if watch.after_leftover_stop(result) && !watch.deferred_noted {
+                self.note_identity_unknown(&node.node_id, t.pid);
             }
         }
         let (reason, unconfirmed) = (watch.reason, watch.unconfirmed);
@@ -811,6 +842,7 @@ impl Control<'_> {
                 reason,
                 exit,
                 unconfirmed: true,
+                identity_unknown: watch.identity_unknown,
             });
         }
         let kind = match (reason, exit) {
@@ -824,6 +856,7 @@ impl Control<'_> {
             reason,
             exit,
             unconfirmed: !confirmed,
+            identity_unknown: false,
         })
     }
 
@@ -840,7 +873,7 @@ impl Control<'_> {
         if !w.recorded {
             // Looked up again until the identity is recorded: it may become
             // readable on a later look.
-            w.target = child_target(ctx, id).or(w.target.take());
+            w.target = refreshed(w.target.take(), child_target(ctx, id));
         }
         if let (Some(t), false) = (&w.target, w.recorded) {
             if self.record_child(&node.node_id, t)? {
@@ -879,7 +912,7 @@ impl Control<'_> {
         let boot = platform::boot_id()
             .and_then(|b| WorkerBootId::parse(&b).ok())
             .ok_or_else(|| SupervisorError::State("the boot id is not readable".into()))?;
-        let Some(start) = t.start_identity.clone() else {
+        let Leader::Known(start) = t.leader.clone() else {
             return Ok(false);
         };
         self.store.record_process_identity(
@@ -903,10 +936,13 @@ impl Control<'_> {
     /// was running but its start identity could not be read.
     fn note_not_recorded(&self, node: &NodeId, pid: u32) -> Result<()> {
         let attempt = &self.spec.attempt_id;
-        let why = if platform::process_start_identity(pid).is_none() {
-            "the command ended before its identity could be read"
-        } else {
-            "the start identity of the command could not be read"
+        let why = match platform::process_start_identity(pid) {
+            StartIdentity::NoProcess | StartIdentity::Zombie(_) => {
+                "the command ended before its identity could be read"
+            }
+            StartIdentity::Identity(_) | StartIdentity::Unknown => {
+                "the start identity of the command could not be read"
+            }
         };
         if let Some(a) = self.store.get(attempt)? {
             self.store.append_event(
@@ -918,6 +954,29 @@ impl Control<'_> {
             )?;
         }
         Ok(())
+    }
+
+    /// Say in the event log that a stop sent no signal because the identity
+    /// of the command's process could not be read. True when it was written.
+    fn note_identity_unknown(&self, node: &NodeId, pid: u32) -> bool {
+        let attempt = &self.spec.attempt_id;
+        let Ok(Some(a)) = self.store.get(attempt) else {
+            return false;
+        };
+        self.store
+            .append_event(
+                Some(&a.run_id),
+                Some(attempt),
+                "supervisor_stop_identity_unknown",
+                &json!({
+                    "node": node,
+                    "pid": pid,
+                    "reason": "the identity of the command's process could not be read; \
+                               nothing was signalled, the stop is tried again later",
+                }),
+                platform::wall_ms(),
+            )
+            .is_ok()
     }
 }
 
@@ -931,7 +990,72 @@ struct Watch {
     reason: Option<StopReason>,
     stopped: bool,
     unconfirmed: bool,
+    /// The last stop sent nothing because the identity could not be read.
+    identity_unknown: bool,
+    /// The event for that was written.
+    deferred_noted: bool,
     fatal: Option<SupervisorError>,
+}
+
+impl Watch {
+    /// Take in the result of a stop tried while the command runs. A stop
+    /// that could not tell whose the group is has done nothing: it is not
+    /// marked as done, so the next look tries it again. True when that
+    /// is to be said in the event log (once).
+    fn after_stop(&mut self, result: StopResult) -> bool {
+        match result {
+            StopResult::Confirmed => self.stopped = true,
+            StopResult::Unconfirmed => {
+                self.stopped = true;
+                self.unconfirmed = true;
+            }
+            StopResult::IdentityUnknown => return !self.deferred_noted,
+        }
+        false
+    }
+
+    /// Take in the result of the stop of what the reaped command left. There
+    /// is no later look here: an unknown identity leaves the attempt
+    /// unresolved, and the next `supervise` (recovery) tries again. True
+    /// when the identity was the reason.
+    fn after_leftover_stop(&mut self, result: StopResult) -> bool {
+        match result {
+            StopResult::Confirmed => false,
+            StopResult::Unconfirmed => {
+                self.unconfirmed = true;
+                false
+            }
+            StopResult::IdentityUnknown => {
+                self.unconfirmed = true;
+                self.identity_unknown = true;
+                true
+            }
+        }
+    }
+}
+
+/// The watch's target after another look. A leader already seen to have
+/// ended, or whose identity is known, is kept: whatever has its PID at a
+/// later look may be another process, and must not become the target.
+fn refreshed(old: Option<StopTarget>, new: Option<StopTarget>) -> Option<StopTarget> {
+    match (old, new) {
+        (Some(old), Some(new)) if old.pid == new.pid && old.leader != Leader::Unread => Some(old),
+        (old, new) => new.or(old),
+    }
+}
+
+/// What is known of a command's leader once it has been reaped: the identity
+/// read while it ran (`seen`, when it is of the same PID), else only that it
+/// ended. Never a new read of the PID.
+fn reaped_leader(seen: Option<&StopTarget>, pid: u32) -> Leader {
+    match seen {
+        Some(StopTarget {
+            pid: p,
+            leader: Leader::Known(start),
+            ..
+        }) if *p == pid => Leader::Known(start.clone()),
+        _ => Leader::Ended,
+    }
 }
 
 /// The pid and process group of the registered command `id`'s child, once
@@ -945,15 +1069,21 @@ pub(crate) fn sidecar_child(ctx: &Context, id: &str) -> Option<(u32, i32)> {
     Some((child.pid, child.pgid.unwrap_or(child.pid as i32)))
 }
 
-/// The child of the registered command `id` as a stop target. A child that
-/// has already ended (or whose identity cannot be read) has no start
-/// identity, but its group is still a target.
+/// The child of the registered command `id` as a stop target, with what a
+/// read of its PID says about it now: its identity, that it has ended, or
+/// that it could not be read (and then nothing of it is signalled until a
+/// later look can read it).
+///
+/// The command is a child of this process, and is reaped by the thread that
+/// runs it. A read after that may find another process with the PID, so an
+/// identity is taken only from a process whose parent (from the same read)
+/// is this process ([`Leader::from_read`]).
 fn child_target(ctx: &Context, id: &str) -> Option<StopTarget> {
     let (pid, pgid) = sidecar_child(ctx, id)?;
     Some(StopTarget {
         pid,
         pgid,
-        start_identity: platform::process_start_identity(pid),
+        leader: Leader::from_read(&platform::read_process(pid), std::process::id()),
     })
 }
 
@@ -976,6 +1106,7 @@ pub fn run(spec: &SuperviseSpec) -> Result<Report> {
             termination: Some(t),
             finalized_here: false,
             unresolved: None,
+            identity_unknown: false,
             sleep_inhibit: "not needed".into(),
         });
     }
@@ -1056,6 +1187,7 @@ pub fn run(spec: &SuperviseSpec) -> Result<Report> {
                 termination: Some(termination),
                 finalized_here,
                 unresolved: None,
+                identity_unknown: false,
                 sleep_inhibit,
             });
         }
@@ -1078,6 +1210,7 @@ pub fn run(spec: &SuperviseSpec) -> Result<Report> {
         reason: None,
         exit: Some(Exit::Code(0)),
         unconfirmed: false,
+        identity_unknown: false,
     };
     let mut last_node = String::new();
     for (index, node) in spec.nodes.iter().enumerate() {
@@ -1088,14 +1221,19 @@ pub fn run(spec: &SuperviseSpec) -> Result<Report> {
         }
     }
     if end.unconfirmed {
+        let why = if end.identity_unknown {
+            "whose the command's processes are could not be told (an identity could not be \
+             read, or nothing left in its group is known to be its own), so nothing was \
+             signalled and they could not be confirmed stopped"
+        } else {
+            "the command's processes could not be confirmed stopped"
+        };
         return unresolved_report(
             &store,
             attempt,
             &[last_node.clone()],
-            format!(
-                "node {last_node}: the command's processes could not be confirmed \
-                 stopped; the attempt stays unresolved"
-            ),
+            format!("node {last_node}: {why}; the attempt stays unresolved"),
+            end.identity_unknown,
             sleep_inhibit,
         );
     }
@@ -1108,6 +1246,7 @@ pub fn run(spec: &SuperviseSpec) -> Result<Report> {
         termination: Some(termination),
         finalized_here,
         unresolved: None,
+        identity_unknown: false,
         sleep_inhibit,
     })
 }
@@ -1163,5 +1302,104 @@ mod tests {
             absorb_retryable(other),
             Err(SupervisorError::Storage(_))
         ));
+    }
+}
+
+#[cfg(test)]
+mod identity_tests {
+    use super::*;
+
+    fn target(pid: u32, leader: Leader) -> StopTarget {
+        StopTarget {
+            pid,
+            pgid: pid as i32,
+            leader,
+        }
+    }
+
+    #[test]
+    fn a_stop_that_could_not_tell_the_identity_is_left_to_be_tried_again() {
+        let mut w = Watch::default();
+        assert!(w.after_stop(StopResult::IdentityUnknown), "said once");
+        assert!(!w.stopped && !w.unconfirmed && !w.identity_unknown);
+        w.deferred_noted = true;
+        assert!(!w.after_stop(StopResult::IdentityUnknown), "not said twice");
+        assert!(!w.stopped && !w.unconfirmed);
+        // A later look that can read the identity finishes the stop.
+        assert!(!w.after_stop(StopResult::Confirmed));
+        assert!(w.stopped && !w.unconfirmed);
+    }
+
+    #[test]
+    fn a_stop_that_could_not_be_confirmed_is_not_tried_again_by_the_watch() {
+        let mut w = Watch::default();
+        assert!(!w.after_stop(StopResult::Unconfirmed));
+        assert!(w.stopped && w.unconfirmed && !w.identity_unknown);
+    }
+
+    #[test]
+    fn leftovers_with_an_unknown_identity_leave_the_node_unconfirmed() {
+        let mut w = Watch::default();
+        assert!(!w.after_leftover_stop(StopResult::Confirmed));
+        assert!(!w.unconfirmed && !w.identity_unknown);
+        assert!(!w.after_leftover_stop(StopResult::Unconfirmed));
+        assert!(w.unconfirmed && !w.identity_unknown);
+        let mut w = Watch::default();
+        assert!(w.after_leftover_stop(StopResult::IdentityUnknown));
+        assert!(w.unconfirmed && w.identity_unknown);
+    }
+
+    #[test]
+    fn a_later_look_never_replaces_a_leader_that_ended_or_is_known() {
+        let ended = target(0x7fff_fff0, Leader::Ended);
+        let known = target(0x7fff_fff0, Leader::Known("linux:5".into()));
+        let unread = target(0x7fff_fff0, Leader::Unread);
+        let other = target(0x7fff_fff0, Leader::Known("linux:9".into()));
+        // The PID was seen free (or with the command): what has it later is
+        // not the command.
+        for old in [&ended, &known] {
+            assert_eq!(
+                refreshed(Some(old.clone()), Some(other.clone())),
+                Some(old.clone())
+            );
+            assert_eq!(refreshed(Some(old.clone()), None), Some(old.clone()));
+        }
+        // A read that failed is tried again, and whatever it says is taken.
+        for new in [&ended, &known, &unread] {
+            assert_eq!(
+                refreshed(Some(unread.clone()), Some(new.clone())),
+                Some(new.clone())
+            );
+        }
+        assert_eq!(refreshed(Some(unread.clone()), None), Some(unread.clone()));
+        assert_eq!(refreshed(None, Some(known.clone())), Some(known.clone()));
+        assert_eq!(refreshed(None, None), None);
+        // Another child (another PID) is another target.
+        let next = target(0x7fff_fff1, Leader::Known("linux:9".into()));
+        assert_eq!(
+            refreshed(Some(ended.clone()), Some(next.clone())),
+            Some(next)
+        );
+    }
+
+    #[test]
+    fn a_reaped_leader_keeps_only_the_identity_read_while_it_ran() {
+        let known = target(0x7fff_fff0, Leader::Known("linux:5".into()));
+        assert_eq!(
+            reaped_leader(Some(&known), 0x7fff_fff0),
+            Leader::Known("linux:5".into())
+        );
+        // Another PID, a leader that was never read, or nothing seen: all
+        // that is known is that the command ended.
+        assert_eq!(reaped_leader(Some(&known), 0x7fff_fff1), Leader::Ended);
+        assert_eq!(
+            reaped_leader(Some(&target(0x7fff_fff0, Leader::Unread)), 0x7fff_fff0),
+            Leader::Ended
+        );
+        assert_eq!(
+            reaped_leader(Some(&target(0x7fff_fff0, Leader::Ended)), 0x7fff_fff0),
+            Leader::Ended
+        );
+        assert_eq!(reaped_leader(None, 0x7fff_fff0), Leader::Ended);
     }
 }

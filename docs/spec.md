@@ -531,6 +531,17 @@ lease期限切れはworker側の停止方針である。親に停止証拠が届
 
 取消要求を先に永続化し、新しいspawnを禁止する。実行中のcommand専用process groupと追跡した子孫・serviceを止め、停止とcleanupを確認してからterminalを確定する。PIDだけではなくboot IDとプロセス開始identityを確認する。
 
+signalを送る前の確認は次の規則に従う（recovery・timeout・lease切れによる停止も同じ）。
+
+- pidが今どのprocessのものかの読み取り結果は、**identity**（生きたprocessがあり開始identityが読めた）、**zombie**（終了したがまだ回収されていないprocessがそのpidを持ち、開始identityが読めた。pidはまだ空いていない）、**processなし**（OSが「そのprocessは無い」と確答した場合だけ）、**不明**（権限・資源不足・解釈できない内容など、それ以外のすべての失敗）に分ける。不明を「processなし」にも「同じprocess」にも寄せない。zombieも開始identityで誰のものかを判定する（Linuxは `/proc/<pid>/stat`、macOSは `sysctl(KERN_PROC_PID)`。macOSの `proc_pidinfo` はzombieを「processなし」と答えるので使わない）。
+- 記録したidentityと一致する生きたprocessのgroupだけに、番号を根拠にsignalを送る。identityが違えば（zombieでも）pidの再利用であり、送らない。leaderを回収済みなのにそのpidをzombieが持っている場合も他人のものであり、送らない。
+- leaderが「processなし」と確答された場合、または記録したidentityのzombieである場合は、group番号だけでは誰のgroupか分からない（groupが一度空になれば、そのpidを得た別のprocessが自分のgroupを作り、子孫を残して消えることがある）。このときはgroupにmemberが残っているかを調べ、残っていれば、**memberの1つがそのcommandのものだと確認できたときに限り**signalを送る。確認の根拠は、task-traffic-controllerがcommandの環境に入れる印（managed idとscope）を持つprocess、またはcommandの実行中に記録された子孫（pidと開始時刻）が、今そのgroupに属し、groupを読んだ後も同じ開始時刻であること。根拠が無ければ不明として扱い、signalを送らない。自分がsignalを送った直後に限り、根拠の無いmember（終了途中のもの）が消えるのを停止の確認時間の範囲で待つ。
+- supervisorが実行中のcommandのidentityを記録するのは、同じ読み取りで親pidがsupervisor自身だったときだけにする。commandの回収は別threadが行うので、読み取りの時点でそのpidが別のprocessのものになっていることがあり、そのidentityを記録すると後で「同じprocess」と誤認する。
+- **不明のprocessにはsignalを送らず、groupの有無も調べない**。停止を確定せず、消えたとも扱わない。実行中のsupervisorは次のpollで読み直し、それでも確定できなければattemptを未解決（unresolved）のまま残して、次回のsupervise（recovery）が同じ確認をやり直す。理由はevent（`supervisor_stop_identity_unknown`、`supervisor_recover_node` の `verdict: Unknown`、`supervisor_unresolved` の `identity_unknown`）に残す。
+- 未解決の理由がidentity不明だけのとき、supervisorは専用のexit code（5）で終わる。agentはこれをsupervisorの失敗に数えず、attemptを諦めない（`max_spawn_failures` の対象外）。`retry_ms` から始めて倍々に、最大32倍まで間隔を延ばしながらsuperviseを起動し直し、確定できるまで続ける。最初の1回と、間隔が上限に達したときに、event `agent_identity_unknown` を1件ずつ残す。待つ間もcancelとretireを見ており、新しく要求されたら待ちを打ち切ってすぐに見直す。identity不明以外の理由が1つでも混ざる未解決は、従来どおりexit code 3で、失敗として数える。
+- 既知の制約: 根拠を得られないmember（環境を消して起動され、実行中にも記録されなかった子孫。macOSでは、環境をOSが見せないsystem binaryで記録もされなかったもの）がgroupに残ると、そのattemptは未解決のまま再確認を続ける。残ったprocessが終わる（または利用者が確かめて止める）まで解消しない。Linuxで `/proc` が別のPID namespaceのものだったり `hidepid` で他のprocessを隠していたりすると、存在するprocessが「processなし」に見える。この構成は対象外とし、workerは自分のPID namespaceの `/proc` を読める環境で動かす。判定の読み取りからsignalまでの間にpidが再利用される、ごく短い時間の競合は残る（OSにpidではなくprocessを指定してsignalを送る手段が両対応では無い）。
+- identityは判定のときと、signalを送る直前のたびに読み直す。group番号がleaderのpidと異なる記録は、leaderからgroupを判定できないので不明として扱う。
+
 自然終了とcancelが競合した場合は、条件付きtransactionで一度だけterminalを確定する。cancel受理とcancel完了は別の応答とする。queued／preparingの仕事も遅れてspawnしないことを確認する。
 
 通常の実行契約はforeground commandと、remote-task-runnerが所有を追跡できるserviceである。独立daemonとして脱離する処理はservice宣言とcleanup契約を必要とする。任意コードの外部サービスへの副作用を取り消せるとは約束しない。
@@ -545,7 +556,7 @@ command実行timeout、task全体deadline、資源待ちtimeoutを区別する�
 | SSH切断 | worker spoolへ出力。lease範囲で継続し、再接続で追跡 |
 | 親process再起動 | process lock取得、epoch更新、非terminalをreconcileして同じattemptをadopt |
 | worker agent再起動 | 生存supervisorへ再接続。DBのactive表示だけでcommandを再起動しない |
-| supervisor異常終了 | 子孫・serviceを調査、停止・確定。起動済み不明なら自動再実行しない |
+| supervisor異常終了 | 子孫・serviceを調査、停止・確定。起動済み不明なら自動再実行しない。identityを読めないprocessと、leaderが消えたあと自分のものと確認できないgroupにはsignalを送らず、未解決のまま残して、確定できるまで間隔を延ばしながらrecoveryで再確認する |
 | worker OS再起動 | boot ID変更を検出し、旧所有資源を確認・cleanupしてinterruptedへ |
 | 結果転送の中断 | offset・digestから回収だけを再開 |
 | 入力転送の中断 | 同じsource IDの不足blobだけ再送 |
@@ -633,7 +644,7 @@ LinuxのworkerもSSHで導入・起動する。既定はsystemdのuser service�
 | - | - |
 | suspendを含む単調時計 | 第12章のlease・timeout・queue ageに使う。両OSでsuspend中の経過を含める |
 | boot ID | worker OSの再起動を検出する（第12章） |
-| process identity | pidの再利用を区別するため、開始時刻等と組にして記録する |
+| process identity | pidの再利用を区別するため、開始時刻等と組にして記録する。読み取り結果はidentity／zombie／processなし（OSの確答だけ）／不明で、不明をどれにも寄せない |
 | sleep抑止 | 実行中のidle sleepを抑止する。Linuxでは系統のsuspendも対象とする |
 
 ## 一時worker（Google Colab等）

@@ -26,6 +26,13 @@ pub mod code {
     pub const UNRESOLVED: i32 = 3;
     /// Another supervisor holds the attempt.
     pub const ALIVE: i32 = 4;
+    /// The attempt is unresolved for no other reason than that whose a
+    /// recorded process or group is could not be told (an identity could not
+    /// be read, or what a gone leader left is not known to be the
+    /// command's): nothing of it was signalled. Not a failure of the
+    /// supervisor: the parent starts `supervise` again later, for as long as
+    /// it takes, and recovery looks again.
+    pub const IDENTITY_UNKNOWN: i32 = 5;
     /// Any other failure.
     pub const FAILED: i32 = 1;
 }
@@ -80,7 +87,11 @@ pub fn main(spec_path: &Path) -> i32 {
         Ok(report) => {
             if let Some(why) = &report.unresolved {
                 eprintln!("supervise: unresolved: {why}");
-                code::UNRESOLVED
+                if report.identity_unknown {
+                    code::IDENTITY_UNKNOWN
+                } else {
+                    code::UNRESOLVED
+                }
             } else {
                 code::SETTLED
             }

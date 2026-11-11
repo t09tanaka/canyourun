@@ -147,6 +147,40 @@ pub fn backoff_ms(base_ms: u64, failures: u32) -> u64 {
     base_ms.saturating_mul(1 << failures.min(5))
 }
 
+/// What the exit of a supervisor means to the agent that started it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SupervisorExit {
+    /// The attempt is settled, or another supervisor holds it.
+    Done,
+    /// The attempt is unresolved only because whose a recorded process is
+    /// could not be told. Not a failure: it is looked at again, for as long
+    /// as it takes, and never counted towards giving up.
+    IdentityUnknown,
+    /// The supervisor failed.
+    Failed,
+}
+
+/// What a supervisor's exit `code` means (`None`: it was killed by a signal).
+pub fn supervisor_exit(code: Option<i32>) -> SupervisorExit {
+    match code {
+        Some(0 | 4) => SupervisorExit::Done,
+        Some(5) => SupervisorExit::IdentityUnknown,
+        _ => SupervisorExit::Failed,
+    }
+}
+
+/// Whether the pause after `tries` earlier ones is the first of the longest
+/// ([`backoff_ms`] no longer grows from here): said once in the event log.
+pub fn backoff_capped(tries: u32) -> bool {
+    tries == 5
+}
+
+/// Whether a wait before the next look at an attempt ends early: a cancel
+/// or a retire that was not there when the wait began is acted on at once.
+pub fn wakes(cancel_then: bool, cancel_now: bool, retired_then: bool, retired_now: bool) -> bool {
+    (cancel_now && !cancel_then) || (retired_now && !retired_then)
+}
+
 /// Whether every launch of an attempt was recorded by another boot of the
 /// machine: nothing of it can still run. A launch without a recorded process
 /// proves nothing.
@@ -613,6 +647,58 @@ mod tests {
         assert_eq!(DEFAULT_MAX_LIVE_ATTEMPTS, 32);
         assert_eq!(DEFAULT_MAX_PREPARES, 4);
         assert_eq!(DEFAULT_MAX_SPAWN_FAILURES, 5);
+    }
+
+    #[test]
+    fn a_supervisor_exit_is_a_failure_unless_it_says_otherwise() {
+        use crate::supervisor::process::code;
+        assert_eq!(supervisor_exit(Some(code::SETTLED)), SupervisorExit::Done);
+        assert_eq!(supervisor_exit(Some(code::ALIVE)), SupervisorExit::Done);
+        assert_eq!(
+            supervisor_exit(Some(code::IDENTITY_UNKNOWN)),
+            SupervisorExit::IdentityUnknown
+        );
+        for failed in [
+            Some(code::FAILED),
+            Some(code::BAD_SPEC),
+            Some(code::UNRESOLVED),
+            Some(6),
+            Some(-1),
+            Some(69),
+            Some(75),
+            None,
+        ] {
+            assert_eq!(supervisor_exit(failed), SupervisorExit::Failed);
+        }
+        assert_eq!(
+            (code::SETTLED, code::ALIVE, code::IDENTITY_UNKNOWN),
+            (0, 4, 5)
+        );
+    }
+
+    #[test]
+    fn the_cap_of_the_backoff_is_reached_once() {
+        let capped: Vec<u32> = (0..40).filter(|t| backoff_capped(*t)).collect();
+        assert_eq!(capped, vec![5]);
+        assert!(!backoff_capped(u32::MAX));
+        // It is the first try whose pause is the longest.
+        assert!(backoff_ms(100, 4) < backoff_ms(100, 5));
+        assert_eq!(backoff_ms(100, 5), backoff_ms(100, 6));
+    }
+
+    #[test]
+    fn a_wait_ends_early_only_for_a_cancel_or_a_retire_that_is_new() {
+        assert!(wakes(false, true, false, false));
+        assert!(wakes(false, false, false, true));
+        assert!(wakes(false, true, false, true));
+        assert!(wakes(true, true, false, true));
+        assert!(wakes(false, true, true, true));
+        assert!(!wakes(false, false, false, false));
+        assert!(!wakes(true, true, false, false));
+        assert!(!wakes(false, false, true, true));
+        assert!(!wakes(true, true, true, true));
+        // What was there and is not any more is not news.
+        assert!(!wakes(true, false, true, false));
     }
 
     #[test]
