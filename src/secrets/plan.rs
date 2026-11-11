@@ -13,9 +13,9 @@ use std::ops::Range;
 pub const MAX_FILES: usize = 256;
 /// Largest single file. One request must fit in a protocol frame (2 MiB, with
 /// the content in base64), so a file has to fit in half of it.
-pub const MAX_FILE_BYTES: usize = 512 * 1024;
+pub const MAX_FILE_BYTES: usize = 524_288;
 /// Most bytes in one bundle.
-pub const MAX_TOTAL_BYTES: usize = 8 * 1024 * 1024;
+pub const MAX_TOTAL_BYTES: usize = 8_388_608;
 /// Longest path, in bytes.
 pub const MAX_PATH_BYTES: usize = 1024;
 /// What one `secret_bundle_put` request may carry (content plus paths, before

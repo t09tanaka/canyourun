@@ -103,7 +103,7 @@ impl Masker {
 /// Most bytes [`StreamMasker`] holds back beyond what one secret needs. A
 /// run of overlapping occurrences (`abab` in `ababab...`) could otherwise keep
 /// growing; past this the run so far is released as one mask.
-pub const MAX_HELD_BYTES: usize = 1024 * 1024;
+pub const MAX_HELD_BYTES: usize = 1_048_576;
 
 /// Masks a log arriving in pieces. Output may lag the input by up to
 /// `longest pattern - 1` bytes (plus the rest of a character, so that a piece

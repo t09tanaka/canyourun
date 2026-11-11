@@ -22,9 +22,9 @@ pub const MAX_EVENT_SCAN: u32 = 100_000;
 /// Digests in one `blob_verify`.
 pub const MAX_VERIFY_DIGESTS: usize = 4096;
 /// The longest execution lease a submit may ask for: 24 hours.
-pub const MAX_LEASE_MS: u64 = 24 * 60 * 60 * 1000;
+pub const MAX_LEASE_MS: u64 = 86_400_000;
 /// The longest deadline or timeout a submit may ask for: 7 days.
-pub const MAX_TIMEOUT_MS: u64 = 7 * 24 * 60 * 60 * 1000;
+pub const MAX_TIMEOUT_MS: u64 = 604_800_000;
 /// Attempts that are not terminal on one worker, unless configured.
 pub const DEFAULT_MAX_LIVE_ATTEMPTS: u32 = 32;
 /// Workspaces prepared at once, unless configured.

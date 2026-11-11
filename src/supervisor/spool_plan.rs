@@ -18,17 +18,17 @@ use std::path::{Component, Path, PathBuf};
 
 pub const RECORD_LEN: usize = 16;
 /// The largest answer to one read, whatever the caller asked for.
-pub const MAX_READ_BYTES: u64 = 8 << 20;
+pub const MAX_READ_BYTES: u64 = 8_388_608;
 /// Unrecorded drops are written out when they reach this many bytes, so a
 /// flood after the limit does not grow the index without bound.
-pub const DROP_RECORD_STEP: u64 = 1 << 20;
+pub const DROP_RECORD_STEP: u64 = 1_048_576;
 /// Stored bytes that may wait without an index record. The log bytes are
 /// written at once; the record that publishes them to a reader is written only
 /// after the log is fsynced, and that happens when this much has accumulated
 /// (or the writer syncs or finishes), so the index stays at most `RECORD_LEN`
 /// per `MIN_RECORD_BYTES` of log and the log is fsynced once per that many
 /// bytes, however small the producer's writes are.
-pub const MIN_RECORD_BYTES: u64 = 1 << 20;
+pub const MIN_RECORD_BYTES: u64 = 1_048_576;
 const MAX_NAME_BYTES: usize = 1024;
 const MAX_COMPONENT_BYTES: usize = 255;
 const MAX_DEPTH: usize = 16;
@@ -399,6 +399,12 @@ mod tests {
     #[test]
     fn the_production_record_threshold_is_one_mebibyte() {
         assert_eq!(MIN_RECORD_BYTES, 1 << 20);
+    }
+
+    #[test]
+    fn the_read_and_drop_limits_have_their_documented_values() {
+        assert_eq!(MAX_READ_BYTES, 8 << 20);
+        assert_eq!(DROP_RECORD_STEP, 1 << 20);
     }
 
     #[test]
