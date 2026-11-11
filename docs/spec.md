@@ -375,7 +375,7 @@ coordinator内の1つのscheduler actorが、配置のcommitを直列化する�
 
 例：`local_worker_priority = -1`、他のworkerが0なら、手元は60秒遅いものとして比べられ、他のworkerが60秒以上遅れない限りそちらへ配置される。手元を実質使わないなら大きな差（例：-50）を付ける。配置理由の表示には、priorityによる補正量（worker別の秒数）を含める。
 
-workerはactive task数と未開始prefetch数の両方を制限する。既定は `max_active_task = 2`、`prefetch_per_worker = 1` とし、設定で調整できる。resource待ちのactive taskもactive枠を使う。セッションだけを大量に開始して親のbacklogを消費する実装を避ける。step単位のCPU・メモリ制御は別途task-traffic-controllerが行う。
+workerはactive task数と未開始prefetch数の両方を制限する。既定は `max_active_task = 2`、`prefetch_per_worker = 1` とし、設定で調整できる。resource待ちのactive taskもactive枠を使う。親は、あるworkerに置いたtask（開始済み・未開始・未ACK・unknown・retire確認待ちを含む）の合計が `max_active_task + prefetch_per_worker` に達したら、そのworkerへ新しく配置しない。上限は親の設定とworkerが `inspect` で答えた値の、項目ごとに小さい方を使う。件数は配置を記録するtransactionの中で数え直す。セッションだけを大量に開始して親のbacklogを消費する実装を避ける。step単位のCPU・メモリ制御は別途task-traffic-controllerが行う。
 
 ## 必要なのは仕事ごとの予測
 
@@ -526,6 +526,17 @@ workerは受け取る量に上限を持ち、超える要求は一部だけ処�
 **ACKが失われたことを理由に、別workerで同じ仕事を始めない。** 一時的な `not_found` だけでも再配置の証拠として不足する。遅れたsubmitが後から到着する可能性があるため、元workerにretire tombstoneを永続化し、未開始または停止済みを確認してから新attemptを作る。
 
 元workerがofflineで確認できなければunknownのまま保持する。leaseが切れたはずだという時間推測だけで、別workerへ自動再投入しない。これにより、障害時に可用性より重複防止を優先する箇所を明確にする。
+
+親（coordinator）は、attemptごとに「親DBに記録済みの事実」と「workerの今の答え」だけから次の1手を決める。親がどの時点で落ちても、次の起動が同じ規則で続きを行う。
+
+- 答えが無い（切断・timeout）ときはunknownにして保持する。再送も再配置も失敗の確定もしない。
+- retireの依頼があれば最初に送り、次にcancel、その後に未ACKのsubmitの再送を行う。再送は記録済みのpayloadを同じworkerへ送る場合に限り、payloadのhashが記録と違えば送らない。
+- workerのACKを記録済みのattemptに `not_found` が返っても、再送せずunknownのまま保持する。
+- retireの答えが `not_started` または `stopped` なら確認済みとし、taskを次のgenerationで配置できるようにする。`unconfirmed` は待つ。`already_terminal` のときは `get_attempt` の結果で分ける。`cancelled`・`interrupted`（完了せずに止まった）なら確認済みとして再配置し、`succeeded`・`failed`・`timed_out`（自分で終わった）ならその結果を採用して再配置しない。retireの最初の答えが失われて再送した場合に `already_terminal` が返るので、答えが届いた場合と同じ結論になるようにこの区別を置く。
+- 届く前にcancelしたattemptは、workerにtombstoneが書かれたことを確かめてから、親が `cancelled` を確定する。
+- workerがsubmitを確定的に断った場合（`OVERLOADED`・`RETIRED`・`STALE_EPOCH` 以外のerror）は、そのworkerへretireを送ってtombstoneを残し、確認できたら親がそのattemptを `failed` に確定する。別workerへは自動で配置しない。
+- `STALE_EPOCH` を受け取った親は、新しい親に交代したものとして、以後は配置も制御も行わない。
+- 配置を記録した未ACKの需要は、workerの受理を記録したときのほか、attemptがterminalになったとき、retireが確認されたときにも解消する。
 
 retire・重複排除の最小記録はclusterの寿命中保持する。大量のログ・成果物をGCしても、古いsubmitを新規実行する状態に戻さない。完全消去・再登録は新しいworker identityとして扱い、旧identityのunknown attemptを自動的に再投入しない。
 
