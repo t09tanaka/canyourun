@@ -7,7 +7,7 @@
 use crate::state::{AttemptState, Observation, Receipt};
 use crate::wire::{AttemptPayload, CancelPhase, CommandSpec, EventKind, RetireStatus};
 use serde_json::Value;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// Commands in one attempt.
 pub const MAX_COMMANDS: usize = 256;
@@ -72,6 +72,11 @@ pub fn check_payload(p: &AttemptPayload, poll_ms: u64) -> Result<(), &'static st
     let mut seen = BTreeSet::new();
     let mut bytes = 0usize;
     for c in &p.commands {
+        // Before anything is done per name. No command has more commands to
+        // wait for than the attempt may have; more names are repeats.
+        if c.depends_on.len() > MAX_COMMANDS {
+            return Err("a command names too many dependencies");
+        }
         if c.argv.first().is_none_or(|a| a.is_empty()) {
             return Err("a command is empty");
         }
@@ -119,27 +124,42 @@ pub fn check_payload(p: &AttemptPayload, poll_ms: u64) -> Result<(), &'static st
 /// Refused: a name that is no command of the attempt, and a cycle (a command
 /// naming itself included).
 pub fn execution_order(commands: &[CommandSpec]) -> Result<Vec<usize>, &'static str> {
-    let ids: BTreeSet<&str> = commands.iter().map(|c| c.node_id.as_str()).collect();
-    if commands
+    let index: BTreeMap<&str, usize> = commands
         .iter()
-        .flat_map(|c| &c.depends_on)
-        .any(|d| !ids.contains(d.as_str()))
-    {
-        return Err("depends_on names no command of the attempt");
+        .enumerate()
+        .map(|(i, c)| (c.node_id.as_str(), i))
+        .collect();
+    // Per command: how many commands it still waits for, and who waits for
+    // it. A name given more than once is one dependency (the set), so the
+    // work is bounded by the names read once, not by commands times names.
+    let mut waits = vec![0usize; commands.len()];
+    let mut unblocks: Vec<Vec<usize>> = vec![Vec::new(); commands.len()];
+    for (i, c) in commands.iter().enumerate() {
+        let on: BTreeSet<usize> = c
+            .depends_on
+            .iter()
+            .map(|d| index.get(d.as_str()).copied())
+            .collect::<Option<_>>()
+            .ok_or("depends_on names no command of the attempt")?;
+        waits[i] = on.len();
+        for d in on {
+            unblocks[d].push(i);
+        }
     }
-    let mut done: BTreeSet<&str> = BTreeSet::new();
-    let mut placed = vec![false; commands.len()];
+    // Kahn's algorithm; the set gives the first of the list among the ready.
+    let mut ready: BTreeSet<usize> = (0..commands.len()).filter(|&i| waits[i] == 0).collect();
     let mut order = Vec::with_capacity(commands.len());
-    while order.len() < commands.len() {
-        let next = commands.iter().enumerate().position(|(i, c)| {
-            !placed[i] && c.depends_on.iter().all(|d| done.contains(d.as_str()))
-        });
-        let Some(i) = next else {
-            return Err("depends_on forms a cycle");
-        };
-        placed[i] = true;
-        done.insert(commands[i].node_id.as_str());
+    while let Some(i) = ready.pop_first() {
         order.push(i);
+        for &next in &unblocks[i] {
+            waits[next] -= 1;
+            if waits[next] == 0 {
+                ready.insert(next);
+            }
+        }
+    }
+    if order.len() < commands.len() {
+        return Err("depends_on forms a cycle");
     }
     Ok(order)
 }
@@ -615,6 +635,93 @@ mod tests {
         // The same name twice is one dependency.
         assert_eq!(order(&[("a", &["b", "b"]), ("b", &[])]), Ok(vec![1, 0]));
         assert_eq!(order(&[]), Ok(vec![]));
+        // Of the commands that may run next, the first of the list: `b` is
+        // freed by `a` and runs before `c`, which was free all along.
+        assert_eq!(
+            order(&[("a", &[]), ("b", &["a"]), ("c", &[])]),
+            Ok(vec![0, 1, 2])
+        );
+        assert_eq!(
+            order(&[("a", &["d"]), ("b", &["d"]), ("c", &["a"]), ("d", &[])]),
+            Ok(vec![3, 0, 1, 2])
+        );
+    }
+
+    /// The definition, word for word: again and again the first command of
+    /// the list whose dependencies have all run.
+    fn order_by_definition(commands: &[CommandSpec]) -> Result<Vec<usize>, &'static str> {
+        let mut done: Vec<&str> = Vec::new();
+        let mut order: Vec<usize> = Vec::new();
+        while order.len() < commands.len() {
+            let next = commands.iter().enumerate().position(|(i, c)| {
+                !order.contains(&i) && c.depends_on.iter().all(|d| done.contains(&d.as_str()))
+            });
+            let i = next.ok_or("depends_on forms a cycle")?;
+            done.push(commands[i].node_id.as_str());
+            order.push(i);
+        }
+        Ok(order)
+    }
+
+    #[test]
+    fn every_small_graph_is_ordered_as_the_definition_says() {
+        // Four commands, each naming any subset of the four (itself too):
+        // all 65536 graphs, cycles included.
+        let names = ["a", "b", "c", "d"];
+        let (mut orders, mut cycles) = (0, 0);
+        for graph in 0u32..65_536 {
+            let commands: Vec<CommandSpec> = (0..4)
+                .map(|i| {
+                    let mut c = cmd(names[i]);
+                    c.depends_on = (0..4)
+                        .filter(|d| graph >> (i * 4 + d) & 1 == 1)
+                        .map(|d| NodeId::parse(names[d]).unwrap())
+                        .collect();
+                    c
+                })
+                .collect();
+            let got = execution_order(&commands);
+            assert_eq!(got, order_by_definition(&commands), "graph {graph:#x}");
+            match got {
+                Ok(_) => orders += 1,
+                Err(_) => cycles += 1,
+            }
+        }
+        // 543 of them have no cycle (the labelled acyclic graphs on four).
+        assert_eq!((orders, cycles), (543, 64_993));
+    }
+
+    #[test]
+    fn repeated_names_cost_one_look_each_and_too_many_are_refused() {
+        // At the limit, all of them the same name: accepted, one dependency.
+        let mut p = payload();
+        p.commands = deps(&[("a", &[]), ("b", &[])]);
+        p.commands[1].depends_on = vec![NodeId::parse("a").unwrap(); MAX_COMMANDS];
+        assert_eq!(check_payload(&p, 0), Ok(()));
+        assert_eq!(execution_order(&p.commands), Ok(vec![0, 1]));
+        p.commands[1].depends_on.push(NodeId::parse("a").unwrap());
+        assert_eq!(
+            check_payload(&p, 0),
+            Err("a command names too many dependencies")
+        );
+        // The count is refused before the names are looked at.
+        p.commands[1].depends_on[0] = NodeId::parse("nowhere").unwrap();
+        assert_eq!(
+            check_payload(&p, 0),
+            Err("a command names too many dependencies")
+        );
+        // Every command of a full attempt naming the first one as often as
+        // allowed: 65 280 names, each read once.
+        let mut full = payload();
+        full.commands = (0..MAX_COMMANDS).map(|i| cmd(&format!("n{i}"))).collect();
+        for c in &mut full.commands[1..] {
+            c.depends_on = vec![NodeId::parse("n0").unwrap(); MAX_COMMANDS];
+        }
+        assert_eq!(check_payload(&full, 0), Ok(()));
+        assert_eq!(
+            execution_order(&full.commands),
+            Ok((0..MAX_COMMANDS).collect())
+        );
     }
 
     #[test]
