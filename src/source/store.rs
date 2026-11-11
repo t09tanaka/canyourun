@@ -614,9 +614,13 @@ impl SourceStore {
     ///
     /// Each distinct set of `have` is one file under `bundles/`. A source
     /// keeps [`MAX_BUNDLES_PER_SOURCE`] of them: after a bundle is written,
-    /// the oldest others of the source are removed. Whoever sends the file
-    /// reads it before it asks for another; [`Self::remove_bundles`] removes
-    /// them all once the peer holds the source.
+    /// the oldest others of the source are removed. So the file returned
+    /// here may be gone by the time it is read, when more than that many
+    /// exports of the source with other bases ran meanwhile: whoever sends
+    /// it reads it at once and takes a missing file as "export again".
+    /// [`Self::remove_bundles`] removes them all once the peer holds the
+    /// source; nothing in this crate calls it yet (the sending side of the
+    /// coordinator is not written).
     pub fn export_bundle(
         &self,
         ctx: &ExecContext,
