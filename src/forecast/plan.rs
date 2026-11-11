@@ -868,6 +868,7 @@ mod tests {
             deadline_ms: None,
             resource_wait_timeout_ms: None,
             has_secret_bundle: false,
+            artifacts: Vec::new(),
         }
     }
 
