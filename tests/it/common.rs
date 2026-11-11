@@ -49,3 +49,29 @@ pub fn alive(pid: i32) -> bool {
 pub fn read_pid(path: &Path) -> Option<i32> {
     std::fs::read_to_string(path).ok()?.trim().parse().ok()
 }
+
+/// Write `text` to `path` and make it executable, so that it can be run at
+/// once by a test that shares its process with other tests.
+///
+/// A file this process holds open for writing cannot be executed (ETXTBSY),
+/// and another thread that forks at that moment hands the descriptor to its
+/// child until the child execs. So the file is written by a short-lived child
+/// instead: no descriptor of it ever exists in this process.
+pub fn write_executable(path: &Path, text: &str) {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    let mut child = Command::new("/bin/sh")
+        .arg("-c")
+        .arg("cat > \"$0\" && chmod 755 \"$0\"")
+        .arg(path)
+        .stdin(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(text.as_bytes())
+        .unwrap();
+    assert!(child.wait().unwrap().success(), "writing {path:?}");
+}
