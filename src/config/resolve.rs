@@ -24,7 +24,7 @@ pub const DEFAULT_TERM_GRACE_SECONDS: u64 = 10;
 pub const DEFAULT_FORECAST_TTL_MS: u64 = 2000;
 pub const DEFAULT_PREFETCH_PER_WORKER: u32 = 1;
 pub const DEFAULT_MAX_ACTIVE_TASK: u32 = 2;
-pub const DEFAULT_LOG_SPOOL_LIMIT_BYTES: u64 = 1 << 30;
+pub const DEFAULT_LOG_SPOOL_LIMIT_BYTES: u64 = 1_073_741_824;
 pub const DEFAULT_RETENTION_DAYS: u32 = 7;
 pub const DEFAULT_PRIORITY: i64 = 0;
 pub const MIN_PRIORITY: i64 = -100;
@@ -912,5 +912,18 @@ pub fn resolve(inp: &Inputs<'_>) -> Result<ResolvedConfig, ConfigError> {
         Ok(r)
     } else {
         Err(ConfigError::Invalid { problems })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_built_in_limits_have_their_documented_values() {
+        assert_eq!(DEFAULT_LOG_SPOOL_LIMIT_BYTES, 1 << 30);
+        assert_eq!(MIN_PRIORITY, -100);
+        assert_eq!(MAX_PRIORITY, 100);
+        assert_eq!(MAX_PRIORITY_STEP_SECONDS, 3600);
     }
 }
