@@ -1075,12 +1075,27 @@ pub struct AckCollectedResponse {
 // blobs
 // ---------------------------------------------------------------------------
 
+/// What a `blob_put` or a `blob_verify` entry carries for a source.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SourceBlobKind {
+    /// A file of the source, named by the hash of its content.
+    Content,
+    /// The JSON of a manifest: the source's own, or one of a submodule
+    /// capture it names. The source's own manifest is sent first.
+    Manifest,
+    /// The Git bundle of the source (one per source; it carries the commits
+    /// of dirty submodules too).
+    Bundle,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BlobPutRequest {
     pub schema_version: SchemaVersion,
     pub request_id: RequestId,
     pub coordinator_epoch: CoordinatorEpoch,
     pub source_id: SourceId,
+    pub kind: SourceBlobKind,
     /// Digest of the complete blob.
     pub digest: Digest,
     pub total_size: u64,
@@ -1098,10 +1113,12 @@ pub struct BlobPutResponse {
     pub complete: bool,
 }
 
+/// Fetch a part of an artifact of `attempt_id`, named by its digest.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BlobGetRequest {
     pub schema_version: SchemaVersion,
     pub request_id: RequestId,
+    pub attempt_id: AttemptId,
     pub digest: Digest,
     pub offset: u64,
     pub max_bytes: u32,
@@ -1117,18 +1134,39 @@ pub struct BlobGetResponse {
     pub eof: bool,
 }
 
+/// One blob a `blob_verify` asks about.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BlobRef {
+    pub kind: SourceBlobKind,
+    pub digest: Digest,
+    pub total_size: u64,
+}
+
+/// A blob the worker does not hold whole.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BlobProgress {
+    pub digest: Digest,
+    /// Bytes held contiguously from 0; a `blob_put` resumes here.
+    pub received: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BlobVerifyRequest {
     pub schema_version: SchemaVersion,
     pub request_id: RequestId,
-    pub digests: Vec<Digest>,
+    pub source_id: SourceId,
+    pub blobs: Vec<BlobRef>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BlobVerifyResponse {
     pub schema_version: SchemaVersion,
+    /// The source is published in the worker's store: a `submit_attempt`
+    /// that names it can be prepared.
+    pub ready: bool,
     pub present: Vec<Digest>,
-    pub missing: Vec<Digest>,
+    pub missing: Vec<BlobProgress>,
+    /// Held, but not as described (another size).
     pub corrupt: Vec<Digest>,
 }
 
@@ -1696,6 +1734,7 @@ mod tests {
                 request_id: rid(),
                 coordinator_epoch: CoordinatorEpoch(3),
                 source_id: SourceId::generate(),
+                kind: SourceBlobKind::Bundle,
                 digest: dg("blob"),
                 total_size: 4,
                 offset: 0,
@@ -1704,6 +1743,7 @@ mod tests {
             Request::BlobGet(BlobGetRequest {
                 schema_version: SV,
                 request_id: rid(),
+                attempt_id: aid.clone(),
                 digest: dg("blob"),
                 offset: 0,
                 max_bytes: 10,
@@ -1711,7 +1751,12 @@ mod tests {
             Request::BlobVerify(BlobVerifyRequest {
                 schema_version: SV,
                 request_id: rid(),
-                digests: vec![dg("a"), dg("b")],
+                source_id: SourceId::generate(),
+                blobs: vec![BlobRef {
+                    kind: SourceBlobKind::Manifest,
+                    digest: dg("a"),
+                    total_size: 9,
+                }],
             }),
             Request::SecretBundlePut(SecretBundlePutRequest {
                 schema_version: SV,
@@ -1876,8 +1921,12 @@ mod tests {
             }),
             Response::BlobVerify(BlobVerifyResponse {
                 schema_version: SV,
+                ready: false,
                 present: vec![dg("a")],
-                missing: vec![dg("b")],
+                missing: vec![BlobProgress {
+                    digest: dg("b"),
+                    received: 3,
+                }],
                 corrupt: vec![dg("c")],
             }),
             Response::SecretBundlePut(SecretBundlePutResponse {
@@ -2242,6 +2291,7 @@ mod tests {
             request_id: rid(),
             coordinator_epoch: CoordinatorEpoch(3),
             source_id: SourceId::parse("src_01ARZ3NDEKTSV4RRFFQ69G5FAV").unwrap(),
+            kind: SourceBlobKind::Content,
             digest: dg(digest),
             total_size: total,
             offset,

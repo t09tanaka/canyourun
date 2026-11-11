@@ -114,7 +114,7 @@ impl ObjectsRepo {
 
     /// The execution commit of `m` is reachable from the snapshot ref the
     /// bundle was unpacked under, and has the recorded tree.
-    fn check_reachable(&self, m: &CiManifest) -> Result<()> {
+    pub fn check_reachable(&self, m: &CiManifest) -> Result<()> {
         let Some(commit) = &m.execution_commit else {
             return Ok(());
         };
@@ -531,7 +531,7 @@ pub struct RequestSummary {
 
 /// A manifest from outside is not taken for what it says: its schema, its
 /// seal, and every path and mode are checked.
-fn verify_manifest(m: &CiManifest) -> Result<()> {
+pub fn verify_manifest(m: &CiManifest) -> Result<()> {
     if m.schema_version != SCHEMA_VERSION {
         return Err(corrupt(format!(
             "manifest schema version {} is not supported (this is {SCHEMA_VERSION})",

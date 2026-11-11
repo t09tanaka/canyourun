@@ -1422,7 +1422,8 @@ async fn status_events_logs_lease_and_inspect_answer_from_the_store() {
         Request::BlobVerify(BlobVerifyRequest {
             schema_version: SchemaVersion::CURRENT,
             request_id: RequestId::generate(),
-            digests: vec![],
+            source_id: SourceId::generate(),
+            blobs: vec![],
         }),
     )
     .await

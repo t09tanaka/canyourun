@@ -5,6 +5,7 @@
 //!
 //! All of it is blocking; the agent calls it from its own threads.
 
+use super::blobs::BlobSink;
 use crate::error::ApiError;
 use crate::ids::AttemptId;
 use crate::secrets::envfile::Values;
@@ -52,4 +53,9 @@ pub trait Host: Send + Sync {
     /// The attempt ended: erase its secret files and remove its workspace.
     /// Idempotent.
     fn cleanup(&self, attempt: &AttemptId, workspace: Option<&Workspace>) -> Result<(), ApiError>;
+    /// Where the sources the coordinator sends are taken in (`blob_put`,
+    /// `blob_verify`). `None`: this host does not receive sources.
+    fn blobs(&self) -> Option<&dyn BlobSink> {
+        None
+    }
 }
