@@ -445,8 +445,11 @@ fn a_supervisor_that_dies_before_it_started_anything_does_not_make_the_agent_run
     assert!(skip.is_empty());
     let note = note.unwrap();
     assert!(note.contains("setup builder was lost"), "{note}");
-    wait_for("the builder to be removed", || f.builder_dirs() == 0);
-    assert!(f.setups.unsettled().is_empty());
+    // Reaping removes the directory before clearing the unsettled record.
+    // Observe both effects instead of racing that final bookkeeping step.
+    wait_for("the builder and its unsettled record to be removed", || {
+        f.builder_dirs() == 0 && f.setups.unsettled().is_empty()
+    });
     assert!(!ran.exists(), "the step ran inside the agent");
     assert!(f.template_dirs().is_empty());
 }
