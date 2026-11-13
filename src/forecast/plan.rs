@@ -600,6 +600,22 @@ mod tests {
 
     const D: Defaults = Defaults { weight: 2 };
 
+    #[test]
+    fn repeated_assumptions_are_deduplicated_but_can_make_the_answer_conditional() {
+        let mut notes = Notes::default();
+        notes.note("runtime was assumed".into());
+        notes.note("runtime was assumed".into());
+        assert_eq!(notes.assumptions, ["runtime was assumed"]);
+        assert!(!notes.soft);
+
+        // A conditional occurrence still changes confidence when the same
+        // wording was already recorded as an unconditional assumption.
+        notes.add("runtime was assumed".into());
+        notes.add("runtime was assumed".into());
+        assert_eq!(notes.assumptions, ["runtime was assumed"]);
+        assert!(notes.soft);
+    }
+
     fn t0() -> DateTime<Utc> {
         "2030-01-01T00:00:00Z".parse().unwrap()
     }
