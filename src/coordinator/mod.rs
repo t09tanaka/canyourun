@@ -92,6 +92,8 @@ type Result<T, E = CoordinatorError> = std::result::Result<T, E>;
 /// from this by [`build_payload`] and nowhere else.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TaskSpec {
+    #[serde(default)]
+    pub setup: Option<crate::wire::SetupSpec>,
     pub plan_digest: PlanDigest,
     pub manifest_digest: ManifestDigest,
     pub commands: Vec<CommandSpec>,
@@ -120,7 +122,7 @@ pub fn build_payload(
         .clone()
         .ok_or_else(|| StorageError::Invalid(format!("run {} has no source", input.run_id)))?;
     Ok(AttemptPayload {
-        setup: None,
+        setup: spec.setup.clone(),
         run_id: input.run_id.clone(),
         task_id: input.task_id.clone(),
         generation: input.generation,

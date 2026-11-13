@@ -927,3 +927,68 @@ mod tests {
         assert_eq!(MAX_PRIORITY_STEP_SECONDS, 3600);
     }
 }
+
+/// Validated timing and limits shared by the resident parent and worker.
+#[derive(Debug, Clone)]
+pub struct RuntimeSettings {
+    pub coordinator: crate::coordinator::CoordinatorConfig,
+    pub scheduler: crate::scheduler::SchedulerConfig,
+    pub heartbeat_ms: u64,
+    pub stale_ms: u64,
+    pub term_grace_ms: u64,
+    pub retention_ms: u64,
+    pub log_limit_bytes: u64,
+}
+
+impl ResolvedConfig {
+    /// Convert seconds once, before opening stores or starting processes.
+    pub fn runtime_settings(&self) -> Result<RuntimeSettings, ConfigError> {
+        let mut problems = Vec::new();
+        check_timing(self, &mut problems);
+        if !problems.is_empty() {
+            return Err(ConfigError::Invalid { problems });
+        }
+        fn millis(name: &str, seconds: u64) -> Result<u64, ConfigError> {
+            seconds
+                .checked_mul(1000)
+                .ok_or_else(|| ConfigError::Invalid {
+                    problems: vec![format!("{name} overflows milliseconds")],
+                })
+        }
+        let lease_ms = millis("lease_seconds", self.lease_seconds.value)?;
+        let scheduler = crate::scheduler::SchedulerConfig {
+            rules: crate::scheduler::decide::Rules {
+                priority_step_ms: millis(
+                    "priority_step_seconds",
+                    self.priority_step_seconds.value,
+                )?,
+                forecast_ttl_ms: self.forecast_ttl_ms.value,
+                ..crate::scheduler::SchedulerConfig::default().rules
+            },
+            ..crate::scheduler::SchedulerConfig::default()
+        };
+        scheduler.check().map_err(|message| ConfigError::Invalid {
+            problems: vec![message],
+        })?;
+        Ok(RuntimeSettings {
+            coordinator: crate::coordinator::CoordinatorConfig {
+                limits: crate::coordinator::policy::Limits {
+                    max_active_task: self.max_active_task.value,
+                    prefetch_per_worker: self.prefetch_per_worker.value,
+                },
+                lease_ms,
+                // Two phases per tick must fit comfortably inside one lease.
+                worker_budget_ms: lease_ms / 4,
+            },
+            scheduler,
+            heartbeat_ms: millis("heartbeat_seconds", self.heartbeat_seconds.value)?,
+            stale_ms: millis("stale_seconds", self.stale_seconds.value)?,
+            term_grace_ms: millis("term_grace_seconds", self.term_grace_seconds.value)?,
+            retention_ms: millis(
+                "retention_days",
+                u64::from(self.retention_days.value) * 86400,
+            )?,
+            log_limit_bytes: self.log_spool_limit_bytes.value,
+        })
+    }
+}

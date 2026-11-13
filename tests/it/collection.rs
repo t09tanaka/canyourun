@@ -467,6 +467,7 @@ fn decl(name: &str, if_missing: MissingPolicy) -> ArtifactDecl {
 
 fn spec(artifacts: Vec<ArtifactDecl>) -> TaskSpec {
     TaskSpec {
+        setup: None,
         plan_digest: Digest::of_bytes(b"plan"),
         manifest_digest: Digest::of_bytes(b"manifest"),
         commands: vec![CommandSpec {

@@ -84,6 +84,8 @@ pub struct SetupConfig {
     pub poll_ms: u64,
     pub lease_ms: u64,
     pub term_grace_ms: u64,
+    /// Maximum bytes retained per setup supervisor log spool.
+    pub log_limit_bytes: u64,
     pub kill_wait_ms: u64,
     /// The whole builder, from its start to its end.
     pub deadline_ms: u64,
@@ -110,6 +112,7 @@ impl SetupConfig {
             supervisor_exe,
             traffic_config: None,
             profile: "default".into(),
+            log_limit_bytes: crate::supervisor::spec::DEFAULT_LOG_LIMIT_BYTES,
             env: BTreeMap::new(),
             poll_ms: 200,
             lease_ms: crate::supervisor::spec::DEFAULT_LEASE_MS,
@@ -931,7 +934,7 @@ impl Setups {
             lease_seed: None,
             inhibit_sleep: self.cfg.inhibit_sleep,
             spool_root: None,
-            log_limit_bytes: crate::supervisor::spec::DEFAULT_LOG_LIMIT_BYTES,
+            log_limit_bytes: self.cfg.log_limit_bytes,
             workspace_warnings: ws.warnings.clone(),
             // no secret reaches a builder; an explicit empty list says so
             mask: MaskValues(Vec::new()),

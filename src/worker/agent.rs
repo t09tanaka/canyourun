@@ -75,6 +75,8 @@ pub struct AgentConfig {
     /// spec default 2000). It is the `ttl_ms` the answer carries.
     pub forecast_ttl_ms: u64,
     pub term_grace_ms: u64,
+    /// Maximum bytes retained per supervisor log spool.
+    pub log_limit_bytes: u64,
     pub kill_wait_ms: u64,
     /// How often the supervisors and the agent's own loops look again.
     pub poll_ms: u64,
@@ -133,6 +135,7 @@ impl AgentConfig {
             max_active_task: 1,
             prefetch_per_worker: 1,
             forecast_ttl_ms: 2000,
+            log_limit_bytes: DEFAULT_LOG_LIMIT_BYTES,
             term_grace_ms: crate::supervisor::spec::DEFAULT_TERM_GRACE_MS,
             kill_wait_ms: 5_000,
             poll_ms: 200,
@@ -1251,7 +1254,7 @@ impl Agent {
             inhibit_sleep: self.cfg.inhibit_sleep,
             // The spool and this file share `<state_dir>/attempts/<attempt>`.
             spool_root: Some(self.cfg.attempts_root()),
-            log_limit_bytes: DEFAULT_LOG_LIMIT_BYTES,
+            log_limit_bytes: self.cfg.log_limit_bytes,
             workspace_warnings: ws.warnings.clone(),
             // This file therefore holds secrets: it is written 0600 and
             // removed with the workspace when the attempt has ended.
