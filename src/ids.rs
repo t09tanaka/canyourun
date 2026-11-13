@@ -90,43 +90,53 @@ macro_rules! prefixed_id {
 
 prefixed_id!(
     /// One coordinator plus its workers.
-    ClusterId, "cl"
+    ClusterId,
+    "cl"
 );
 prefixed_id!(
     /// A coordinator installation.
-    CoordinatorId, "co"
+    CoordinatorId,
+    "co"
 );
 prefixed_id!(
     /// One CI or command submission.
-    RunId, "run"
+    RunId,
+    "run"
 );
 prefixed_id!(
     /// A placeable logical piece of work.
-    TaskId, "task"
+    TaskId,
+    "task"
 );
 prefixed_id!(
     /// One execution attempt of a task.
-    AttemptId, "att"
+    AttemptId,
+    "att"
 );
 prefixed_id!(
     /// An idempotent request.
-    RequestId, "req"
+    RequestId,
+    "req"
 );
 prefixed_id!(
     /// A captured input snapshot.
-    SourceId, "src"
+    SourceId,
+    "src"
 );
 prefixed_id!(
     /// A shared setup builder.
-    BuilderId, "bld"
+    BuilderId,
+    "bld"
 );
 prefixed_id!(
     /// A global matrix permit.
-    PermitId, "prm"
+    PermitId,
+    "prm"
 );
 prefixed_id!(
     /// A history measurement (deduplicates records).
-    MeasurementId, "msr"
+    MeasurementId,
+    "msr"
 );
 
 /// Longest accepted free-form name.
@@ -217,7 +227,9 @@ name_id!(
     /// path-safe. Derive a safe name (for example a digest) first.
     NodeId,
     is_valid_node_name,
-    IdError::BadNodeName { max: MAX_NODE_NAME_LEN }
+    IdError::BadNodeName {
+        max: MAX_NODE_NAME_LEN
+    }
 );
 
 macro_rules! counter {
