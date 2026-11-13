@@ -47,7 +47,39 @@
 | S25 | RTR | 1 台上の試験ハーネスと障害注入 | 複数 worker（別 state dir）を 1 台で立てる、kill 点・ACK 消失・時計のずれの注入口、A 対応表のうち実機不要のものを自動試験にまとめる | 実機不要の A がすべて自動で緑 | 実機の試験（S26） | S15・S16・S18・S23 |
 | S26 | RTR | 実機での受入と初回リリース | 手元の Mac ＋ 2 台目の Mac（＋ S24 の Linux・一時 worker）で A01・A02・A24・A26・A34・A35・A37・A45・A46、結果の報告、0.1.0 の `cargo publish` とタグ・Release | §19 の全 A が緑、§20 の完了報告 | なし（最終行） | 全行、実機（2 台目の Mac）の用意 |
 
-並列に走るもの: 最初は S0・S1・X1 の 3 本（S0 は回答待ち）。S1 が入ると S2・S3、S2 が入ると S4・S5・S6 が並ぶ。
+## 現在の進捗と追加作業（2026-11-14）
+
+この計画を進捗と追加変更の基準とする。完成に必要な不足が判明したら、理由・担当・検証条件・依存を追記する。実装済みの部品と、利用者が実際に使う経路への接続は区別し、接続と受入検証が終わるまで担当行を完了にしない。
+
+- S0〜S14 と関連する先行変更は main に統合済み。S17 は PR #38 で、リモート CI は成功、ローカル検証で見つかった共有ツールの問題を修正中。
+- S15 は以下の小さい PR に分ける。S15a は S17 を起点に実装を先行できるが、公開・統合前に S17 の統合結果へ載せ直す。独立した修正・調査は担当を分け、設計と統合は親担当が行う。
+- 検証はコミット済み HEAD に対する `local-ci run --include-disabled` を基準とし、対象 SHA、コードの失敗、環境エラー、未再現の範囲、リモート CI の結果を分ける。共有ツールが原因なら、そのツールで修正・検証・公開した後、RTR の利用版を別変更で追従する。
+
+| 追加行 | 担当 | 必要になった理由・スコープ | 完了条件 | 依存・状態 |
+|---|---|---|---|---|
+| F1 | TTC | 同じ秒に開始した無関係な session leader が、孤児の候補から外れない。同 boot の単調時刻で子より古いと証明できる場合だけ除外する | 修正前に失敗する決定的な回帰テスト。unknown・equal・newer・別 boot・矛盾する証拠は保持。関連統合テストと CI、修正版の公開 | PR #38 のローカル検証を安定させる前提。実装・検証中 |
+| F2 | fast-worktree | 並行する Git worktree 登録が、別の登録途中の空 `commondir` を読む競合 | 登録変更だけを repository 共通の排他で保護。hook・依存準備は排他外。決定的な並行登録・hook 再入・長い hook 中の別 add の回帰テストと CI、修正版の公開 | 実装中。Git ネイティブ `hook run` を使うため Git 最低版を 2.36 とし、旧版は変更前に明瞭に拒否する |
+| F3 | RTR | 修正済み共有ツールと実行環境への追従 | TTC・fast-worktree の修正版を利用し、Git 2.36 の preflight・表示・テスト・文書を一致させる。local-ci の実行失敗を解消し、PR #38 をマージ | F1・F2。必要な関連ツールの更新・作成・公開も作業範囲に含む |
+| F4 | 検証環境 | CI の Rust 1.100 と古いローカル formatter・coverage ツールの差 | 同じ Rust 版と対応する coverage ツールで検証。新しい compiler で判明した未カバー分岐をテストし、ゲートを維持 | formatter と forecast の不足テストは PR #38 に反映。coverage ツールを CI と同版へ更新済み |
+
+### S15 の実装順
+
+| 行 | スコープ | 完了条件 | 依存・状態 |
+|---|---|---|---|
+| S15a | 設定から Coordinator・Scheduler・Agent・Setup への checked 変換、検証済み worker identity と priority、`TaskSpec.setup` の転送、`Machine::with_setup` 必須の共通 factory | 非既定値・単位変換の境界・lease/budget/TTL・identity の不一致・旧 task JSON・setup payload 転送・factory の関連テスト | S17。実装中 |
+| S15b | 親の常駐 loop、local worker、hello 検証済み remote link、再接続、独立した回収 loop、単一の ResultStore、ローカル IPC | 呼出元 CLI 終了後も durable task が実行・回収され、再起動で同じ attempt を引き継ぐ。遅い回収が lease 更新を止めない | S15a |
+| S15c | `init`・source/secret capture と durable `submit`・`ls`・`show`、run/task の問い合わせ API | 同時 CLI でも coordinator epoch が増殖しない。capture 失敗時は配置せず、完了済み run も正しく列挙する。JSON と stderr の契約を検証 | S15b、起動方式は S22 と整合 |
+| S15d | `exec`・`wait`・`cancel`・Ctrl-C・明示 `retry`・local-only `--in-place` | exit code を透過し、停止不明を cancelled にしない。unknown の retry を拒否し、元 snapshot と履歴を保つ。in-place を remote に配置しない | S15c |
+| S15e | `logs --follow`・再接続・`outputs`・retention の常駐 loop への接続 | 非 UTF-8・offset・切断再開、出力 path 衝突と部分失敗、回収失敗、実行中・回収中・保持対象を消さない GC を検証。自動削除に件数上限と時計跳躍の保護を付ける | S15d・S14 |
+| S15f | 読み取り専用 `estimate`、配置理由、転送・setup・回収の実測値の接続 | estimate が queue・attempt・ledger 需要を増やさない。measured/fallback/unknown・TTL・priority の説明を保つ。S15 の受入条件を利用者経路で閉じる | S15b〜S15e、S11・S13 |
+
+S16・S18〜S25 は元の分割表の必須範囲を維持する。新しい不足はこの追加表へ登録し、未実装の必須項目を「将来対応」として完成から外さない。
+
+### 受入環境と S26 の進め方
+
+- 当面の追加 worker と Linux 検証には Docker を使う。別 state dir と portool で分離し、複数 worker、親の再起動、接続断、ACK 消失、worker 消失、cold/warm と親単独との差を確認する。
+- Docker 上の Linux worker と macOS ホストの結果は区別する。Docker を別の Mac 実機と記載せず、独立した Mac の sleep・boot・launchd・実機間転送など、代替できない項目は実機確認待ちとして A 対応表と最終報告へ残す。
+- 公開する版には Docker で確認した範囲と未検証範囲を明記する。実機未確認の項目を、A01〜A49 全件確認済みと報告しない。
 
 ## A01〜A49 の対応
 
