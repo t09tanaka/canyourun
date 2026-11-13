@@ -519,6 +519,16 @@ impl TemplateStore {
 
 /// Copy, check, then change the workspace; see [`TemplateStore::materialize`].
 fn apply(tree: &Path, dest: &Path, scratch: &Path, steps: &[Step]) -> Result<(), StoreError> {
+    apply_with(tree, dest, scratch, steps, || {})
+}
+
+fn apply_with(
+    tree: &Path,
+    dest: &Path,
+    scratch: &Path,
+    steps: &[Step],
+    mut before_replace: impl FnMut(),
+) -> Result<(), StoreError> {
     let new_at = |i: usize| scratch.join(format!("new-{i}"));
     for (i, s) in steps.iter().enumerate() {
         let Step::Put { rel, digest, .. } = s else {
@@ -542,7 +552,9 @@ fn apply(tree: &Path, dest: &Path, scratch: &Path, steps: &[Step]) -> Result<(),
                 let to = dest.join(rel);
                 let kept = scratch.join(format!("old-{i}"));
                 let moved = if *replace {
-                    fs::rename(&to, &kept).map(|()| {
+                    // Keep the original in place until the replacement is
+                    // ready: a stopped agent must never leave a missing leaf.
+                    copy_tree(&to, &kept).map_err(io::Error::other).map(|()| {
                         undo.push(Undo::Restore {
                             kept,
                             to: to.clone(),
@@ -551,11 +563,16 @@ fn apply(tree: &Path, dest: &Path, scratch: &Path, steps: &[Step]) -> Result<(),
                 } else {
                     Ok(())
                 };
-                moved.and_then(|()| fs::rename(new_at(i), &to)).map(|()| {
-                    if !*replace {
-                        undo.push(Undo::Delete(to));
-                    }
-                })
+                moved
+                    .and_then(|()| {
+                        before_replace();
+                        fs::rename(new_at(i), &to)
+                    })
+                    .map(|()| {
+                        if !*replace {
+                            undo.push(Undo::Delete(to));
+                        }
+                    })
             }
             Step::Remove { rel, dir: false } => {
                 let to = dest.join(rel);
@@ -580,7 +597,7 @@ fn apply(tree: &Path, dest: &Path, scratch: &Path, steps: &[Step]) -> Result<(),
     for u in undo.iter().rev() {
         let back = match u {
             Undo::Delete(to) => remove_tree(to),
-            Undo::Restore { kept, to } => remove_tree(to).and_then(|()| fs::rename(kept, to)),
+            Undo::Restore { kept, to } => fs::rename(kept, to),
             Undo::Mkdir(to) => fs::create_dir(to),
         };
         if let Err(b) = back {
@@ -743,4 +760,50 @@ pub fn digest_of(path: &Path) -> Result<String, StoreError> {
         tree_digest(path).map_err(|e| StoreError::Corrupt(format!("{}: {e:#}", path.display())))?;
     debug_assert!(d.digest.starts_with(Digest::PREFIX));
     Ok(d.digest)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn interruption_before_replacement_keeps_the_original_leaf() {
+        for link in [false, true] {
+            let tmp = tempfile::tempdir().unwrap();
+            let tree = tmp.path().join("tree");
+            let dest = tmp.path().join("workspace");
+            let scratch = tmp.path().join("scratch");
+            for dir in [&tree, &dest, &scratch] {
+                fs::create_dir(dir).unwrap();
+            }
+            if link {
+                symlink("old-target", dest.join("entry")).unwrap();
+                symlink("new-target", tree.join("entry")).unwrap();
+            } else {
+                fs::write(dest.join("entry"), "original").unwrap();
+                fs::write(tree.join("entry"), "prepared").unwrap();
+            }
+            let original = digest_of(&dest.join("entry")).unwrap();
+            let prepared = digest_of(&tree.join("entry")).unwrap();
+            let steps = [Step::Put {
+                rel: "entry",
+                digest: &prepared,
+                replace: true,
+            }];
+            // Interrupt at the boundary after the backup, before installing
+            // the prepared leaf. No process or signal is needed for this cut.
+            let interrupted = std::panic::catch_unwind(|| {
+                let _ = apply_with(&tree, &dest, &scratch, &steps, || {
+                    panic!("agent stopped before replacement")
+                });
+            });
+            assert!(interrupted.is_err());
+            assert_eq!(digest_of(&dest.join("entry")).unwrap(), original);
+            // A restarted application can replace it from the same base.
+            remove_tree(&scratch).unwrap();
+            fs::create_dir(&scratch).unwrap();
+            apply(&tree, &dest, &scratch, &steps).unwrap();
+            assert_eq!(digest_of(&dest.join("entry")).unwrap(), prepared);
+        }
+    }
 }
