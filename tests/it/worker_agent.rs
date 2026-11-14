@@ -57,6 +57,10 @@ struct DirHost {
     secret_paths: Mutex<Option<Vec<String>>>,
     /// The source is here and its secret files cannot be told.
     secret_paths_error: Mutex<Option<ApiError>>,
+    /// `setup_poll` answers `Pending` while this is set; then it is done,
+    /// with the setup steps of `setup_skip` in the workspace.
+    setup_pending: AtomicBool,
+    setup_skip: Mutex<std::collections::BTreeSet<String>>,
 }
 
 type MaskHook = Box<dyn Fn(&AttemptId) + Send + Sync>;
@@ -120,6 +124,25 @@ impl Host for DirHost {
             index_reproduced: true,
             warnings: Vec::new(),
         })
+    }
+    fn setup_poll(
+        &self,
+        a: &AcceptedAttempt,
+        _: &AttemptPayload,
+        _: &Workspace,
+    ) -> Result<remote_task_runner::setup::builder::SetupPoll, ApiError> {
+        use remote_task_runner::setup::builder::SetupPoll;
+        self.log(format!("setup_poll {}", a.attempt_id));
+        if self.setup_pending.load(Ordering::SeqCst) {
+            return Ok(SetupPoll::Pending);
+        }
+        Ok(SetupPoll::Done {
+            skip: self.setup_skip.lock().unwrap().clone(),
+            note: Some("a note".into()),
+        })
+    }
+    fn setup_release(&self, a: &AttemptId) {
+        self.log(format!("setup_release {a}"));
     }
     fn secret_paths(&self, _: &AttemptPayload) -> Result<Option<Vec<String>>, ApiError> {
         if let Some(e) = self.secret_paths_error.lock().unwrap().clone() {
@@ -220,6 +243,8 @@ pub(crate) fn fx() -> Fx {
         on_mask: Mutex::default(),
         secret_paths: Mutex::new(Some(Vec::new())),
         secret_paths_error: Mutex::new(None),
+        setup_pending: AtomicBool::new(false),
+        setup_skip: Mutex::default(),
     });
     Fx {
         dir,
@@ -354,6 +379,10 @@ impl Fx {
     fn supervisors(&self, a: &AttemptId) -> Vec<i32> {
         pgrep(&supervisor_pattern(a))
     }
+    /// The supervisors whose spec is under `dir`.
+    fn supervisors_under(&self, dir: &Path) -> Vec<i32> {
+        pgrep(&dir.to_string_lossy())
+    }
     /// SIGKILL the attempt's supervisors: each only while it still is the
     /// process the search found (its identity and command line are read
     /// again right before the signal).
@@ -370,6 +399,7 @@ fn payload(script: &str) -> AttemptPayload {
     let mut env = BTreeMap::new();
     env.insert("PATH".to_string(), "/usr/bin:/bin".to_string());
     AttemptPayload {
+        setup: None,
         run_id: RunId::generate(),
         task_id: TaskId::generate(),
         generation: Generation(1),
@@ -378,6 +408,7 @@ fn payload(script: &str) -> AttemptPayload {
         manifest_digest: d,
         permit_id: None,
         commands: vec![CommandSpec {
+            setup_step: None,
             node_id: NodeId::parse("main").unwrap(),
             argv: vec!["/bin/sh".into(), "-c".into(), script.into()],
             cwd: String::new(),
@@ -2916,6 +2947,17 @@ impl Host for RealButCore {
     fn prepare(&self, a: &AcceptedAttempt, p: &AttemptPayload) -> Result<Workspace, ApiError> {
         self.0.prepare(a, p)
     }
+    fn setup_poll(
+        &self,
+        a: &AcceptedAttempt,
+        p: &AttemptPayload,
+        w: &Workspace,
+    ) -> Result<remote_task_runner::setup::builder::SetupPoll, ApiError> {
+        self.0.setup_poll(a, p, w)
+    }
+    fn setup_release(&self, a: &AttemptId) {
+        self.0.setup_release(a)
+    }
     fn secret_paths(&self, p: &AttemptPayload) -> Result<Option<Vec<String>>, ApiError> {
         self.0.secret_paths(p)
     }
@@ -3280,4 +3322,352 @@ async fn the_real_host_knows_a_worktreeinclude_file_and_a_placed_secret_under_an
         ]
     );
     refused_as_link_and_copy(&f, &b);
+}
+
+// ---------------------------------------------------------------- setup
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_commands_of_a_prepared_setup_are_left_out_and_the_others_run() {
+    let f = fx();
+    let agent = f.start("boot-a");
+    let c = f.connect(&agent).await;
+    f.host.setup_pending.store(true, Ordering::SeqCst);
+    *f.host.setup_skip.lock().unwrap() = ["s1".to_string()].into();
+    let order = f.path("order");
+    let say = |name: &str| format!("echo {name} >> {}", order.display());
+    let step = |c: CommandSpec, id: &str| CommandSpec {
+        setup_step: Some(id.into()),
+        ..c
+    };
+    let mut p = payload("true");
+    p.commands = vec![
+        step(command("install", &say("install"), &[]), "s1"),
+        // a step the template does not hold stays
+        step(command("tools", &say("tools"), &["install"]), "s2"),
+        command("test", &say("test"), &["install", "tools"]),
+    ];
+    let a = AttemptId::generate();
+    submit(&c, &a, &p).await;
+    // while the builder works the attempt waits and nothing starts
+    wait_for("the setup to be asked about", || {
+        f.host.count(&format!("setup_poll {a}")) >= 3
+    });
+    assert_eq!(f.rec(&a).state, AttemptState::Preparing);
+    assert!(!order.exists());
+    f.host.setup_pending.store(false, Ordering::SeqCst);
+    assert_eq!(f.wait_terminal(&a), Outcome::Succeeded);
+    // `install` is in the workspace already: it does not run, and nothing
+    // waits for it
+    assert_eq!(std::fs::read_to_string(&order).unwrap(), "tools\ntest\n");
+    let launched: Vec<String> = f
+        .store()
+        .launches(&a)
+        .unwrap()
+        .into_iter()
+        .map(|l| l.0.to_string())
+        .collect();
+    assert_eq!(launched, ["tools", "test"]);
+    // what the host said about a template it could not have is in the journal
+    let events = f.store().events_of(&a, "agent_setup_unavailable").unwrap();
+    assert_eq!(events.len(), 1);
+    assert!(events[0].payload.to_string().contains("a note"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_submit_with_a_setup_that_is_not_valid_is_refused_before_it_is_stored() {
+    use remote_task_runner::wire::{ReuseScope, SetupSpec, SetupStep};
+    let f = fx();
+    let agent = f.start("boot-a");
+    let c = f.connect(&agent).await;
+    let step = |id: &str, dir: &str| SetupStep {
+        id: id.into(),
+        dir: dir.into(),
+        run: "true".into(),
+        shell: None,
+        env: BTreeMap::new(),
+        unresolved_env: vec![],
+    };
+    let setup = |steps: Vec<SetupStep>| SetupSpec {
+        steps,
+        toolchain: vec![],
+        scope: ReuseScope::Persistent,
+        freshness_secs: None,
+        secrets: vec![],
+        no_cache: false,
+        step_timeout_ms: None,
+    };
+    let a = AttemptId::generate();
+    for (what, steps) in [
+        ("the same id twice", vec![step("s", ""), step("s", "")]),
+        ("a dir out of the workspace", vec![step("s", "../x")]),
+    ] {
+        let mut p = payload("true");
+        p.setup = Some(setup(steps));
+        let e = call(&c, submit_req(&a, &p)).await.expect_err(what);
+        assert_eq!(e.code, ErrorCode::InvalidInput, "{what}: {e:?}");
+    }
+    assert!(f.store().get(&a).unwrap().is_none());
+    assert_eq!(f.host.count(&format!("prepare {a}")), 0);
+    // a valid one is accepted
+    let mut p = payload("true");
+    p.setup = Some(setup(vec![step("s", "web")]));
+    assert!(!submit(&c, &a, &p).await.duplicate);
+    f.wait_terminal(&a);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_attempt_whose_commands_are_all_prepared_succeeds_without_starting_one() {
+    // An install-only task whose template is there: every command is left
+    // out. It is a success with no exit status and no log, its declared
+    // artifact is taken from the workspace, and the journal says why
+    // nothing ran.
+    let f = fx();
+    let agent = f.start("boot-a");
+    let c = f.connect(&agent).await;
+    f.host.setup_pending.store(true, Ordering::SeqCst);
+    *f.host.setup_skip.lock().unwrap() = ["s1".to_string(), "s2".to_string()].into();
+    *f.host.secret_paths.lock().unwrap() = Some(Vec::new());
+    let ran = f.path("ran");
+    let say = format!("echo x >> {}", ran.display());
+    let step = |c: CommandSpec, id: &str| CommandSpec {
+        setup_step: Some(id.into()),
+        ..c
+    };
+    let mut p = payload("true");
+    p.commands = vec![
+        step(command("install", &say, &[]), "s1"),
+        step(command("tools", &say, &["install"]), "s2"),
+    ];
+    p.artifacts = vec![decl("lock", "made/lock.txt", MissingPolicy::Required)];
+    let a = AttemptId::generate();
+    submit(&c, &a, &p).await;
+    wait_for("the setup to be asked about", || {
+        f.host.count(&format!("setup_poll {a}")) >= 1
+    });
+    // what the template puts into the workspace
+    let made = f.host.ws_dir(&a).join("made");
+    std::fs::create_dir_all(&made).unwrap();
+    std::fs::write(made.join("lock.txt"), "locked\n").unwrap();
+    f.host.setup_pending.store(false, Ordering::SeqCst);
+    assert_eq!(f.wait_terminal(&a), Outcome::Succeeded);
+    assert!(!ran.exists(), "a prepared step was run");
+    assert!(f.store().launches(&a).unwrap().is_empty());
+    let result = result_of(&c, &a).await;
+    assert_eq!(result.termination.outcome(), Outcome::Succeeded);
+    assert_eq!(result.termination.exit(), None);
+    assert!(result.nodes.is_empty());
+    let names: Vec<&str> = result.artifacts.iter().map(|r| r.name.as_str()).collect();
+    assert_eq!(names, ["lock"]);
+    assert!(result.artifacts_not_stored.is_empty());
+    let said = f.store().events_of(&a, "agent_setup_satisfied").unwrap();
+    assert_eq!(said.len(), 1);
+    assert_eq!(said[0].payload["steps"], serde_json::json!(["s1", "s2"]));
+    assert_eq!(f.store().events_of(&a, "prepared_only").unwrap().len(), 1);
+    // The parent collects it like any result: it reads the log of the first
+    // declared command to its end, and that log is empty and complete.
+    for stream in [LogStream::Stdout, LogStream::Stderr] {
+        let Response::ReadLog(log) = call(
+            &c,
+            Request::ReadLog(ReadLogRequest {
+                schema_version: SchemaVersion::CURRENT,
+                request_id: RequestId::generate(),
+                attempt_id: a.clone(),
+                node_id: NodeId::parse("install").unwrap(),
+                stream,
+                offset: 0,
+                max_bytes: 1024,
+            }),
+        )
+        .await
+        .unwrap() else {
+            panic!()
+        };
+        assert!(log.eof && log.data.0.is_empty());
+    }
+    assert!(result.result_digest.to_string().starts_with("sha256:"));
+    assert!(f
+        .store()
+        .events_of(&a, "agent_prepare_failed")
+        .unwrap()
+        .is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_attempt_cancelled_while_it_waits_for_its_setup_lets_go_of_the_builder() {
+    let f = fx();
+    let agent = f.start("boot-a");
+    let c = f.connect(&agent).await;
+    f.host.setup_pending.store(true, Ordering::SeqCst);
+    let marker = f.path("starts");
+    let p = payload(&format!("echo start >> {}", marker.display()));
+    let a = AttemptId::generate();
+    submit(&c, &a, &p).await;
+    wait_for("the setup to be asked about", || {
+        f.host.count(&format!("setup_poll {a}")) >= 2
+    });
+    let Response::CancelAttempt(_) = call(&c, cancel_req(&a)).await.unwrap() else {
+        panic!()
+    };
+    assert_eq!(f.wait_terminal(&a), Outcome::Cancelled);
+    assert!(f.host.count(&format!("setup_release {a}")) >= 1);
+    assert_eq!(lines(&marker), 0);
+    assert!(f.store().launches(&a).unwrap().is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_attempt_that_waited_too_long_for_its_setup_runs_every_command_itself() {
+    let f = fx();
+    let mut cfg = f.cfg("boot-a");
+    cfg.prepare_timeout_ms = 300;
+    let agent = f.start_with(cfg);
+    let c = f.connect(&agent).await;
+    f.host.setup_pending.store(true, Ordering::SeqCst);
+    *f.host.setup_skip.lock().unwrap() = ["s1".to_string()].into();
+    let marker = f.path("starts");
+    let mut p = payload("true");
+    let mut only = command(
+        "install",
+        &format!("echo start >> {}", marker.display()),
+        &[],
+    );
+    only.setup_step = Some("s1".into());
+    p.commands = vec![only];
+    let a = AttemptId::generate();
+    submit(&c, &a, &p).await;
+    assert_eq!(f.wait_terminal(&a), Outcome::Succeeded);
+    assert_eq!(lines(&marker), 1);
+    assert!(f.host.count(&format!("setup_release {a}")) >= 1);
+    let events = f.store().events_of(&a, "agent_setup_unavailable").unwrap();
+    assert!(events[0]
+        .payload
+        .to_string()
+        .contains("not ready within 300"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_real_host_prepares_a_setup_once_and_two_attempts_use_it() {
+    use remote_task_runner::setup::builder::SetupConfig;
+    use remote_task_runner::source::{capture_for_run, CaptureParams, SourceRequest, SourceStore};
+    let f = fx();
+    let state = f.state();
+    let env: BTreeMap<String, String> = [
+        ("PATH", "/usr/bin:/bin:/usr/local/bin:/opt/homebrew/bin"),
+        ("HOME", f.path("home").to_str().unwrap()),
+        ("GIT_CONFIG_GLOBAL", "/dev/null"),
+        ("GIT_CONFIG_NOSYSTEM", "1"),
+    ]
+    .into_iter()
+    .map(|(k, v)| (k.to_string(), v.to_string()))
+    .collect();
+    std::fs::create_dir_all(f.path("home")).unwrap();
+    let plain = f.path("plain");
+    std::fs::create_dir_all(&plain).unwrap();
+    std::fs::write(plain.join("package.json"), "{}\n").unwrap();
+    let run = RunId::generate();
+    let store = SourceStore::open(&state).unwrap();
+    let captured = capture_for_run(
+        &env,
+        &store,
+        &run,
+        &SourceRequest::Directory { dir: plain.clone() },
+        &CaptureParams::default(),
+    )
+    .unwrap();
+    let machine = remote_task_runner::worker::machine::Machine::open(
+        &state,
+        env.clone(),
+        state.join("cluster.key"),
+    )
+    .unwrap();
+    let mut setup = SetupConfig::new(
+        state.clone(),
+        WorkerId::parse("w-test").unwrap(),
+        PathBuf::from(env!("CARGO_BIN_EXE_remote-task-runner")),
+    );
+    setup.poll_ms = 25;
+    setup.lease_ms = 3_000;
+    setup.term_grace_ms = 1_000;
+    setup.kill_wait_ms = 2_000;
+    setup.env = env;
+    let machine = machine.with_setup(setup).unwrap();
+    let setups = machine.setups().unwrap().clone();
+    let agent = Agent::start(f.cfg("boot-a"), Arc::new(RealButCore(machine))).unwrap();
+    f.agents.lock().unwrap().push(agent.clone());
+    let c = f.connect(&agent).await;
+
+    let (count, installed) = (f.path("count"), f.path("installed"));
+    let setup_spec = SetupSpec {
+        steps: vec![SetupStep {
+            id: "i1".into(),
+            dir: String::new(),
+            run: format!(
+                "echo x >> {}; mkdir -p node_modules; echo dep > node_modules/f; sleep 1",
+                count.display()
+            ),
+            shell: None,
+            env: BTreeMap::new(),
+            unresolved_env: vec![],
+        }],
+        toolchain: vec![],
+        scope: ReuseScope::Persistent,
+        freshness_secs: None,
+        secrets: vec![],
+        no_cache: false,
+        step_timeout_ms: None,
+    };
+    let make = |out: &Path| {
+        let mut p = payload("true");
+        p.run_id = run.clone();
+        p.source_id = captured.manifest.source_id.clone();
+        let digest = &captured.manifest.manifest_digest;
+        p.manifest_digest = Digest::parse(digest)
+            .or_else(|_| Digest::parse(&format!("sha256:{digest}")))
+            .unwrap();
+        let mut install = command(
+            "install",
+            &format!("echo ran >> {}", installed.display()),
+            &[],
+        );
+        install.setup_step = Some("i1".into());
+        let test = command(
+            "test",
+            &format!("cat node_modules/f > {}", out.display()),
+            &["install"],
+        );
+        p.commands = vec![install, test];
+        p.setup = Some(setup_spec.clone());
+        p
+    };
+    let (out_a, out_b) = (f.path("out_a"), f.path("out_b"));
+    let (a, b) = (AttemptId::generate(), AttemptId::generate());
+    submit(&c, &a, &make(&out_a)).await;
+    let mut pb = make(&out_b);
+    pb.task_id = TaskId::generate();
+    submit(&c, &b, &pb).await;
+    assert_eq!(f.wait_terminal(&a), Outcome::Succeeded);
+    assert_eq!(f.wait_terminal(&b), Outcome::Succeeded);
+    // built once, copied into both workspaces; the install command did not run
+    assert_eq!(setups.builds_started(), 1);
+    assert_eq!(lines(&count), 1);
+    assert_eq!(lines(&installed), 0);
+    assert_eq!(std::fs::read_to_string(&out_a).unwrap(), "dep\n");
+    assert_eq!(std::fs::read_to_string(&out_b).unwrap(), "dep\n");
+    for x in [&a, &b] {
+        let launched: Vec<String> = f
+            .store()
+            .launches(x)
+            .unwrap()
+            .into_iter()
+            .map(|l| l.0.to_string())
+            .collect();
+        assert_eq!(launched, ["test"]);
+    }
+    // nothing of the builder is left: its workspace and directory are gone
+    wait_for("the builder to be removed", || {
+        std::fs::read_dir(state.join("setup/builders")).map_or(true, |rd| rd.count() == 0)
+    });
+    wait_for("the workspaces to go", || {
+        std::fs::read_dir(state.join("workspaces")).map_or(true, |rd| rd.count() == 0)
+    });
+    assert!(f.supervisors_under(&state.join("setup")).is_empty());
 }

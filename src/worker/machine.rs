@@ -16,6 +16,7 @@ use crate::secrets::place::Placed;
 use crate::secrets::place::WorkerSecrets;
 use crate::secrets::vault::Vault;
 use crate::secrets::SecretError;
+use crate::setup::builder::{BuilderWorkspaces, SetupConfig, SetupPoll, Setups};
 use crate::source::classify::ci_id_of;
 use crate::source::SourceStore;
 use crate::storage::AcceptedAttempt;
@@ -28,6 +29,9 @@ use std::sync::Arc;
 
 pub struct Machine {
     state_dir: PathBuf,
+    env: BTreeMap<String, String>,
+    fw: Arc<CliFastWorktree>,
+    setups: Option<Arc<Setups>>,
     store: SourceStore,
     workspaces: Workspaces,
     secrets: WorkerSecrets,
@@ -65,6 +69,9 @@ impl Machine {
         );
         Ok(Machine {
             incoming,
+            setups: None,
+            env,
+            fw,
             state_dir: state_dir.to_path_buf(),
             store,
             workspaces,
@@ -82,29 +89,73 @@ impl Machine {
     }
 
     fn manifest_of(&self, payload: &AttemptPayload) -> Result<CiManifest, ApiError> {
-        let missing = || {
-            ApiError::new(
-                ErrorCode::NotFound,
-                format!("source {} is not in this worker's store", payload.source_id),
-            )
+        manifest_in(&self.store, payload)
+    }
+
+    /// Prepare the setup steps of attempts once per worker (spec chapter 8):
+    /// `cfg` says how builders are run. Without it a payload's setup is not
+    /// looked at and every attempt runs all of its commands. Before the
+    /// agent starts: it clears what builders of an earlier run left.
+    pub fn with_setup(mut self, cfg: SetupConfig) -> Result<Self, ApiError> {
+        let ws = BuilderWs {
+            store: self.store.clone(),
+            workspaces: Workspaces::new(self.state_dir.clone(), self.env.clone(), self.fw.clone()),
         };
-        let source = ci_id_of(&payload.source_id).ok_or_else(missing)?;
-        let m = self
-            .store
-            .manifest(&source)
-            .map_err(|e| internal("source store", format!("{e:#}")))?
-            .ok_or_else(missing)?;
-        let want = payload.manifest_digest.as_str();
-        if m.manifest_digest != want && format!("sha256:{}", m.manifest_digest) != want {
-            return Err(ApiError::new(
-                ErrorCode::Conflict,
-                format!(
-                    "source {} has another manifest than the attempt names",
-                    payload.source_id
-                ),
-            ));
-        }
-        Ok(m)
+        self.setups = Some(Setups::open(cfg, Arc::new(ws))?);
+        Ok(self)
+    }
+
+    pub fn setups(&self) -> Option<&Arc<Setups>> {
+        self.setups.as_ref()
+    }
+}
+
+/// The manifest of the source the payload names, and only if it is the
+/// manifest the payload names.
+fn manifest_in(store: &SourceStore, payload: &AttemptPayload) -> Result<CiManifest, ApiError> {
+    let missing = || {
+        ApiError::new(
+            ErrorCode::NotFound,
+            format!("source {} is not in this worker's store", payload.source_id),
+        )
+    };
+    let source = ci_id_of(&payload.source_id).ok_or_else(missing)?;
+    let m = store
+        .manifest(&source)
+        .map_err(|e| internal("source store", format!("{e:#}")))?
+        .ok_or_else(missing)?;
+    let want = payload.manifest_digest.as_str();
+    if m.manifest_digest != want && format!("sha256:{}", m.manifest_digest) != want {
+        return Err(ApiError::new(
+            ErrorCode::Conflict,
+            format!(
+                "source {} has another manifest than the attempt names",
+                payload.source_id
+            ),
+        ));
+    }
+    Ok(m)
+}
+
+/// The workspaces of the setup builders: made like an attempt's.
+struct BuilderWs {
+    store: SourceStore,
+    workspaces: Workspaces,
+}
+
+impl BuilderWorkspaces for BuilderWs {
+    fn create(&self, attempt: &AttemptId, payload: &AttemptPayload) -> Result<Workspace, ApiError> {
+        let m = manifest_in(&self.store, payload)?;
+        let repo = match (&m.execution_commit, &m.repository_id) {
+            (Some(_), Some(id)) => Some(self.workspaces.ensure_clone(id, None)?),
+            _ => None,
+        };
+        self.workspaces
+            .create(attempt, &self.store, &m, repo.as_ref())
+    }
+
+    fn remove(&self, ws: &Workspace) -> Result<(), ApiError> {
+        self.workspaces.remove(ws)
     }
 }
 
@@ -152,7 +203,13 @@ impl Host for Machine {
     }
 
     fn sweep_workspaces(&self, has_record: &dyn Fn(&AttemptId) -> bool) -> Result<(), ApiError> {
-        let report = self.workspaces.sweep_orphans(has_record)?;
+        // A setup builder's workspace is not an attempt's: its owner is the
+        // setup area, which settled the builders of an earlier run when it
+        // was opened and names those it could not.
+        let owned = |a: &AttemptId| {
+            has_record(a) || self.setups.as_ref().is_some_and(|s| s.owns_workspace(a))
+        };
+        let report = self.workspaces.sweep_orphans(&owned)?;
         match report.failed.first() {
             Some((path, why)) => Err(internal(
                 "orphan workspace",
@@ -174,6 +231,27 @@ impl Host for Machine {
         };
         self.workspaces
             .create(&attempt.attempt_id, &self.store, &m, repo.as_ref())
+    }
+
+    fn setup_poll(
+        &self,
+        attempt: &AcceptedAttempt,
+        payload: &AttemptPayload,
+        workspace: &Workspace,
+    ) -> Result<SetupPoll, ApiError> {
+        match &self.setups {
+            Some(s) => s.poll(&attempt.attempt_id, payload, workspace),
+            None => Ok(SetupPoll::Done {
+                skip: Default::default(),
+                note: None,
+            }),
+        }
+    }
+
+    fn setup_release(&self, attempt: &AttemptId) {
+        if let Some(s) = &self.setups {
+            s.release(attempt);
+        }
     }
 
     fn secret_paths(&self, payload: &AttemptPayload) -> Result<Option<Vec<String>>, ApiError> {
@@ -229,6 +307,7 @@ impl Host for Machine {
     }
 
     fn cleanup(&self, attempt: &AttemptId, workspace: Option<&Workspace>) -> Result<(), ApiError> {
+        self.setup_release(attempt);
         match self.secrets.erase(attempt) {
             Ok(_) => {}
             Err(e @ SecretError::WorkspaceRequired { .. }) => {

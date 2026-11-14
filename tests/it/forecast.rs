@@ -109,6 +109,7 @@ fn request(target: WorkloadPlan, pending: Vec<WorkloadPlan>, epoch: u64) -> Fore
 fn accept(store: &WorkerStore, attempt: &AttemptId, node: &str) -> AcceptedAttempt {
     let d = Digest::of_bytes(attempt.as_str().as_bytes());
     let payload = AttemptPayload {
+        setup: None,
         run_id: RunId::generate(),
         task_id: TaskId::generate(),
         generation: Generation(1),
@@ -117,6 +118,7 @@ fn accept(store: &WorkerStore, attempt: &AttemptId, node: &str) -> AcceptedAttem
         manifest_digest: d,
         permit_id: None,
         commands: vec![remote_task_runner::wire::CommandSpec {
+            setup_step: None,
             node_id: NodeId::parse(node).unwrap(),
             argv: vec!["true".into()],
             cwd: String::new(),
@@ -155,6 +157,7 @@ fn register(ctx: &Context, attempt: &AttemptId, work: &Path) -> managed::OwnerGu
         command_id: id,
         spec_digest: "digest".into(),
         opts: Opts {
+            label: None,
             weight: Some(1),
             front: false,
             key: None,

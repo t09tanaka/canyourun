@@ -12,6 +12,7 @@ pub mod results;
 pub mod scheduler;
 pub mod secrets;
 pub mod service;
+pub mod setup;
 pub mod source;
 pub mod state;
 pub mod storage;

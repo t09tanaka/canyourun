@@ -239,6 +239,7 @@ mod tests {
     fn running(id: &str, weight: u32, expected: Option<f64>, elapsed: i64) -> InspectedEntry {
         InspectedEntry {
             entry: Entry {
+                label: None,
                 id: id.into(),
                 pid: 1,
                 state: State::Running,

@@ -631,6 +631,129 @@ pub struct CommandSpec {
     /// `command_timeout_ms`. Queue wait never counts toward it.
     #[serde(default)]
     pub timeout_ms: Option<u64>,
+    /// The id of the [`SetupStep`] this command is. The worker leaves the
+    /// command out when the template it verified holds that step. Not
+    /// written when absent, so a command that is no setup step keeps its
+    /// canonical JSON, and the payload its hash.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub setup_step: Option<String>,
+}
+
+/// One install of a [`SetupSpec`] (spec chapter 8): what runs, where, with
+/// which shell and environment. Two steps with the same text but another
+/// shell, directory or environment are not the same step.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SetupStep {
+    /// Names the step; a [`CommandSpec::setup_step`] refers to it.
+    pub id: String,
+    /// Relative to the workspace root; empty for the root itself.
+    #[serde(default)]
+    pub dir: String,
+    /// The script.
+    pub run: String,
+    /// `None` is bash.
+    #[serde(default)]
+    pub shell: Option<String>,
+    /// The workflow, job and step `env:` put together.
+    #[serde(default)]
+    pub env: BTreeMap<String, String>,
+    /// Names of `env:` entries whose value is only known when the step runs
+    /// (`needs`, matrix, step outputs). Such a step stays where it is: it
+    /// is not prepared in advance, nor any step after it.
+    #[serde(default)]
+    pub unresolved_env: Vec<String>,
+}
+
+/// Whether a prepared template may be used by another run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReuseScope {
+    /// Only by the run that made it (the run id is part of the key).
+    Run,
+    /// By later runs too, while the key holds.
+    Persistent,
+}
+
+/// A secret that decides what the setup makes, by name and a digest of its
+/// version. Its value is never part of anything stored.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SecretVersion {
+    pub name: String,
+    pub digest: String,
+}
+
+/// What an attempt asks of the worker's setup builder: the ordered install
+/// steps of its task (spec chapter 8). The worker derives the template key
+/// from this and its own OS, architecture and profile; no key comes from
+/// the wire.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SetupSpec {
+    pub steps: Vec<SetupStep>,
+    #[serde(default)]
+    pub toolchain: Vec<ToolRequirement>,
+    pub scope: ReuseScope,
+    /// A template older than this is not used.
+    #[serde(default)]
+    pub freshness_secs: Option<u64>,
+    #[serde(default)]
+    pub secrets: Vec<SecretVersion>,
+    /// `--no-cache` or `[ci] no_cache`: no template of another run is used.
+    #[serde(default)]
+    pub no_cache: bool,
+    /// How long the builder may run each step.
+    #[serde(default)]
+    pub step_timeout_ms: Option<u64>,
+}
+
+/// A file or directory the setup made, by path relative to the workspace,
+/// with the digest of its tree.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PreparedArtifact {
+    pub path: String,
+    pub digest: String,
+}
+
+/// An entry the setup changed: a file or link that was there before, by the
+/// digest it had then (`base`) and the one it has now. It is put into a
+/// consumer's workspace only over an entry that still has the `base` digest.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PreparedChange {
+    pub path: String,
+    pub base: String,
+    pub digest: String,
+}
+
+/// An entry the setup removed: a file or link by the digest it had (`base`),
+/// or a directory (`base` absent), which goes only when it is empty.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PreparedRemoval {
+    pub path: String,
+    #[serde(default)]
+    pub base: Option<String>,
+}
+
+/// What a finished template holds. A consumer trusts the template only after
+/// its trees match these digests again.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PreparedTemplateReceipt {
+    pub schema_version: SchemaVersion,
+    pub template_key: String,
+    pub source_digest: String,
+    pub builder_id: BuilderId,
+    /// The ids of the steps that were prepared and passed, in order.
+    pub steps: Vec<String>,
+    /// What the steps added: the topmost new entries, anywhere in the
+    /// workspace.
+    pub artifacts: Vec<PreparedArtifact>,
+    /// What the steps changed of what was there.
+    #[serde(default)]
+    pub modified: Vec<PreparedChange>,
+    /// What the steps removed of what was there.
+    #[serde(default)]
+    pub removed: Vec<PreparedRemoval>,
+    pub created_at_ms: u64,
+    /// `sha256:` of this receipt's canonical JSON with this field empty.
+    pub digest: String,
 }
 
 /// What to make of a declared artifact the commands did not leave behind.
@@ -689,6 +812,10 @@ pub struct AttemptPayload {
     /// canonical JSON, and the hash, it had before this field existed.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub artifacts: Vec<ArtifactDecl>,
+    /// The setup of the task, to be prepared once by the worker's builder
+    /// and shared. Not written when absent, like `artifacts`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub setup: Option<SetupSpec>,
 }
 
 /// Submit an attempt. If the attempt was retired, or cancelled before this
@@ -1596,6 +1723,7 @@ mod tests {
 
     fn payload() -> AttemptPayload {
         AttemptPayload {
+            setup: None,
             run_id: RunId::generate(),
             task_id: TaskId::generate(),
             generation: Generation(1),
@@ -1604,6 +1732,7 @@ mod tests {
             manifest_digest: dg("manifest"),
             permit_id: Some(PermitId::generate()),
             commands: vec![CommandSpec {
+                setup_step: None,
                 node_id: node("test"),
                 argv: vec!["cargo".into(), "test".into()],
                 cwd: ".".into(),
@@ -2811,6 +2940,66 @@ mod tests {
         assert!(req.hash_matches().unwrap());
         req.payload.artifacts[0].if_missing = MissingPolicy::Optional;
         assert!(!req.hash_matches().unwrap());
+    }
+
+    fn setup_spec() -> SetupSpec {
+        SetupSpec {
+            steps: vec![SetupStep {
+                id: "s1".into(),
+                dir: "web".into(),
+                run: "npm ci".into(),
+                shell: Some("bash".into()),
+                env: BTreeMap::from([("CI".to_string(), "1".to_string())]),
+                unresolved_env: vec!["TOKEN".into()],
+            }],
+            toolchain: vec![ToolRequirement {
+                name: "node".into(),
+                version: "20".into(),
+            }],
+            scope: ReuseScope::Persistent,
+            freshness_secs: Some(60),
+            secrets: vec![SecretVersion {
+                name: "NPM_TOKEN".into(),
+                digest: "v3".into(),
+            }],
+            no_cache: true,
+            step_timeout_ms: Some(1000),
+        }
+    }
+
+    #[test]
+    fn the_setup_of_a_payload_is_written_hashed_and_read_back() {
+        let base = payload();
+        let h = payload_hash(&base).unwrap();
+        let mut with = base.clone();
+        with.setup = Some(setup_spec());
+        with.commands[0].setup_step = Some("s1".into());
+        assert_ne!(h, payload_hash(&with).unwrap());
+        let v = serde_json::to_value(&with).unwrap();
+        assert_eq!(v["setup"]["scope"], "persistent");
+        assert_eq!(v["setup"]["steps"][0]["id"], "s1");
+        assert_eq!(v["commands"][0]["setup_step"], "s1");
+        assert_eq!(
+            serde_json::from_value::<AttemptPayload>(v.clone()).unwrap(),
+            with
+        );
+        // Another step id, or another spec, is another payload.
+        let mut other = with.clone();
+        other.commands[0].setup_step = Some("s2".into());
+        assert_ne!(payload_hash(&with).unwrap(), payload_hash(&other).unwrap());
+        let mut other = with.clone();
+        other.setup.as_mut().unwrap().steps[0].shell = None;
+        assert_ne!(payload_hash(&with).unwrap(), payload_hash(&other).unwrap());
+        // Most of the spec may be left out of the wire.
+        let min: SetupSpec = serde_json::from_value(json!({
+            "steps": [{"id": "a", "run": "make"}],
+            "scope": "run"
+        }))
+        .unwrap();
+        assert_eq!(min.scope, ReuseScope::Run);
+        assert!(!min.no_cache && min.secrets.is_empty() && min.toolchain.is_empty());
+        assert_eq!(min.steps[0].dir, "");
+        assert!(min.steps[0].shell.is_none() && min.steps[0].unresolved_env.is_empty());
     }
 
     #[test]
