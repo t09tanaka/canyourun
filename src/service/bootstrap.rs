@@ -126,7 +126,7 @@ fn startup_lock(state: &Path) -> anyhow::Result<File> {
     Ok(resident::secure_file(&path, true)?)
 }
 
-fn read_cluster(spec: &Spec) -> anyhow::Result<ClusterId> {
+fn read_store(spec: &Spec) -> anyhow::Result<CoordinatorStore> {
     // Read-only inspection never takes ownership, creates state, or increments epoch.
     resident::reject_symlinks(&spec.state_dir)?;
     let db = spec.state_dir.join("coordinator.db");
@@ -142,7 +142,15 @@ fn read_cluster(spec: &Spec) -> anyhow::Result<ClusterId> {
     if let Some(expected) = &spec.expected_cluster {
         anyhow::ensure!(expected == &cluster, "foreign coordinator cluster");
     }
-    Ok(cluster)
+    Ok(store)
+}
+fn read_cluster(spec: &Spec) -> anyhow::Result<ClusterId> {
+    Ok(read_store(spec)?.cluster_id().clone())
+}
+/// Validate credentials, identities, private paths and schema without writes.
+pub(crate) fn read_only_store(spec: &Spec) -> anyhow::Result<CoordinatorStore> {
+    validate(spec)?;
+    read_store(spec)
 }
 fn load_client(spec: &Spec) -> anyhow::Result<Client> {
     Client::load(&spec.state_dir, read_cluster(spec)?)
@@ -229,6 +237,22 @@ pub async fn ensure(spec: Spec) -> anyhow::Result<Client> {
             }
         }
     }
+}
+
+/// Read the retained private input without creating any runtime state.
+pub fn read_input(path: &Path) -> anyhow::Result<Spec> {
+    resident::check_private_dir(
+        path.parent()
+            .ok_or_else(|| anyhow::anyhow!("input parent missing"))?,
+    )?;
+    let mut bytes = Vec::new();
+    resident::secure_file(path, false)?
+        .take(LIMIT + 1)
+        .read_to_end(&mut bytes)?;
+    anyhow::ensure!(bytes.len() as u64 <= LIMIT, "bootstrap input too large");
+    let spec: Spec = serde_json::from_slice(&bytes)?;
+    validate(&spec)?;
+    Ok(spec)
 }
 
 /// Hidden process entry. Stdin is one bounded, private bootstrap specification.

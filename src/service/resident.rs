@@ -55,6 +55,9 @@ pub enum Operation {
     Task {
         task_id: TaskId,
     },
+    Query {
+        query: super::query::Query,
+    },
     Shutdown,
 }
 #[derive(Debug, Serialize, Deserialize)]
@@ -68,11 +71,26 @@ pub struct Attempt {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum Reply {
-    Ready { epoch: CoordinatorEpoch },
-    Accepted { run_id: RunId },
-    Task { attempts: Vec<Attempt> },
+    Ready {
+        epoch: CoordinatorEpoch,
+    },
+    Accepted {
+        run_id: RunId,
+    },
+    Task {
+        attempts: Vec<Attempt>,
+    },
+    Query {
+        response: super::query::Response,
+    },
+    QueryError {
+        code: crate::error::ErrorCode,
+        message: String,
+    },
     Stopping,
-    Error { message: String },
+    Error {
+        message: String,
+    },
 }
 
 /// No store is exposed: callers only receive socket credentials.
@@ -115,6 +133,23 @@ impl Client {
         })
     }
 
+    pub async fn query(
+        &self,
+        query: super::query::Query,
+    ) -> Result<super::query::Response, super::query::Error> {
+        use super::query::Error;
+        use crate::error::ErrorCode;
+        match self
+            .request(Operation::Query { query })
+            .await
+            .map_err(|e| Error::new(ErrorCode::CommunicationUnknown, e))?
+        {
+            Reply::Query { response } => Ok(response),
+            Reply::QueryError { code, message } => Err(Error::new(code, message)),
+            Reply::Error { message } => Err(Error::new(ErrorCode::CommunicationUnknown, message)),
+            _ => Err(Error::new(ErrorCode::Internal, "unexpected query response")),
+        }
+    }
     pub fn socket_path(&self) -> &Path {
         &self.socket
     }
@@ -468,6 +503,30 @@ async fn handle(
             && request.owner_token == client.owner_token,
         "unauthorized parent request"
     );
+    // Metadata reads use their own read-only SQLite thread, never the owner's
+    // admission lock or update connection. Dropping the response cannot write state.
+    if let Operation::Query { query } = request.operation {
+        let state = coordinator
+            .store()
+            .db
+            .path()
+            .parent()
+            .expect("database parent")
+            .to_owned();
+        let reply = tokio::task::spawn_blocking(move || {
+            match crate::storage::CoordinatorStore::open_read_only(&state)
+                .and_then(|s| s.query(query))
+            {
+                Ok(response) => Reply::Query { response },
+                Err(e) => Reply::QueryError {
+                    code: e.code(),
+                    message: e.to_string(),
+                },
+            }
+        })
+        .await?;
+        return write_message(&mut stream, &reply).await.map_err(Into::into);
+    }
     let mut gate = admission.lock().await;
     let reply = if *gate || coordinator.is_fenced() {
         Reply::Error {
@@ -565,6 +624,7 @@ async fn handle(
                     },
                 }
             }
+            Operation::Query { .. } => unreachable!("query handled before admission"),
             Operation::Shutdown => {
                 *gate = true;
                 let _ = stop.send(true);

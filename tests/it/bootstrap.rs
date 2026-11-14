@@ -293,3 +293,176 @@ async fn failed_child_and_interrupted_startup_do_not_keep_startup_lock() {
     let client = ensure(spec).await.unwrap();
     shutdown(&client).await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn bounded_queries_cli_configured_fixture_does_not_advance_epoch() {
+    use remote_task_runner::ids::{RunId, TaskId};
+    use serde_json::json;
+    let (root, spec) = fixture();
+    let run = RunId::generate();
+    let task = TaskId::generate();
+    {
+        let owner = CoordinatorStore::open(&spec.state_dir, 1).unwrap();
+        owner
+            .create_run(&run, None, None, &json!({"env":"PRIVATE_PAYLOAD"}), 1)
+            .unwrap();
+        owner
+            .create_task(&task, &run, &json!({"argv":["PRIVATE_PAYLOAD"]}), 1)
+            .unwrap();
+        owner.close_run(&run, 2).unwrap();
+    }
+    let dir = root.path().join(".config/remote-task-runner");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    remote_task_runner::service::bootstrap::write_input(&dir.join("coordinator.json"), &spec)
+        .unwrap();
+    // Simulate the pre-index schema with durable rows and no running owner.
+    let db = rusqlite::Connection::open(spec.state_dir.join("coordinator.db")).unwrap();
+    db.execute_batch(
+        "DROP INDEX task_run_key; UPDATE schema_meta SET value='3' WHERE key='schema_version';",
+    )
+    .unwrap();
+    let old_epoch: i64 = db
+        .query_row("SELECT epoch FROM coordinator_state", [], |r| r.get(0))
+        .unwrap();
+    drop(db);
+    for args in [
+        vec!["--json", "ls"],
+        vec!["--json", "show", run.as_str()],
+        vec!["--json", "show", task.as_str()],
+    ] {
+        let output = Command::new(&spec.executable)
+            .args(args)
+            .current_dir(root.path())
+            .env_clear()
+            .envs(&spec.env)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        assert!(output.stderr.is_empty());
+    }
+    assert!(
+        !spec.state_dir.join("parent").exists(),
+        "read-only CLI started owner IPC"
+    );
+    assert!(
+        !spec.state_dir.join("startup.lock").exists(),
+        "read-only CLI entered bootstrap"
+    );
+    let db = rusqlite::Connection::open_with_flags(
+        spec.state_dir.join("coordinator.db"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    assert_eq!(
+        db.query_row("SELECT epoch FROM coordinator_state", [], |r| r
+            .get::<_, i64>(0))
+            .unwrap(),
+        old_epoch
+    );
+    assert_eq!(
+        db.query_row(
+            "SELECT value FROM schema_meta WHERE key='schema_version'",
+            [],
+            |r| r.get::<_, String>(0)
+        )
+        .unwrap(),
+        "3"
+    );
+    assert_eq!(
+        db.query_row(
+            "SELECT count(*) FROM sqlite_master WHERE name='task_run_key'",
+            [],
+            |r| r.get::<_, i64>(0)
+        )
+        .unwrap(),
+        0
+    );
+    drop(db);
+    let client = ensure(spec.clone()).await.unwrap();
+    let epoch = CoordinatorStore::open_read_only(&spec.state_dir)
+        .unwrap()
+        .epoch();
+    for args in [
+        vec!["--json", "ls", "--limit", "1"],
+        vec!["--json", "show", run.as_str()],
+        vec!["--json", "show", task.as_str()],
+    ] {
+        let output = Command::new(&spec.executable)
+            .args(args)
+            .current_dir(root.path())
+            .env_clear()
+            .envs(&spec.env)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        assert!(output.stderr.is_empty());
+        let text = String::from_utf8(output.stdout).unwrap();
+        assert!(!text.contains("PRIVATE_PAYLOAD"));
+        let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(value["ok"], true);
+    }
+    for (id, code) in [
+        ("invalid".to_string(), 2),
+        (RunId::generate().to_string(), 73),
+    ] {
+        let output = Command::new(&spec.executable)
+            .args(["--json", "show", &id])
+            .current_dir(root.path())
+            .env_clear()
+            .envs(&spec.env)
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(code));
+        assert!(output.stderr.is_empty());
+    }
+    assert_eq!(
+        CoordinatorStore::open_read_only(&spec.state_dir)
+            .unwrap()
+            .epoch(),
+        epoch
+    );
+    shutdown(&client).await;
+}
+
+#[tokio::test]
+async fn readonly_queries_refuse_foreign_cluster_and_unsafe_key_without_owner() {
+    let (_root, mut spec) = fixture();
+    let epoch = {
+        let owner = CoordinatorStore::open(&spec.state_dir, 1).unwrap();
+        owner.epoch()
+    };
+    spec.expected_cluster = Some(ClusterId::generate());
+    assert!(
+        remote_task_runner::service::query::Reader::open(spec.clone())
+            .await
+            .is_err()
+    );
+    spec.expected_cluster = None;
+    std::fs::set_permissions(
+        &spec.cluster_key_path,
+        std::fs::Permissions::from_mode(0o644),
+    )
+    .unwrap();
+    assert!(
+        remote_task_runner::service::query::Reader::open(spec.clone())
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        CoordinatorStore::open_read_only(&spec.state_dir)
+            .unwrap()
+            .epoch(),
+        epoch
+    );
+    assert!(!spec.state_dir.join("startup.lock").exists());
+    assert!(!spec.state_dir.join("parent").exists());
+}
