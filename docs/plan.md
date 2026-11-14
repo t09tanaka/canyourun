@@ -4,6 +4,8 @@
 
 ## 前提
 
+- lease 更新の実プロセス試験は、準備開始・更新の durable commit・seed の更新キーと単一 monotonic 測定期限・コマンド開始・supervisor の更新キー観測を順に確認する。短い実時間枠内での起動速度や旧 watcher を期待せず、期限境界は純粋な LeaseClock 試験で検証する。観測 journal は best-effort 診断であり、lease の判定やコマンドの継続条件にしない。
+
 - 全 PR を `main` 宛てにし、単体で CI が通る形で都度マージする。依存列の「#N」は「#N が main にマージされた後、main から起点を切る」。
 - 共通の検証コマンド（RTR = remote-task-runner）: `cargo fmt --all --check`、`cargo clippy --all-targets -- -D warnings`、`cargo test`、GitHub Actions の緑。純粋モジュールは local-ci と同じく行カバレッジ 100% のゲートと cargo-schemata の変異テストに登録する。
 - 略称: RTR = remote-task-runner、LC = local-ci、TTC = task-traffic-controller。

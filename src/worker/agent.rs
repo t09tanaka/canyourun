@@ -876,10 +876,11 @@ impl Agent {
         // renewal that arrives after this makes the seed void (the supervisor
         // then counts that grant in full), never too short.
         let measuring = lock(&self.lease_step);
+        let measured_at = platform::monotonic_ms();
         let measured = self
             .store
             .lease(a)
-            .and_then(|lease| Ok((lease.map(|(k, _)| k), self.elapsed(rec)?)));
+            .and_then(|lease| Ok((lease.map(|(k, _)| k), self.elapsed(rec, measured_at)?)));
         let (key, (since_accept, since_grant)) = match measured {
             Ok(m) => m,
             Err(e) => {
@@ -922,7 +923,7 @@ impl Agent {
             deadline_left = Some(left);
         }
         let seed = LeaseSeed {
-            ends_mono_ms: platform::monotonic_ms().saturating_add(lease_left),
+            ends_mono_ms: measured_at.saturating_add(lease_left),
             key,
         };
         // Written at every start: an earlier start's values are stale.
@@ -974,8 +975,7 @@ impl Agent {
     /// recorded. No other host's time is involved. A renewal time that
     /// cannot be read is an error, not "never renewed": that would end a
     /// renewed lease early.
-    fn elapsed(&self, rec: &AcceptedAttempt) -> Result<(u64, u64), StorageError> {
-        let mono = platform::monotonic_ms();
+    fn elapsed(&self, rec: &AcceptedAttempt, mono: u64) -> Result<(u64, u64), StorageError> {
         if let Some(c) = lock(&self.clocks).get(rec.attempt_id.as_str()) {
             return Ok((
                 mono.saturating_sub(c.accepted_ms),

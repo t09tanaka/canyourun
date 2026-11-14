@@ -2212,44 +2212,47 @@ async fn a_renewal_before_the_start_seeds_the_supervisor_with_what_is_left_of_it
     let f = fx();
     let agent = f.start("boot-a");
     let c = f.connect(&agent).await;
-    // A 4 s lease, renewed 1 s after the acceptance, and a supervisor that
-    // starts at 3 s. From the acceptance it would end at 4 s, counted in full
-    // from the start at 7 s; from the renewal it ends at 5 s.
     f.host.block_prepare.store(true, Ordering::SeqCst);
     let (script, marker, _) = stay(&f);
-    let mut p = payload(&script);
-    p.lease_ms = 4_000;
+    let p = payload(&script);
     let a = AttemptId::generate();
     submit(&c, &a, &p).await;
-    std::thread::sleep(Duration::from_millis(1_000));
-    let Response::RenewLease(r) = call(
-        &c,
-        Request::RenewLease(RenewLeaseRequest {
-            schema_version: SchemaVersion::CURRENT,
-            request_id: RequestId::generate(),
-            coordinator_epoch: CoordinatorEpoch(1),
-            attempt_id: a.clone(),
-            generation: Generation(1),
-            lease_seq: 1,
-            lease_ms: 4_000,
-        }),
-    )
-    .await
-    .unwrap() else {
+    let accepted = remote_task_runner::platform::monotonic_ms();
+    wait_for("preparation to begin", || {
+        f.host.count(&format!("prepare {a}")) == 1
+    });
+    // Distinct clock ticks make the wrong acceptance/start origin fail
+    // without requiring any operation to finish within a small budget.
+    wait_for("a tick after acceptance", || {
+        remote_task_runner::platform::monotonic_ms() > accepted
+    });
+    let before = remote_task_runner::platform::monotonic_ms();
+    let Response::RenewLease(r) = call(&c, renew_req(&a, 1, p.lease_ms)).await.unwrap() else {
         panic!()
     };
+    let after = remote_task_runner::platform::monotonic_ms();
     assert!(r.extended);
-    let renewed_at = f.store().lease_renewed_at(&a).unwrap().unwrap();
-    std::thread::sleep(Duration::from_millis(2_000));
+    assert_eq!(f.store().lease(&a).unwrap().unwrap().0.lease_seq, 1);
+    assert!(f.store().lease_renewed_at(&a).unwrap().is_some());
+    assert_eq!(lines(&marker), 0, "preparation still owns the start gate");
+    wait_for("a tick after renewal", || {
+        remote_task_runner::platform::monotonic_ms() > after
+    });
     f.host.block_prepare.store(false, Ordering::SeqCst);
-    assert_eq!(f.wait_terminal(&a), Outcome::Interrupted);
-    assert_eq!(lines(&marker), 1, "the command did start");
-    let expired = f.store().events_of(&a, "lease_expired").unwrap();
-    assert_eq!(expired.len(), 1);
-    // One period after the renewal: not at the first grant's end (3 s
-    // after it) and not a full period after the supervisor's start (6 s).
-    let after = expired[0].at_ms - renewed_at;
-    assert!((3_500..5_500).contains(&after), "{after} ms");
+    wait_for("the command to start", || lines(&marker) == 1);
+    let seed = seed_of(&f, &a);
+    assert_eq!(seed["key"]["lease_seq"], 1);
+    // The seed ends at the renewal's grant, regardless of how long the
+    // real supervisor needed to start. It is neither the acceptance's
+    // deadline nor a full lease counted from the supervisor's start.
+    let end = seed["ends_mono_ms"].as_u64().unwrap();
+    assert!(
+        (before + p.lease_ms..=after + p.lease_ms).contains(&end),
+        "seed {end}, renewal bracket {before}..={after}"
+    );
+    assert_eq!(events(&f, &a, "lease_expired"), 0);
+    call(&c, cancel_req(&a)).await.unwrap();
+    assert_eq!(f.wait_terminal(&a), Outcome::Cancelled);
 }
 
 fn renew_req(a: &AttemptId, seq: u64, lease_ms: u64) -> Request {
@@ -2372,51 +2375,38 @@ async fn a_lease_that_cannot_be_read_starts_nothing_until_it_can_be() {
     assert_eq!(f.wait_terminal(&a), Outcome::Cancelled);
 }
 
-// Its own test, not the second half of the one above: both wait out real
-// leases, and apart they overlap.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_renewal_after_the_start_moves_the_lease_and_the_first_grants_watch_ends_quietly() {
+async fn a_renewal_after_the_start_is_observed_by_the_running_supervisor() {
     let f = fx();
     let agent = f.start("boot-a");
     let c = f.connect(&agent).await;
-    let renew = |a: &AttemptId| {
-        Request::RenewLease(RenewLeaseRequest {
-            schema_version: SchemaVersion::CURRENT,
-            request_id: RequestId::generate(),
-            coordinator_epoch: CoordinatorEpoch(1),
-            attempt_id: a.clone(),
-            generation: Generation(1),
-            lease_seq: 1,
-            lease_ms: 4_000,
-        })
-    };
-    let (script, _, _) = stay(&f);
-    // Renewed after the start: the supervisor counts from the renewal and
-    // the agent's watch of the first grant ends without a word.
-    f.host.block_prepare.store(true, Ordering::SeqCst);
-    let mut p = payload(&script);
-    p.lease_ms = 4_000;
-    let b = AttemptId::generate();
-    let accepted = Instant::now();
-    submit(&c, &b, &p).await;
-    std::thread::sleep(Duration::from_millis(1_000));
-    f.host.block_prepare.store(false, Ordering::SeqCst);
-    wait_for("the running state", || {
-        f.rec(&b).state == AttemptState::Active
+    let (script, marker, _) = stay(&f);
+    let p = payload(&script);
+    let a = AttemptId::generate();
+    submit(&c, &a, &p).await;
+    // The command can create its marker before the supervisor commits Running.
+    // Wait for both observations before testing a renewal after that receipt.
+    wait_for("the command and its running receipt", || {
+        lines(&marker) == 1 && f.rec(&a).receipts.at_ms(Receipt::Running).is_some()
     });
-    let Response::RenewLease(r) = call(&c, renew(&b)).await.unwrap() else {
+    assert_eq!(seed_of(&f, &a)["key"], serde_json::Value::Null);
+    let Response::RenewLease(r) = call(&c, renew_req(&a, 1, p.lease_ms)).await.unwrap() else {
         panic!()
     };
     assert!(r.extended);
-    assert!(
-        accepted.elapsed() < Duration::from_millis(3_500),
-        "too slow to tell"
-    );
-    std::thread::sleep(Duration::from_millis(4_600).saturating_sub(accepted.elapsed()));
-    assert_eq!(f.rec(&b).state, AttemptState::Active);
-    assert_eq!(events(&f, &b, "lease_expired"), 0);
-    call(&c, retire_req(&b)).await.unwrap();
-    f.wait_terminal(&b);
+    assert_eq!(f.store().lease(&a).unwrap().unwrap().0.lease_seq, 1);
+    assert!(f.store().lease_renewed_at(&a).unwrap().is_some());
+    // A durable ACK alone does not prove that the separate supervisor
+    // process has read the new key and moved its clock. Its diagnostic does.
+    wait_for("the supervisor to observe the renewal", || {
+        events(&f, &a, "lease_renewal_observed") == 1
+    });
+    let observed = f.store().events_of(&a, "lease_renewal_observed").unwrap();
+    assert_eq!(observed[0].payload["key"]["lease_seq"], 1);
+    assert_eq!(f.rec(&a).state, AttemptState::Active);
+    assert_eq!(events(&f, &a, "lease_expired"), 0);
+    call(&c, cancel_req(&a)).await.unwrap();
+    assert_eq!(f.wait_terminal(&a), Outcome::Cancelled);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
