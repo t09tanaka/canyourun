@@ -33,7 +33,7 @@
 //! recorded identity again immediately before sending it.
 
 use super::error::Result;
-use super::identity::{only_identity_unknown, verdict, Leader, Verdict};
+use super::identity::{only_identity_unknown, traffic_probe_unknown, verdict, Leader, Verdict};
 use super::members::ManagedMembers;
 use super::run::{
     complete_terminal, hidden_suspects_json, open_spool, remove_fifos, settle,
@@ -67,6 +67,20 @@ pub(crate) fn recover_on(
     spec: &SuperviseSpec,
     store: &WorkerStore,
     fake: Option<&dyn Os>,
+) -> Result<Report> {
+    recover_using(spec, store, fake, |ctx, id| {
+        managed::resolve_checked_typed(ctx, id).map_err(Into::into)
+    })
+}
+
+fn recover_using(
+    spec: &SuperviseSpec,
+    store: &WorkerStore,
+    fake: Option<&dyn Os>,
+    mut resolve: impl FnMut(
+        &task_traffic_controller::Context,
+        &str,
+    ) -> anyhow::Result<managed::TypedResolution>,
 ) -> Result<Report> {
     let attempt = &spec.attempt_id;
     let Some(rec) = store.get(attempt)? else {
@@ -166,15 +180,22 @@ pub(crate) fn recover_on(
             platform::wall_ms(),
         )?;
         if let Some(id) = &id {
-            let problem = match managed::resolve_checked(&traffic.ctx, id) {
-                // An entry kept for a node whose processes could not be told
-                // is that same reason again, not another one.
-                Ok(r) if r.found && !r.released && !identity_unknown => Some(r.checked.to_string()),
+            let problem = match resolve(&traffic.ctx, id) {
+                Ok(r) if r.resolution.found && !r.resolution.released => {
+                    let by_identity = traffic_probe_unknown(r.verdict);
+                    // The same identity uncertainty was already recorded above.
+                    // Other holds still contribute a separate, non-identity cause.
+                    if by_identity && identity_unknown {
+                        None
+                    } else {
+                        Some((r.resolution.checked, by_identity))
+                    }
+                }
                 Ok(_) => None,
-                Err(e) => Some(e.to_string()),
+                Err(e) => Some((e.to_string(), false)),
             };
-            if let Some(why) = problem {
-                unresolved.push((format!("node {node}: {why}"), false));
+            if let Some((why, by_identity)) = problem {
+                unresolved.push((format!("node {node}: {why}"), by_identity));
                 unresolved_nodes.push(node.to_string());
                 let room = MAX_HIDDEN_SUSPECTS.saturating_sub(hidden.len());
                 hidden.extend(
@@ -421,10 +442,16 @@ mod tests {
     fn a_later_recovery_that_can_read_the_identity_settles_the_attempt() {
         let f = fx();
         let os = FakeOs::new([StartIdentity::Unknown]);
-        assert!(recover_on(&f.spec, &f.store, Some(&os))
-            .unwrap()
-            .unresolved
-            .is_some());
+        let first = recover_on(&f.spec, &f.store, Some(&os)).unwrap();
+        assert_unresolved_for_identity(&f, &first);
+        assert_eq!(first.termination, None);
+        assert_ne!(
+            f.store.get(&f.spec.attempt_id).unwrap().unwrap().state,
+            AttemptState::Terminal
+        );
+        assert!(f.store.get_result(&f.spec.attempt_id).unwrap().is_none());
+        let launches = f.store.launches(&f.spec.attempt_id).unwrap();
+        assert_eq!(launches.len(), 1);
         // Looked at again: now the system says there is no such process and
         // its group is empty.
         let os = FakeOs::new([StartIdentity::NoProcess]);
@@ -434,6 +461,105 @@ mod tests {
         assert_eq!(report.termination.unwrap().outcome(), Outcome::Interrupted);
         assert!(os.sent().is_empty(), "only probes: {:?}", os.signals);
         assert_eq!(node_event(&f)["verdict"], "Gone");
+        assert_eq!(
+            f.store.get(&f.spec.attempt_id).unwrap().unwrap().state,
+            AttemptState::Terminal
+        );
+        assert!(f.store.get_result(&f.spec.attempt_id).unwrap().is_some());
+        assert_eq!(f.store.launches(&f.spec.attempt_id).unwrap(), launches);
+        // Even another observation that cannot read an identity cannot undo
+        // the fixed result or create a replacement launch.
+        let os = FakeOs::new([StartIdentity::Unknown]);
+        let again = recover_on(&f.spec, &f.store, Some(&os)).unwrap();
+        assert_eq!(again.termination, report.termination);
+        assert!(!again.finalized_here);
+        assert_eq!(again.unresolved, None);
+        assert!(os.signals.borrow().is_empty());
+        assert_eq!(f.store.launches(&f.spec.attempt_id).unwrap(), launches);
+    }
+
+    fn typed_resolution(
+        verdict: Option<task_traffic_controller::reap::Verdict>,
+    ) -> managed::TypedResolution {
+        managed::TypedResolution {
+            resolution: managed::Resolution {
+                command_id: "test".into(),
+                phase: None,
+                lease_held: false,
+                found: verdict.is_some(),
+                released: verdict.is_some_and(|v| v.is_release()),
+                forced: false,
+                verdict: "opaque diagnostic".into(),
+                checked: "opaque diagnostic".into(),
+            },
+            verdict,
+        }
+    }
+
+    #[test]
+    fn a_traffic_probe_unknown_is_reconciled_without_failure_or_a_new_launch() {
+        use task_traffic_controller::reap::{Keep, Release, Verdict};
+        let f = fx();
+        let os = FakeOs::new([StartIdentity::NoProcess]);
+        os.members.set(false);
+        let first = recover_using(&f.spec, &f.store, Some(&os), |_, _| {
+            Ok(typed_resolution(Some(Verdict::Keep(Keep::ProbeUnknown))))
+        })
+        .unwrap();
+        assert_eq!(
+            first.unresolved.as_deref(),
+            Some("node n: opaque diagnostic")
+        );
+        assert!(
+            first.identity_unknown,
+            "the typed decision, not diagnostic text, governs this"
+        );
+        assert_eq!(first.termination, None);
+        let events = f
+            .store
+            .events_of(&f.spec.attempt_id, "supervisor_unresolved")
+            .unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].payload["identity_unknown"], true);
+        assert!(f.store.get_result(&f.spec.attempt_id).unwrap().is_none());
+        assert_ne!(
+            f.store.get(&f.spec.attempt_id).unwrap().unwrap().state,
+            AttemptState::Terminal
+        );
+        let launches = f.store.launches(&f.spec.attempt_id).unwrap();
+        assert_eq!(launches.len(), 1);
+        let second = recover_using(&f.spec, &f.store, Some(&os), |_, _| {
+            Ok(typed_resolution(Some(Verdict::Release(Release::Stopped))))
+        })
+        .unwrap();
+        assert_eq!(second.unresolved, None);
+        assert_eq!(second.termination.unwrap().outcome(), Outcome::Interrupted);
+        assert!(f.store.get_result(&f.spec.attempt_id).unwrap().is_some());
+        assert_eq!(f.store.launches(&f.spec.attempt_id).unwrap(), launches);
+        assert!(os.sent().is_empty());
+    }
+
+    #[test]
+    fn traffic_errors_and_other_holds_are_not_hidden_by_an_unknown_identity() {
+        use task_traffic_controller::reap::{Keep, Verdict};
+        for fail in [false, true] {
+            let f = fx();
+            let os = FakeOs::new([StartIdentity::Unknown]);
+            let report = recover_using(&f.spec, &f.store, Some(&os), |_, _| {
+                if fail {
+                    anyhow::bail!("synthetic resolution failure");
+                }
+                Ok(typed_resolution(Some(Verdict::Keep(Keep::LeaseHeld))))
+            })
+            .unwrap();
+            assert!(report.unresolved.is_some());
+            assert!(
+                !report.identity_unknown,
+                "a second non-identity cause remains"
+            );
+            assert_eq!(report.termination, None);
+            assert!(os.signals.borrow().is_empty());
+        }
     }
 
     #[test]

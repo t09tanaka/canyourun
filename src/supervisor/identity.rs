@@ -225,6 +225,17 @@ pub fn member_is_ours<T: PartialEq>(
     pgid > 1 && recorded.is_some() && group_now == Some(pgid) && start_after == recorded
 }
 
+/// Only an inconclusive process probe is an identity-only traffic hold.
+/// Missing decisions and every other hold are not classified by display text.
+pub fn traffic_probe_unknown(verdict: Option<task_traffic_controller::reap::Verdict>) -> bool {
+    matches!(
+        verdict,
+        Some(task_traffic_controller::reap::Verdict::Keep(
+            task_traffic_controller::reap::Keep::ProbeUnknown
+        ))
+    )
+}
+
 /// Whether an attempt is unresolved for no other reason than identities
 /// that could not be told: `reasons` says of each reason whether it is one.
 pub fn only_identity_unknown(reasons: impl IntoIterator<Item = bool>) -> bool {
@@ -563,5 +574,36 @@ mod tests {
         assert!(!only_identity_unknown([false, true]));
         assert!(!only_identity_unknown([false]));
         assert!(!only_identity_unknown([]));
+    }
+    #[test]
+    fn traffic_probe_classification_uses_only_the_typed_decision() {
+        use task_traffic_controller::reap::{Keep, Release, Verdict};
+        assert!(traffic_probe_unknown(Some(Verdict::Keep(
+            Keep::ProbeUnknown
+        ))));
+        for keep in [
+            Keep::LeaseHeld,
+            Keep::SidecarCorrupt,
+            Keep::LaunchUnknown,
+            Keep::DescendantsAlive,
+        ] {
+            assert!(!traffic_probe_unknown(Some(Verdict::Keep(keep))));
+        }
+        for release in [
+            Release::Plain,
+            Release::Terminal,
+            Release::BootChanged,
+            Release::NeverLaunched,
+            Release::Stopped,
+            Release::LaunchSettled,
+            Release::NoMarkedProcess,
+        ] {
+            assert!(!traffic_probe_unknown(Some(Verdict::Release(release))));
+        }
+        assert!(!traffic_probe_unknown(None));
+        assert!(!only_identity_unknown([
+            traffic_probe_unknown(Some(Verdict::Keep(Keep::ProbeUnknown))),
+            false
+        ]));
     }
 }

@@ -10,7 +10,7 @@ Builds on [local-ci](https://github.com/t09tanaka/local-ci) for CI planning and 
 
 The CLI surface is defined, but public orchestration commands remain under development. Unimplemented commands return `NOT_IMPLEMENTED` (exit code 70; with `--json`, an envelope with `schema_version` on stdout).
 
-Use the current stable Rust toolchain for formatting and linting. The minimum supported compiler is Rust 1.89. Workspace integration tests require fast-worktree 0.4.0 or newer and portool; resource admission uses task-traffic-controller 0.8.1 or newer. Initialize and check the worktree's portool allocation before starting services or integration tests.
+Use the current stable Rust toolchain for formatting and linting. The minimum supported compiler is Rust 1.89. Workspace integration tests require fast-worktree 0.4.0 or newer and portool; resource admission uses task-traffic-controller 0.8.2 or newer. Initialize and check the worktree's portool allocation before starting services or integration tests.
 
 Run the configured CI against committed HEAD:
 
