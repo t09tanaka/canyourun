@@ -140,3 +140,19 @@ S16・S18〜S25 は元の分割表の必須範囲を維持する。新しい不�
 - Linux（x86_64・arm64）を正式対応する（systemd user service）。Google Colab は常駐なしの一時 worker とする。OS 依存部分（suspend を含む単調時計、boot ID、process identity、sleep 抑止）は platform module に macOS と Linux の実装を置き、S9a・S10 から両方で動かす。
 - `.worktreeinclude` に一致する ignored ファイルは、自動で secret_files と同じ経路で送る。`secret_files` には追加分だけを書く。
 - 追加実機が未準備のため、当面は Docker の複数 worker と Linux・障害注入で受入を進める。Mac 実機固有の未検証項目は対応表に残す。
+
+### PR #42 の baseline fixture 補正
+
+lease/lock 修正を接続した全体検証では通常テスト・coverage と mutation 3 shard が成功したが、
+残る shard の unmutated baseline で setup 4件・hook 1件・captured submit 1件が失敗した。
+setup の目的は共有・再構築・停止であり、lease expiry の試験ではないため、
+全 fixture に与えていた人工的な3秒 leaseを外し production default を使う。
+1秒の step timeout、本番 lease・更新間隔・CPU guard は変更しない。
+hook の descendant 試験は実 shell と child の起動予算を10秒とし、実際の timeout・stderr・child停止の検査と30秒上限は維持する。
+captured submit は fixture が所有する daemon の Tokio thread 数だけを制限し、
+失敗時の bounded TTC/worker metadata を残す。実行中との推測に Ready を使わない。
+
+fixture 補正 `72b3f09` で setup 全30件、hook 1件、captured submit 1件、
+strict all-target/all-feature clippy と fmt が成功した。
+以前の interrupted が lease expiry だったことは追跡されておらず、起動・スケジュール感度という推定と区別する。
+補正後 HEAD の全体 CI とリモート確認が終わるまで PR #42 を統合しない。
