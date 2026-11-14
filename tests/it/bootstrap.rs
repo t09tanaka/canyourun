@@ -285,10 +285,25 @@ async fn retained_input_is_private_idempotent_and_restarts_through_shared_argv()
 
 #[tokio::test]
 async fn failed_child_and_interrupted_startup_do_not_keep_startup_lock() {
-    let (_root, spec) = fixture();
+    let (root, spec) = fixture();
+    // System utilities may be symlinks, rejected before startup by the private
+    // executable checks. Exercise an actual failed child on every platform.
+    let executable = root.path().join("failed-child");
+    let started = root.path().join("failed-child-started");
+    std::fs::write(
+        &executable,
+        "#!/bin/sh\n: > \"$BOOTSTRAP_FAILED_MARKER\"\nexit 1\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
     let mut failed = spec.clone();
-    failed.executable = "/usr/bin/false".into();
-    assert!(ensure(failed).await.is_err());
+    failed.executable = executable;
+    failed.env.insert(
+        "BOOTSTRAP_FAILED_MARKER".into(),
+        started.to_str().unwrap().into(),
+    );
+    let error = ensure(failed).await.err().expect("child must fail startup");
+    assert!(started.exists(), "failed child did not start: {error:#}");
     let lock = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
