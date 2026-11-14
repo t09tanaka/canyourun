@@ -466,3 +466,389 @@ async fn readonly_queries_refuse_foreign_cluster_and_unsafe_key_without_owner() 
     assert!(!spec.state_dir.join("startup.lock").exists());
     assert!(!spec.state_dir.join("parent").exists());
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn configured_cli_submit_captures_worktree_and_secrets_then_outlives_caller() {
+    use remote_task_runner::ids::TaskId;
+    use remote_task_runner::service::bootstrap::write_input;
+    let (root, mut spec) = fixture();
+    let repo = root.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    let git = |args: &[&str]| {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(&repo)
+            .env_clear()
+            .envs(&spec.env)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+    git(&["init", "-q"]);
+    git(&["config", "user.email", "fixture@example.invalid"]);
+    git(&["config", "user.name", "Fixture"]);
+    std::fs::write(repo.join("input.txt"), "committed").unwrap();
+    std::fs::write(repo.join(".gitignore"), "private.env\n").unwrap();
+    std::fs::write(
+        repo.join(".remote-task-runner.toml"),
+        "schema_version = 1\n[source]\nsecret_files = [{ glob = 'private.env', required = true }]\n",
+    )
+    .unwrap();
+    git(&["add", "."]);
+    git(&["commit", "-qm", "fixture"]);
+    std::fs::write(repo.join("input.txt"), "dirty-snapshot").unwrap();
+    let secret = "fixture-secret-value-abcdefghijkl";
+    std::fs::write(repo.join("private.env"), format!("TOKEN={secret}\n")).unwrap();
+    spec.env
+        .insert("PATH".into(), std::env::var("PATH").unwrap());
+    let configdir = root.path().join(".config/remote-task-runner");
+    std::fs::create_dir_all(&configdir).unwrap();
+    std::fs::set_permissions(&configdir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    write_input(&configdir.join("coordinator.json"), &spec).unwrap();
+    let output=tokio::process::Command::new(&spec.executable).args(["--json","submit","--","/bin/sh","-c","set -e; sleep 1; test \"$(cat input.txt)\" = dirty-snapshot; test \"$(wc -c <private.env)\" -eq 40; cat private.env"])
+        .current_dir(&repo).env_clear().envs(&spec.env).output().await.unwrap();
+    assert!(
+        output.status.success(),
+        "{} {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["result"]["state"], "coordinator_accepted");
+    assert!(!String::from_utf8_lossy(&output.stdout).contains(secret));
+    let task = TaskId::parse(value["result"]["task_id"].as_str().unwrap()).unwrap();
+    let second = tokio::process::Command::new(&spec.executable)
+        .args(["--json", "submit", "--", "/usr/bin/true"])
+        .current_dir(&repo)
+        .env_clear()
+        .envs(&spec.env)
+        .output()
+        .await
+        .unwrap();
+    assert!(
+        second.status.success(),
+        "{}",
+        String::from_utf8_lossy(&second.stdout)
+    );
+    let second: serde_json::Value = serde_json::from_slice(&second.stdout).unwrap();
+    assert_eq!(
+        second["result"]["source_id"], value["result"]["source_id"],
+        "same immutable input must be reusable"
+    );
+    let second_task = TaskId::parse(second["result"]["task_id"].as_str().unwrap()).unwrap();
+    std::fs::write(repo.join("input.txt"), "changed-after-caller-exit").unwrap();
+    std::fs::write(repo.join("private.env"), "changed-after-capture").unwrap();
+    let client = load(&spec);
+    let attempts = tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            if let Reply::Task { attempts } = client
+                .request(Operation::Task {
+                    task_id: task.clone(),
+                })
+                .await
+                .unwrap()
+            {
+                if attempts
+                    .iter()
+                    .any(|a| a.state == remote_task_runner::state::AttemptState::Terminal)
+                {
+                    break attempts;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await;
+    let attempts = match attempts {
+        Ok(attempts) => attempts,
+        Err(error) => {
+            let snapshot = client
+                .request(Operation::Task {
+                    task_id: task.clone(),
+                })
+                .await;
+            eprintln!("timed out task snapshot: {snapshot:?}");
+            if let Ok(Reply::Task { attempts }) = &snapshot {
+                let worker = remote_task_runner::storage::WorkerStore::open_read_only(
+                    &spec.worker_state_dir,
+                )
+                .unwrap();
+                for a in attempts {
+                    if let Some(rec) = worker.get(&a.attempt_id).unwrap() {
+                        eprintln!("worker state: {:?}", rec.state);
+                    }
+                    for event in worker.events_of_attempt(&a.attempt_id, 30).unwrap() {
+                        eprintln!("worker event: {}", event.kind);
+                    }
+                }
+            }
+            shutdown(&client).await;
+            panic!("terminal timeout: {error}");
+        }
+    };
+    assert_eq!(attempts.len(), 1);
+    assert_eq!(
+        attempts[0].termination.as_ref().unwrap().outcome(),
+        remote_task_runner::state::Outcome::Succeeded,
+        "{attempts:?}"
+    );
+    let attempt_dir = spec
+        .worker_state_dir
+        .join("attempts")
+        .join(attempts[0].attempt_id.as_str());
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if !attempt_dir.join("workspace.json").exists()
+                && !attempt_dir.join("supervise.json").exists()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let results =
+        remote_task_runner::results::ResultStore::open(&spec.state_dir.join("results")).unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            if results
+                .read_result(&attempts[0].attempt_id)
+                .unwrap()
+                .is_some()
+                && results
+                    .log_len(
+                        &attempts[0].attempt_id,
+                        remote_task_runner::wire::LogStream::Stdout,
+                    )
+                    .unwrap()
+                    > 0
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let log = results
+        .read_log(
+            &attempts[0].attempt_id,
+            remote_task_runner::wire::LogStream::Stdout,
+        )
+        .unwrap();
+    assert!(!String::from_utf8_lossy(&log).contains(secret));
+    assert!(
+        !log.is_empty(),
+        "collected masked stdout must survive workspace cleanup"
+    );
+    let sources = remote_task_runner::source::SourceStore::open(&spec.state_dir).unwrap();
+    let id =
+        remote_task_runner::ids::RunId::parse(value["result"]["run_id"].as_str().unwrap()).unwrap();
+    let ci = sources.source_of_run(&id).unwrap().unwrap();
+    let manifest = sources.manifest(&ci).unwrap().unwrap();
+    assert!(!manifest
+        .object_manifest
+        .entries
+        .iter()
+        .any(|e| e.path.0 == b"private.env"));
+    assert_eq!(manifest.secret_files.len(), 1);
+    let vault = remote_task_runner::secrets::vault::Vault::open(&spec.state_dir).unwrap();
+    let key = remote_task_runner::secrets::key::load(&spec.cluster_key_path).unwrap();
+    assert!(vault.has(&id));
+    assert_eq!(
+        vault.load(&id, &manifest.secret_files, &key).unwrap().files[0]
+            .content
+            .0,
+        format!("TOKEN={secret}\n").as_bytes()
+    );
+    tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            if let Reply::Task { attempts } = client
+                .request(Operation::Task {
+                    task_id: second_task.clone(),
+                })
+                .await
+                .unwrap()
+            {
+                if let Some(a) = attempts
+                    .iter()
+                    .find(|a| a.state == remote_task_runner::state::AttemptState::Terminal)
+                {
+                    if a.termination.as_ref().unwrap().outcome()
+                        != remote_task_runner::state::Outcome::Succeeded
+                    {
+                        eprintln!("second attempt: {a:?}");
+                        let worker = remote_task_runner::storage::WorkerStore::open_read_only(
+                            &spec.worker_state_dir,
+                        )
+                        .unwrap();
+                        for event in worker.events_of_attempt(&a.attempt_id, 40).unwrap() {
+                            eprintln!(
+                                "second event {}: code={:?} message={:?}",
+                                event.kind,
+                                event.payload.get("code"),
+                                event.payload.get("message")
+                            );
+                        }
+                        eprintln!(
+                            "second result: {:?}",
+                            worker.get_result(&a.attempt_id).unwrap()
+                        );
+                        shutdown(&client).await;
+                        panic!("same-source second attempt failed");
+                    }
+                    break;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let count_runs = || {
+        let db = rusqlite::Connection::open_with_flags(
+            spec.state_dir.join("coordinator.db"),
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+        )
+        .unwrap();
+        db.query_row("SELECT COUNT(*) FROM run", [], |row| row.get::<_, i64>(0))
+            .unwrap()
+    };
+    let before = count_runs();
+    std::fs::remove_file(repo.join("private.env")).unwrap();
+    let failed = tokio::process::Command::new(&spec.executable)
+        .args(["--json", "submit", "--", "/usr/bin/true"])
+        .current_dir(&repo)
+        .env_clear()
+        .envs(&spec.env)
+        .output()
+        .await
+        .unwrap();
+    assert!(!failed.status.success());
+    let error: serde_json::Value = serde_json::from_slice(&failed.stdout).unwrap();
+    assert_eq!(error["ok"], false);
+    assert_eq!(count_runs(), before, "failed capture dispatched a run");
+    shutdown(&client).await;
+}
+
+#[test]
+fn command_capture_directory_is_bound_once_and_source_view_reuses_it() {
+    use remote_task_runner::service::{context::Context, input};
+    let (root, spec) = fixture();
+    let dir = root.path().join("directory");
+    std::fs::create_dir(&dir).unwrap();
+    std::fs::write(dir.join("input"), "first immutable input").unwrap();
+    let mut context = Context::load(spec.env.clone(), dir.clone(), spec).unwrap();
+    let run = remote_task_runner::ids::RunId::generate();
+    let first = input::capture(&context, &run, None).unwrap();
+    std::fs::write(dir.join("input"), "later content").unwrap();
+    let second = input::capture(&context, &run, None).unwrap();
+    assert_eq!(first.manifest.source_id, second.manifest.source_id);
+    let view = root.path().join("view");
+    input::source_view(&context, &run, &view).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(view.join("input")).unwrap(),
+        "first immutable input"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dir.join("input")).unwrap(),
+        "later content"
+    );
+    assert!(
+        !context.state_dir().join("coordinator.db").exists(),
+        "capture took writable owner state"
+    );
+    assert!(input::capture(
+        &context,
+        &remote_task_runner::ids::RunId::generate(),
+        Some("HEAD")
+    )
+    .is_err());
+    context.config.source_mode.value = remote_task_runner::config::model::SourceMode::Commit;
+    assert!(input::capture(&context, &remote_task_runner::ids::RunId::generate(), None).is_err());
+    let mut invalid_env = context.env.clone();
+    invalid_env.insert(
+        "GIT_DIR".into(),
+        root.path().join("absent-git-dir").display().to_string(),
+    );
+    assert!(
+        Context::load(invalid_env, dir, context.bootstrap.clone()).is_err(),
+        "invalid Git context must not become a directory snapshot"
+    );
+}
+
+#[test]
+fn uninitialized_submit_is_typed_without_creating_config_or_state() {
+    let root = tempfile::tempdir().unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_remote-task-runner"))
+        .args(["--json", "submit", "--", "true"])
+        .env_clear()
+        .env("HOME", root.path())
+        .env("PATH", "/usr/bin:/bin")
+        .current_dir(root.path())
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(output.stderr.is_empty());
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["error"]["code"], "NOT_FOUND");
+    assert!(value["error"]["message"].as_str().unwrap().contains("init"));
+    assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
+}
+
+#[test]
+fn command_commit_capture_requires_and_preserves_explicit_revision() {
+    use remote_task_runner::service::{context::Context, input};
+    let (root, spec) = fixture();
+    let repo = root.path().join("commit-repo");
+    std::fs::create_dir(&repo).unwrap();
+    let git = |args: &[&str]| {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(&repo)
+            .env_clear()
+            .envs(&spec.env)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap()
+    };
+    git(&["init", "-q"]);
+    git(&["config", "user.name", "Fixture"]);
+    git(&["config", "user.email", "fixture@example.invalid"]);
+    std::fs::write(repo.join("input"), "explicit old revision").unwrap();
+    git(&["add", "."]);
+    git(&["commit", "-qm", "first"]);
+    let old = git(&["rev-parse", "HEAD"]).trim().to_string();
+    std::fs::write(repo.join("input"), "new HEAD").unwrap();
+    git(&["commit", "-qam", "second"]);
+    std::fs::write(repo.join("input"), "dirty worktree").unwrap();
+    let mut context = Context::load(spec.env.clone(), repo.clone(), spec).unwrap();
+    context.config.source_mode.value = remote_task_runner::config::model::SourceMode::Commit;
+    assert!(input::capture(&context, &remote_task_runner::ids::RunId::generate(), None).is_err());
+    let run = remote_task_runner::ids::RunId::generate();
+    let captured = input::capture(&context, &run, Some(&old)).unwrap();
+    assert_eq!(
+        captured.manifest.original_head.as_deref(),
+        Some(old.as_str())
+    );
+    let view = root.path().join("commit-view");
+    input::source_view(&context, &run, &view).unwrap();
+    assert_eq!(
+        std::fs::read_to_string(view.join("input")).unwrap(),
+        "explicit old revision"
+    );
+    assert_eq!(
+        std::fs::read_to_string(repo.join("input")).unwrap(),
+        "dirty worktree"
+    );
+}

@@ -1,4 +1,5 @@
-//! Single-owner local runtime. Process bootstrap and remote forwarding are separate layers.
+//! Single-owner local runtime with durable captured input acceptance and local delivery.
+//! Remote connection/reconnection ownership remains a separate layer.
 use crate::config::runtime::{WorkerInputs, WorkerTarget};
 use crate::config::ResolvedConfig;
 use crate::coordinator::{Coordinator, TaskSpec};
@@ -33,8 +34,9 @@ pub struct Inputs {
     pub collection: CollectConfig,
 }
 
-/// Private, versioned IPC. This does not capture or forward sources/secrets.
-/// Submit requires the immutable source to have already reached the local worker.
+/// Private, versioned IPC. Clients capture into the configured private parent stores.
+/// SubmitCaptured forwards that immutable input; legacy Submit accepts prepositioned
+/// local sources only and explicitly refuses secret-bearing tasks.
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Request {
@@ -48,6 +50,11 @@ pub struct Request {
 pub enum Operation {
     Ping,
     Submit {
+        run_id: RunId,
+        source_id: SourceId,
+        tasks: Vec<(TaskId, TaskSpec)>,
+    },
+    SubmitCaptured {
         run_id: RunId,
         source_id: SourceId,
         tasks: Vec<(TaskId, TaskSpec)>,
@@ -160,6 +167,11 @@ impl Client {
         let mut stream = tokio::time::timeout(IO_TIMEOUT, UnixStream::connect(&self.socket))
             .await
             .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "parent connect timeout"))??;
+        let response_timeout = if matches!(&operation, Operation::SubmitCaptured { .. }) {
+            Duration::from_secs(300)
+        } else {
+            IO_TIMEOUT
+        };
         let request = Request {
             schema_version: 1,
             cluster_id: self.cluster_id.clone(),
@@ -167,8 +179,16 @@ impl Client {
             operation,
         };
         write_message(&mut stream, &request).await?;
-        Ok(read_message(&mut stream).await?)
+        Ok(read_message_with_timeout(&mut stream, response_timeout).await?)
     }
+}
+
+struct CapturedInputs {
+    transfer: Arc<Mutex<()>>,
+    sources: crate::source::SourceStore,
+    vault: crate::secrets::vault::Vault,
+    key: crate::secrets::key::ClusterKey,
+    env: std::collections::BTreeMap<String, String>,
 }
 
 pub struct Resident {
@@ -176,6 +196,9 @@ pub struct Resident {
     files: Arc<ResultStore>,
     agent: Arc<Agent>,
     sources: crate::source::SourceStore,
+    captured: Arc<CapturedInputs>,
+    worker_client: crate::protocol::Client,
+    worker_id: WorkerId,
     listener: UnixListener,
     worker_connection: tokio::task::JoinHandle<()>,
     client: Client,
@@ -189,6 +212,7 @@ struct StartupParts {
     coordinator: Arc<Coordinator>,
     files: Arc<ResultStore>,
     sources: crate::source::SourceStore,
+    captured: Arc<CapturedInputs>,
     agent: Arc<Agent>,
     token_file: File,
     socket: PathBuf,
@@ -236,6 +260,13 @@ impl StartupParts {
         private_dir(&inputs.worker.state_dir)?;
         reject_symlinks(&inputs.worker.state_dir)?;
         let sources = crate::source::SourceStore::open(&inputs.worker.state_dir)?;
+        let captured = Arc::new(CapturedInputs {
+            transfer: Arc::new(Mutex::new(())),
+            sources: crate::source::SourceStore::open(&inputs.state_dir)?,
+            vault: crate::secrets::vault::Vault::open(&inputs.state_dir)?,
+            key: crate::secrets::key::load(&inputs.worker.cluster_key_path)?,
+            env: inputs.worker.env.clone(),
+        });
         let runtime = config.worker_runtime(inputs.worker)?;
         let agent = runtime.start().map_err(|e| anyhow::anyhow!(e.message))?;
         let cluster = coordinator.store().cluster_id().clone();
@@ -244,6 +275,7 @@ impl StartupParts {
             coordinator,
             files,
             sources,
+            captured,
             agent,
             token_file,
             socket,
@@ -283,7 +315,11 @@ impl Drop for Startup {
 async fn connect_local(
     startup: &Startup,
     config: &ResolvedConfig,
-) -> anyhow::Result<(UnixListener, tokio::task::JoinHandle<()>)> {
+) -> anyhow::Result<(
+    UnixListener,
+    tokio::task::JoinHandle<()>,
+    crate::protocol::Client,
+)> {
     let parts = startup.parts.as_ref().expect("prepared startup");
     let listener = crate::protocol::transport::listen_unix(&parts.socket)?;
     let (parent, worker) = UnixStream::pair()?;
@@ -315,6 +351,7 @@ async fn connect_local(
             return Err(e.into());
         }
     };
+    let worker_client = connected.client.clone();
     if let Err(e) = config.attach_worker(
         &parts.coordinator,
         WorkerTarget::Local(&parts.worker_id),
@@ -323,7 +360,7 @@ async fn connect_local(
         worker_connection.abort();
         anyhow::bail!(e.message);
     }
-    Ok((listener, worker_connection))
+    Ok((listener, worker_connection, worker_client))
 }
 
 impl Resident {
@@ -344,7 +381,7 @@ impl Resident {
         })
         .await??;
         let connected = connect_local(&startup, config).await;
-        let (listener, worker_connection) = match connected {
+        let (listener, worker_connection, worker_client) = match connected {
             Ok(value) => value,
             Err(e) => {
                 tokio::task::spawn_blocking(move || startup.cleanup()).await?;
@@ -357,6 +394,9 @@ impl Resident {
             files: parts.files,
             agent: parts.agent,
             sources: parts.sources,
+            captured: parts.captured,
+            worker_client,
+            worker_id: parts.worker_id,
             listener,
             worker_connection,
             client: Client {
@@ -416,6 +456,46 @@ impl Resident {
                 tokio::task::spawn_blocking(move || agent.supervise()).await?;
             }
         });
+        let coordinator = self.coordinator.clone();
+        let captured = self.captured.clone();
+        let worker_client = self.worker_client.clone();
+        let worker_id = self.worker_id.clone();
+        let mut secret_stop = rx.clone();
+        loops.spawn(async move {
+            let mut timer = tokio::time::interval(Duration::from_millis(100));
+            timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            let mut sent = std::collections::BTreeSet::new();
+            let mut next = 0usize;
+            loop {
+                tokio::select! { _ = secret_stop.changed() => return Ok(()), _ = timer.tick() => {} }
+                let owner = coordinator.clone(); let worker = worker_id.clone();
+                let attempts = tokio::task::spawn_blocking(move || owner.store().live_attempts(Some(&worker))).await??;
+                let active: std::collections::BTreeSet<_> = attempts.iter().map(|a| a.record.attempt_id.clone()).collect();
+                sent.retain(|id| active.contains(id));
+                let start = next.min(attempts.len());
+                next = if start.saturating_add(16) >= attempts.len() { 0 } else { start + 16 };
+                for attempt in attempts.into_iter().skip(start).take(16) {
+                    let Some(placement) = attempt.placement else { continue; };
+                    let payload: crate::wire::AttemptPayload = serde_json::from_value(placement.demand["payload"].clone())?;
+                    if !payload.has_secret_bundle || sent.contains(&attempt.record.attempt_id) { continue; }
+                    let capture = captured.clone(); let run = payload.run_id.clone(); let source = payload.source_id.clone();
+                    let bundle = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+                        let id = crate::source::classify::ci_id_of(&source).ok_or_else(|| anyhow::anyhow!("invalid source"))?;
+                        let manifest = capture.sources.manifest(&id)?.ok_or_else(|| anyhow::anyhow!("input source unavailable"))?;
+                        Ok(capture.vault.load(&run, &manifest.secret_files, &capture.key)?)
+                    }).await?;
+                    // Missing/tampered bundles never become an empty bundle. The worker's
+                    // secret gate eventually reports SECRET_UNAVAILABLE without running.
+                    let Ok(bundle) = bundle else { continue; };
+                    let delivered = tokio::select! {
+                        _ = secret_stop.changed() => return Ok(()),
+                        result = crate::secrets::send::send_bundle(&worker_client, &bundle,
+                            coordinator.epoch(), &attempt.record.attempt_id, attempt.record.generation, IO_TIMEOUT) => result.is_ok(),
+                    };
+                    if delivered { sent.insert(attempt.record.attempt_id); }
+                }
+            }
+        });
         let permits = Arc::new(Semaphore::new(32));
         // Serializes acceptance with shutdown, not with placement/collection.
         let admission = Arc::new(Mutex::new(false));
@@ -440,12 +520,14 @@ impl Resident {
                     let Ok(permit) = permits.clone().try_acquire_owned() else { continue; };
                     let coordinator = self.coordinator.clone();
                     let sources = self.sources.clone();
+                    let captured = self.captured.clone();
+                    let worker_client = self.worker_client.clone();
                     let client = self.client.clone();
                     let stop = stop.clone();
                     let admission = admission.clone();
                     requests.spawn(async move {
                         let _permit = permit;
-                        let _ = handle(stream, coordinator, sources, client, admission, stop).await;
+                        let _ = handle(stream, coordinator, sources, captured, worker_client, client, admission, stop).await;
                     });
                 }
             }
@@ -488,10 +570,13 @@ impl Drop for Resident {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle(
     mut stream: UnixStream,
     coordinator: Arc<Coordinator>,
     sources: crate::source::SourceStore,
+    captured: Arc<CapturedInputs>,
+    worker_client: crate::protocol::Client,
     client: Client,
     admission: Arc<Mutex<bool>>,
     stop: watch::Sender<bool>,
@@ -600,6 +685,97 @@ async fn handle(
                     }
                 }
             }
+            Operation::SubmitCaptured {
+                run_id,
+                source_id,
+                tasks,
+            } => {
+                // Transfer can be slow; admission/shutdown and other RPCs stay responsive.
+                drop(gate);
+                let source = source_id.clone();
+                let run = run_id.clone();
+                let capture = captured.clone();
+                let mut stopping = stop.subscribe();
+                let checked =
+                    tokio::task::spawn_blocking(move || -> anyhow::Result<(Digest, bool)> {
+                        let id = crate::source::classify::ci_id_of(&source)
+                            .ok_or_else(|| anyhow::anyhow!("invalid source"))?;
+                        anyhow::ensure!(
+                            capture.sources.source_of_run(&run)?.as_deref() == Some(&id),
+                            "run source binding mismatch"
+                        );
+                        let manifest = capture
+                            .sources
+                            .manifest(&id)?
+                            .ok_or_else(|| anyhow::anyhow!("source unavailable"))?;
+                        crate::source::store::verify_manifest(&manifest)?;
+                        capture
+                            .vault
+                            .load(&run, &manifest.secret_files, &capture.key)?;
+                        Ok((
+                            Digest::parse(&manifest.manifest_digest).or_else(|_| {
+                                Digest::parse(&format!("sha256:{}", manifest.manifest_digest))
+                            })?,
+                            !manifest.secret_files.is_empty(),
+                        ))
+                    });
+                let result = async {
+                    let (digest, has_secrets) = tokio::select! {
+                        biased;
+                        _=stopping.wait_for(|stopped| *stopped)=>anyhow::bail!("resident is stopping"),
+                        checked=checked=>checked??,
+                    };
+                    anyhow::ensure!(
+                        !tasks.is_empty() && tasks.len() <= 64,
+                        "submit requires 1..64 tasks"
+                    );
+                    anyhow::ensure!(
+                        tasks.iter().all(|(_, task)| task.manifest_digest == digest
+                            && task.has_secret_bundle == has_secrets),
+                        "source digest mismatch"
+                    );
+                    let transfer=tokio::select! {
+                        biased;
+                        _=stopping.wait_for(|stopped| *stopped)=>anyhow::bail!("resident is stopping"),
+                        transfer=captured.transfer.clone().lock_owned()=>transfer,
+                    };
+                    let source=source_id.clone(); let store=captured.sources.clone();
+                    let env=captured.env.clone(); let worker=worker_client.clone();
+                    let epoch=coordinator.epoch(); let transfer_stop=stopping.clone();
+                    // A detached transfer owns only source IO and its locks. It drains any
+                    // current blocking operation before cleanup, never coordinator ownership.
+                    let forwarding=tokio::spawn(async move {
+                        super::forward::source(&worker,epoch,store,&source,env,transfer_stop,transfer).await
+                    });
+                    tokio::select! {
+                        biased;
+                        _=stopping.wait_for(|stopped| *stopped)=>anyhow::bail!("resident is stopping"),
+                        forwarded=forwarding=>forwarded??,
+                    }
+                    let guard = admission.lock().await;
+                    anyhow::ensure!(!*guard && !coordinator.is_fenced(), "resident is stopping");
+                    let owner = coordinator.clone();
+                    let source = source_id.clone();
+                    tokio::task::spawn_blocking(move || {
+                        owner.store().put_source_ref(&source, &digest, wall_ms())
+                    })
+                    .await??;
+                    coordinator
+                        .enqueue(run_id.clone(), source_id, tasks)
+                        .await?;
+                    Ok::<_, anyhow::Error>(())
+                }
+                .await;
+                let answer = match result {
+                    Ok(()) => Reply::Accepted { run_id },
+                    Err(e) => Reply::Error {
+                        message: e.to_string(),
+                    },
+                };
+                return write_message(&mut stream, &answer)
+                    .await
+                    .map_err(Into::into);
+            }
             Operation::Task { task_id } => {
                 let coordinator = coordinator.clone();
                 match tokio::task::spawn_blocking(move || {
@@ -637,7 +813,13 @@ async fn handle(
     Ok(())
 }
 async fn read_message<T: DeserializeOwned>(stream: &mut UnixStream) -> io::Result<T> {
-    tokio::time::timeout(IO_TIMEOUT, async {
+    read_message_with_timeout(stream, IO_TIMEOUT).await
+}
+async fn read_message_with_timeout<T: DeserializeOwned>(
+    stream: &mut UnixStream,
+    timeout: Duration,
+) -> io::Result<T> {
+    tokio::time::timeout(timeout, async {
         let length = stream.read_u32().await? as usize;
         if length == 0 || length > MAX_REQUEST_BYTES {
             return Err(io::Error::new(

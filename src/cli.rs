@@ -245,6 +245,52 @@ pub fn run(cli: Cli) -> i32 {
     if let Command::Supervise(args) = &cli.command {
         return crate::supervisor::process::main(&args.spec);
     }
+    if let Command::Submit(args) = &cli.command {
+        let result = (|| -> Result<crate::service::submit::Receipt, crate::error::ApiError> {
+            let env = std::env::vars_os()
+                .filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?)))
+                .collect();
+            let cwd = std::env::current_dir()
+                .map_err(|e| crate::error::ApiError::new(ErrorCode::InvalidInput, e.to_string()))?;
+            let context = crate::service::context::Context::discover(env, cwd)?;
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .map_err(|e| crate::error::ApiError::new(ErrorCode::Internal, e.to_string()))?;
+            runtime.block_on(crate::service::submit::command(
+                context,
+                args.command.clone(),
+                None,
+            ))
+        })();
+        return match result {
+            Ok(receipt) => {
+                for warning in &receipt.warnings {
+                    eprintln!("warning: {warning}");
+                }
+                if cli.json {
+                    println!(
+                        "{}",
+                        serde_json::json!({"schema_version":1,"ok":true,"result":receipt})
+                    );
+                } else {
+                    println!("{} {}", receipt.run_id, receipt.task_id);
+                }
+                exit::SUCCESS
+            }
+            Err(error) => {
+                if cli.json {
+                    println!(
+                        "{}",
+                        serde_json::json!({"schema_version":1,"ok":false,"error":error})
+                    );
+                } else {
+                    eprintln!("error: {}", error.message);
+                }
+                error.code.exit_code()
+            }
+        };
+    }
     let envelope = Envelope::not_implemented();
     if cli.json {
         let line = serde_json::to_string(&envelope).expect("envelope serializes");
