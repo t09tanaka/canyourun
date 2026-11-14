@@ -397,12 +397,15 @@ async fn shutdown_rejects_inflight_and_mutex_waiting_sources_without_enqueuing()
             matches!(tokio::time::timeout(Duration::from_secs(2),task).await.unwrap().unwrap().unwrap(),Reply::Error {message} if message.contains("stopping"))
         );
     }
-    // No owner lock survives in a detached source job, and neither run was accepted.
-    let store = CoordinatorStore::open_read_only(&state).unwrap();
+    // The source peer is still blocked: acquiring the non-waiting writer
+    // lock directly proves that detached source IO retains no coordinator owner.
+    // A complete bootstrap's runtime is not evidence about lock ownership.
+    assert!(!peer.is_finished());
+    let store = CoordinatorStore::open(&state, wall_ms()).unwrap();
     assert!(store.queued_tasks(10).unwrap().is_empty());
     assert!(store.list_nonterminal_attempts().unwrap().is_empty());
     drop(store);
-    let restart = tokio::time::timeout(Duration::from_secs(2), Resident::start(&config, inputs()))
+    let restart = tokio::time::timeout(Duration::from_secs(20), Resident::start(&config, inputs()))
         .await
         .unwrap()
         .unwrap();
