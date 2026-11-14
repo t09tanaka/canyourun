@@ -248,6 +248,62 @@ fn settled(r: &Report) -> remote_task_runner::state::Termination {
     r.termination.expect("settled")
 }
 
+fn assert_recorded_command_stopped(identity: &remote_task_runner::storage::ProcessIdentity) {
+    assert!(identity.pid > 1);
+    match platform::process_start_identity(identity.pid) {
+        platform::StartIdentity::NoProcess => {}
+        platform::StartIdentity::Identity(now) | platform::StartIdentity::Zombie(now) => {
+            assert_ne!(now, identity.start_identity, "the recorded command remains");
+        }
+        platform::StartIdentity::Unknown => panic!("the recorded command's identity is unknown"),
+    }
+}
+
+fn assert_recorded_traffic_child_stopped(child: &task_traffic_controller::process::ChildIdentity) {
+    assert!(child.pid > 1);
+    match platform::process_start_identity(child.pid) {
+        platform::StartIdentity::NoProcess => {}
+        platform::StartIdentity::Identity(_) | platform::StartIdentity::Zombie(_) => {
+            // TTC's start time uses a different representation from the
+            // worker identity. Compare it only with TTC's recorded value.
+            let recorded = child
+                .start_time
+                .expect("the child's start time was recorded");
+            let now = task_traffic_controller::process::start_time(child.pid)
+                .expect("the current child's start time must be readable");
+            assert_ne!(now, recorded, "the recorded traffic child remains");
+        }
+        platform::StartIdentity::Unknown => panic!("the traffic child's identity is unknown"),
+    }
+}
+
+// Measure the stop from a command's durable start marker. Registration,
+// admission and earlier nodes are not part of the running-command budget.
+fn run_from_command_start(f: &Fx, marker: &Path) -> remote_task_runner::state::Termination {
+    std::thread::scope(|scope| {
+        let runner = scope.spawn(|| run(&f.spec).unwrap());
+        wait_for("the timed command to start", || marker.exists());
+        let started = Instant::now();
+        let report = runner.join().unwrap();
+        assert!(started.elapsed() < Duration::from_secs(10));
+        let t = settled(&report);
+        assert_eq!(t.timeout().unwrap().phase, TimeoutPhase::Running);
+        assert!(f
+            .store
+            .get(f.attempt())
+            .unwrap()
+            .unwrap()
+            .receipts
+            .reached(Receipt::Running));
+        for (_, _, identity) in f.store.launches(f.attempt()).unwrap() {
+            if let Some(identity) = identity {
+                assert_recorded_command_stopped(&identity);
+            }
+        }
+        t
+    })
+}
+
 // ------------------------------------------------------------- the run
 
 #[test]
@@ -832,37 +888,48 @@ fn the_command_timeout_stops_a_running_command() {
 fn a_node_s_own_timeout_replaces_the_default_for_that_node_only() {
     // The first node outlives the default and may: its own limit is longer.
     // The second has a shorter one of its own and is stopped by it.
-    let mut f = fx(vec![
+    let mut f = fx(vec![]);
+    let marker = f.path("stuck-started");
+    f.spec.nodes = vec![
         node("slow", "sleep 1.2; echo slow-done"),
-        node("stuck", "sleep 30"),
-    ]);
+        node(
+            "stuck",
+            &format!("touch {}; sleep 30; echo stuck-done", marker.display()),
+        ),
+    ];
     f.spec.command_timeout_ms = Some(400);
     f.spec.nodes[0].timeout_ms = Some(20_000);
     f.spec.nodes[1].timeout_ms = Some(300);
     f.spec.term_grace_ms = 2_000;
-    let started = Instant::now();
-    let t = settled(&run(&f.spec).unwrap());
+    let t = run_from_command_start(&f, &marker);
     assert!(f.output().contains("slow-done"), "{}", f.output());
     assert_eq!(t.outcome(), Outcome::TimedOut);
     let info = t.timeout().unwrap();
     assert_eq!(info.kind, TimeoutKind::Command);
     assert_eq!(info.phase, TimeoutPhase::Running);
-    assert!(started.elapsed() < Duration::from_secs(10));
+    assert!(!f.output().contains("stuck-done"));
     assert_eq!(f.store.launches(f.attempt()).unwrap().len(), 2);
 }
 
 #[test]
 fn a_node_without_its_own_timeout_keeps_the_default() {
-    let mut f = fx(vec![node("quick", "true"), node("stuck", "sleep 30")]);
+    let mut f = fx(vec![]);
+    let marker = f.path("stuck-started");
+    f.spec.nodes = vec![
+        node("quick", "true"),
+        node(
+            "stuck",
+            &format!("touch {}; sleep 30; echo stuck-done", marker.display()),
+        ),
+    ];
     f.spec.command_timeout_ms = Some(400);
     // The limit of the node before it does not stay in force.
     f.spec.nodes[0].timeout_ms = Some(60_000);
     f.spec.term_grace_ms = 2_000;
-    let started = Instant::now();
-    let t = settled(&run(&f.spec).unwrap());
+    let t = run_from_command_start(&f, &marker);
     assert_eq!(t.outcome(), Outcome::TimedOut);
     assert_eq!(t.timeout().unwrap().kind, TimeoutKind::Command);
-    assert!(started.elapsed() < Duration::from_secs(10));
+    assert!(!f.output().contains("stuck-done"));
 }
 
 #[test]
@@ -1267,14 +1334,57 @@ fn a_declared_artifact_that_leaves_the_workspace_refuses_the_spec() {
 
 #[test]
 fn the_deadline_counts_the_whole_attempt() {
-    let mut f = fx(vec![node("n", "sleep 30")]);
+    let mut f = fx(vec![]);
+    let marker = f.path("deadline-command-started");
+    f.spec.nodes = vec![node(
+        "n",
+        &format!("touch {}; sleep 30; echo deadline-missed", marker.display()),
+    )];
     f.spec.deadline_ms = Some(500);
     f.spec.command_timeout_ms = Some(60_000);
     let t = settled(&run(&f.spec).unwrap());
     assert_eq!(t.outcome(), Outcome::TimedOut);
     let info = t.timeout().unwrap();
     assert_eq!(info.kind, TimeoutKind::Deadline);
-    assert_eq!(info.phase, TimeoutPhase::Running);
+    // The deadline includes registration and admission. If those consume
+    // the budget, no launch may occur. The durable launch claim is made
+    // after the final Waiting look and before entering the Running loop;
+    // a child/Running receipt may still be pending at that boundary.
+    let launches = f.store.launches(f.attempt()).unwrap();
+    let running = f
+        .store
+        .get(f.attempt())
+        .unwrap()
+        .unwrap()
+        .receipts
+        .reached(Receipt::Running);
+    if launches.is_empty() {
+        assert_eq!(info.phase, TimeoutPhase::Waiting);
+        assert!(!running);
+        assert!(!marker.exists());
+    } else {
+        assert_eq!(launches.len(), 1);
+        assert_eq!(info.phase, TimeoutPhase::Running);
+        use task_traffic_controller::{managed, receipt::Phase, Context, Paths};
+        let ctx = Context::new(Paths::new(
+            &f.spec.traffic_state_dir,
+            f.spec.traffic_config_path(),
+        ));
+        let id = remote_task_runner::supervisor::spec::command_id(f.attempt(), 0);
+        let managed::Loaded::Ok(sidecar) = managed::load_sidecar(&ctx, &id) else {
+            panic!("the claimed launch must have a durable terminal sidecar");
+        };
+        assert_eq!(sidecar.phase, Phase::Terminal);
+        assert!(sidecar.launch_intent_at.is_some());
+        assert!(sidecar.terminal.is_some());
+        if let Some(child) = sidecar.child {
+            assert_recorded_traffic_child_stopped(&child);
+        }
+        if let Some(identity) = &launches[0].2 {
+            assert_recorded_command_stopped(identity);
+        }
+    }
+    assert!(!f.output().contains("deadline-missed"));
 }
 
 // ------------------------------------------------- A20 recovery and identity
