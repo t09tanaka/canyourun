@@ -2384,8 +2384,11 @@ async fn a_renewal_after_the_start_is_observed_by_the_running_supervisor() {
     let p = payload(&script);
     let a = AttemptId::generate();
     submit(&c, &a, &p).await;
-    wait_for("the command to start", || lines(&marker) == 1);
-    assert!(f.rec(&a).receipts.at_ms(Receipt::Running).is_some());
+    // The command can create its marker before the supervisor commits Running.
+    // Wait for both observations before testing a renewal after that receipt.
+    wait_for("the command and its running receipt", || {
+        lines(&marker) == 1 && f.rec(&a).receipts.at_ms(Receipt::Running).is_some()
+    });
     assert_eq!(seed_of(&f, &a)["key"], serde_json::Value::Null);
     let Response::RenewLease(r) = call(&c, renew_req(&a, 1, p.lease_ms)).await.unwrap() else {
         panic!()
