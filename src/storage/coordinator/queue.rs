@@ -674,6 +674,18 @@ impl CoordinatorStore {
         })
     }
 
+    /// Bounded status query for the resident request API.
+    pub fn latest_attempt_of_task(&self, task_id: &TaskId) -> Result<Option<AttemptRecord>> {
+        let task = task_id.to_string();
+        self.db.call(move |c| {
+            c.query_row(
+                &format!("SELECT {ATTEMPT_COLS} FROM attempt WHERE task_id = ?1 ORDER BY generation DESC LIMIT 1"),
+                [&task],
+                |r| Ok(attempt_from_row(r)),
+            ).optional()?.transpose()
+        })
+    }
+
     /// Every attempt of a task, by generation.
     pub fn attempts_of_task(&self, task_id: &TaskId) -> Result<Vec<AttemptRecord>> {
         let task = task_id.to_string();
