@@ -71,6 +71,8 @@ jobs:
         run: |
           git lfs version || { sudo apt-get update && sudo apt-get install -y git-lfs; }
           git lfs version
+      - name: install fast-worktree
+        run: command -v fast-worktree || cargo install fast-worktree --locked --version 0.3.2
       - name: 100% line coverage on the listed pure modules
         run: ./scripts/coverage-gate.sh
 
@@ -103,6 +105,8 @@ jobs:
           if ! cargo schemata --version 2>/dev/null | grep -q '0\.4\.0'; then
             cargo install cargo-schemata --locked --version 0.4.0 --force
           fi
+      - name: install fast-worktree
+        run: command -v fast-worktree || cargo install fast-worktree --locked --version 0.3.2
       - name: mutate this shard
         run: |
           args=""; for f in $PURE; do args="$args --file $f"; done
