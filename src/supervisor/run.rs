@@ -770,6 +770,7 @@ impl Control<'_> {
             }
         };
         let opts = Opts {
+            label: None,
             weight: node.weight,
             front: false,
             key: None,

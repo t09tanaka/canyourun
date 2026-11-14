@@ -157,6 +157,7 @@ fn register(ctx: &Context, attempt: &AttemptId, work: &Path) -> managed::OwnerGu
         command_id: id,
         spec_digest: "digest".into(),
         opts: Opts {
+            label: None,
             weight: Some(1),
             front: false,
             key: None,

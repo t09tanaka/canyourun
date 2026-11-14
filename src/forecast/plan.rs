@@ -1031,6 +1031,7 @@ mod tests {
     ) -> InspectedEntry {
         InspectedEntry {
             entry: Entry {
+                label: None,
                 id: "e".into(),
                 pid: 1,
                 state,
