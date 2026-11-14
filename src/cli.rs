@@ -21,6 +21,9 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
+    /// Run the parent owner process (internal).
+    #[command(hide = true)]
+    Daemon(DaemonArgs),
     /// Configure the coordinator and the local worker.
     Init,
     /// Run CI for the project.
@@ -55,6 +58,13 @@ pub enum Command {
     /// Supervise one attempt as its own process (internal).
     #[command(hide = true)]
     Supervise(SuperviseArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct DaemonArgs {
+    /// Retained private service bootstrap input; absent means bounded stdin.
+    #[arg(long)]
+    pub input: Option<std::path::PathBuf>,
 }
 
 #[derive(Debug, Args)]
@@ -203,6 +213,9 @@ impl Envelope {
 
 /// Run a parsed command and return the process exit code.
 pub fn run(cli: Cli) -> i32 {
+    if let Command::Daemon(args) = &cli.command {
+        return crate::service::bootstrap::daemon_main(args.input.as_deref());
+    }
     if let Command::Worker(args) = &cli.command {
         if args.stdio && !args.ephemeral {
             return run_worker_stdio();

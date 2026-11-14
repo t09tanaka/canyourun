@@ -12,7 +12,7 @@ use crate::storage::CoordinatorStore;
 use crate::worker::{agent::Agent, serve::serve_connection};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use std::fs::{File, OpenOptions};
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
@@ -46,6 +46,7 @@ pub struct Request {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Operation {
+    Ping,
     Submit {
         run_id: RunId,
         source_id: SourceId,
@@ -67,6 +68,7 @@ pub struct Attempt {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum Reply {
+    Ready { epoch: CoordinatorEpoch },
     Accepted { run_id: RunId },
     Task { attempts: Vec<Attempt> },
     Stopping,
@@ -81,6 +83,38 @@ pub struct Client {
     owner_token: String,
 }
 impl Client {
+    /// Load credentials without taking writable coordinator ownership.
+    /// The expected cluster is supplied by the caller, never inferred from a token.
+    pub fn load(state: &Path, cluster_id: ClusterId) -> anyhow::Result<Self> {
+        check_private_dir(state)?;
+        let ipc = state.join("parent");
+        check_private_dir(&ipc)?;
+        let mut file = secure_file(&ipc.join("owner.token"), false)?;
+        let mut token = String::new();
+        Read::by_ref(&mut file)
+            .take(65)
+            .read_to_string(&mut token)?;
+        anyhow::ensure!(
+            token.len() == 64
+                && token
+                    .bytes()
+                    .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()),
+            "invalid owner token"
+        );
+        let socket = ipc.join("request.sock");
+        let meta = std::fs::symlink_metadata(&socket)?;
+        use std::os::unix::fs::FileTypeExt;
+        anyhow::ensure!(
+            meta.file_type().is_socket() && meta.uid() == uid() && meta.mode() & 0o077 == 0,
+            "unsafe owner socket"
+        );
+        Ok(Self {
+            socket,
+            cluster_id,
+            owner_token: token,
+        })
+    }
+
     pub fn socket_path(&self) -> &Path {
         &self.socket
     }
@@ -88,7 +122,9 @@ impl Client {
         &self.cluster_id
     }
     pub async fn request(&self, operation: Operation) -> anyhow::Result<Reply> {
-        let mut stream = UnixStream::connect(&self.socket).await?;
+        let mut stream = tokio::time::timeout(IO_TIMEOUT, UnixStream::connect(&self.socket))
+            .await
+            .map_err(|_| io::Error::new(io::ErrorKind::TimedOut, "parent connect timeout"))??;
         let request = Request {
             schema_version: 1,
             cluster_id: self.cluster_id.clone(),
@@ -439,6 +475,9 @@ async fn handle(
         }
     } else {
         match request.operation {
+            Operation::Ping => Reply::Ready {
+                epoch: coordinator.store().epoch(),
+            },
             Operation::Submit {
                 run_id,
                 source_id,
@@ -571,7 +610,7 @@ async fn write_message<T: Serialize>(stream: &mut UnixStream, message: &T) -> io
 fn uid() -> u32 {
     unsafe { libc::geteuid() }
 }
-fn private_dir(path: &Path) -> io::Result<()> {
+pub(super) fn private_dir(path: &Path) -> io::Result<()> {
     validate_components(path)?;
     match std::fs::symlink_metadata(path) {
         Ok(m) if m.is_dir() && m.uid() == uid() && m.permissions().mode() & 0o077 == 0 => Ok(()),
@@ -585,7 +624,7 @@ fn private_dir(path: &Path) -> io::Result<()> {
         Err(e) => Err(e),
     }
 }
-fn validate_components(path: &Path) -> io::Result<()> {
+pub(super) fn validate_components(path: &Path) -> io::Result<()> {
     if !path.is_absolute() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -617,7 +656,7 @@ fn validate_components(path: &Path) -> io::Result<()> {
     }
     Ok(())
 }
-fn reject_symlinks(path: &Path) -> io::Result<()> {
+pub(super) fn reject_symlinks(path: &Path) -> io::Result<()> {
     for e in std::fs::read_dir(path)? {
         let e = e?;
         if e.file_type()?.is_symlink() {
@@ -632,3 +671,32 @@ fn reject_symlinks(path: &Path) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests;
+
+/// Open private regular files without following a link or blocking on a FIFO.
+pub(super) fn secure_file(path: &Path, writable: bool) -> io::Result<File> {
+    validate_components(path)?;
+    let file = OpenOptions::new()
+        .read(true)
+        .write(writable)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)?;
+    let meta = file.metadata()?;
+    if !meta.is_file() || meta.nlink() != 1 || meta.uid() != uid() || meta.mode() & 0o077 != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "unsafe resident file",
+        ));
+    }
+    Ok(file)
+}
+pub(super) fn check_private_dir(path: &Path) -> io::Result<()> {
+    validate_components(path)?;
+    let meta = std::fs::symlink_metadata(path)?;
+    if !meta.is_dir() || meta.uid() != uid() || meta.mode() & 0o077 != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "unsafe resident directory",
+        ));
+    }
+    Ok(())
+}
