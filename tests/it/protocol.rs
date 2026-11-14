@@ -694,13 +694,18 @@ fn blob_put_request(bytes: usize) -> Request {
 
 type Calls = Vec<tokio::task::JoinHandle<Result<Response, CallError>>>;
 
+// Arrival and draining each get a bounded budget. Calls must outlive both
+// phases so a loaded machine cannot turn an overload result into a timeout.
+const FLOOD_PHASE_TIMEOUT: Duration = Duration::from_secs(30);
+const FLOOD_CALL_TIMEOUT: Duration = Duration::from_secs(90);
+
 /// Call `requests` at once on a worker that is not taking anything off its queues.
 fn start_flood(client: &remote_task_runner::protocol::Client, requests: Vec<Request>) -> Calls {
     requests
         .into_iter()
         .map(|r| {
             let c = client.clone();
-            tokio::spawn(async move { c.call(r, T).await })
+            tokio::spawn(async move { c.call(r, FLOOD_CALL_TIMEOUT).await })
         })
         .collect()
 }
@@ -708,7 +713,7 @@ fn start_flood(client: &remote_task_runner::protocol::Client, requests: Vec<Requ
 /// Wait until `n` of the calls have ended. Before anything is taken off the
 /// queue only refused calls can end, so this waits for `n` refusals.
 async fn wait_for_refusals(calls: &Calls, n: usize) {
-    tokio::time::timeout(T, async {
+    tokio::time::timeout(FLOOD_PHASE_TIMEOUT, async {
         while calls.iter().filter(|c| c.is_finished()).count() < n {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
@@ -717,36 +722,77 @@ async fn wait_for_refusals(calls: &Calls, n: usize) {
     .expect("the refusals did not arrive");
 }
 
-/// Count what the worker's queue accepted (by taking it off the queue, once
-/// nothing more arrives for a second) and what was refused. The accepted
-/// requests are then dropped unanswered, which answers them `INTERNAL`, so the
-/// two counts come from the callers' side and need no timing: `(refused,
-/// accepted)`.
+/// Drain until every caller has a result, rather than treating a quiet interval
+/// as proof that all requests arrived. Dropping each accepted request answers
+/// it INTERNAL; refused requests answer OVERLOADED.
 async fn finish_flood(
     incoming: &mut remote_task_runner::protocol::Incoming,
     calls: Calls,
 ) -> (usize, usize) {
-    let mut held = Vec::new();
-    while let Ok(Some(inbound)) =
-        tokio::time::timeout(Duration::from_secs(1), incoming.next()).await
-    {
-        held.push(inbound);
-    }
-    let accepted = held.len();
-    drop(held);
-    let (mut busy, mut internal) = (0, 0);
+    let total = calls.len();
+    let mut pending = tokio::task::JoinSet::new();
     for call in calls {
-        match call.await.unwrap() {
-            Err(CallError::Remote(e)) if e.code == ErrorCode::Overloaded => busy += 1,
-            Err(CallError::Remote(e)) if e.code == ErrorCode::Internal => internal += 1,
-            other => panic!("{other:?}"),
-        }
+        pending.spawn(call);
     }
+    tokio::time::timeout(FLOOD_PHASE_TIMEOUT, async {
+        let (mut busy, mut internal, mut accepted) = (0, 0, 0);
+        let mut incoming_open = true;
+        while !pending.is_empty() {
+            tokio::select! {
+                inbound = incoming.next(), if incoming_open => {
+                    if let Some(inbound) = inbound {
+                        accepted += 1;
+                        drop(inbound);
+                    } else {
+                        incoming_open = false;
+                    }
+                }
+                result = pending.join_next() => {
+                    match result.unwrap().unwrap().unwrap() {
+                        Err(CallError::Remote(e)) if e.code == ErrorCode::Overloaded => busy += 1,
+                        Err(CallError::Remote(e)) if e.code == ErrorCode::Internal => internal += 1,
+                        other => panic!("{other:?}"),
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            internal, accepted,
+            "every accepted request was answered once"
+        );
+        assert_eq!(busy + accepted, total, "every caller was accounted for");
+        (busy, accepted)
+    })
+    .await
+    .expect("the flood did not finish")
+}
+
+#[tokio::test]
+async fn finishing_a_flood_waits_for_every_call_to_arrive() {
+    let cluster = ClusterId::generate();
+    let (conn, srv) = pair(&cluster).await;
+    let mut incoming = srv.incoming;
+    let (answered, wait_for_answer) = tokio::sync::oneshot::channel();
+    let first = {
+        let client = conn.client.clone();
+        tokio::spawn(async move {
+            let result = client.call(blob_get_request(), FLOOD_CALL_TIMEOUT).await;
+            answered.send(()).unwrap();
+            result
+        })
+    };
+    let second = tokio::spawn(async move {
+        // The second request cannot arrive until draining answers the first.
+        // A helper that stops at a quiet interval leaves this call stranded.
+        wait_for_answer.await.unwrap();
+        conn.client
+            .call(blob_get_request(), FLOOD_CALL_TIMEOUT)
+            .await
+    });
     assert_eq!(
-        internal, accepted,
-        "every accepted request was answered once"
+        finish_flood(&mut incoming, vec![first, second]).await,
+        (0, 2)
     );
-    (busy, accepted)
 }
 
 #[tokio::test]
