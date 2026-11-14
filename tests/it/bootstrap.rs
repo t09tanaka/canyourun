@@ -693,12 +693,30 @@ async fn configured_cli_submit_captures_worktree_and_secrets_then_outlives_calle
             panic!("terminal timeout: {error}");
         }
     };
-    assert_eq!(attempts.len(), 1);
-    assert_eq!(
-        attempts[0].termination.as_ref().unwrap().outcome(),
-        remote_task_runner::state::Outcome::Succeeded,
-        "{attempts:?}"
-    );
+    if attempts.len() != 1
+        || attempts[0].termination.as_ref().map(|end| end.outcome())
+            != Some(remote_task_runner::state::Outcome::Succeeded)
+    {
+        let worker =
+            remote_task_runner::storage::WorkerStore::open_read_only(&spec.worker_state_dir);
+        for attempt in attempts.iter().take(8) {
+            diagnose_attempt(&spec, &attempt.attempt_id);
+            if let Ok(worker) = &worker {
+                if let Ok(Some(record)) = worker.get(&attempt.attempt_id) {
+                    eprintln!("terminal fixture worker state: {:?}", record.state);
+                }
+                if let Ok(events) = worker.events_of_attempt(&attempt.attempt_id, 30) {
+                    for event in events {
+                        eprintln!("terminal fixture worker event: {}", event.kind);
+                    }
+                }
+            }
+        }
+        // Drain the private owner before reporting terminal preparation or
+        // execution failures, just as the timeout branch does.
+        shutdown(&client).await;
+        panic!("submitted fixture did not succeed: {attempts:?}");
+    }
     let attempt_dir = spec
         .worker_state_dir
         .join("attempts")
