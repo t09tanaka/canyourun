@@ -1422,6 +1422,25 @@ impl Agent {
         Ok(report)
     }
 
+    /// Supervise durable attempts without running retention or cleanup sweeps.
+    /// Resident composition uses this until bounded deletion is available.
+    pub fn supervise(self: &Arc<Self>) {
+        if self.ticking.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let _pass = Ticking(&self.ticking);
+        self.supervise_attempts();
+    }
+
+    fn supervise_attempts(self: &Arc<Self>) {
+        self.reap();
+        if let Ok(list) = self.store.list_nonterminal() {
+            for rec in list {
+                self.kick(&rec.attempt_id);
+            }
+        }
+    }
+
     /// Periodic work: watch attempts nobody watches, clean, collect garbage.
     /// One pass at a time; a call during a pass returns at once.
     pub fn tick(self: &Arc<Self>) {
@@ -1429,12 +1448,7 @@ impl Agent {
             return;
         }
         let _pass = Ticking(&self.ticking);
-        self.reap();
-        if let Ok(list) = self.store.list_nonterminal() {
-            for rec in list {
-                self.kick(&rec.attempt_id);
-            }
-        }
+        self.supervise_attempts();
         self.clean_ended();
         if let Err(e) = self.gc() {
             self.note_global(

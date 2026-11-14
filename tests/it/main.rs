@@ -23,3 +23,5 @@ mod worker_blobs;
 mod workspace;
 
 mod runtime;
+
+mod resident;
