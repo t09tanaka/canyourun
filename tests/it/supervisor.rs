@@ -664,11 +664,12 @@ fn a_cooperative_command_stops_on_term_within_the_grace() {
         wait_for("the command", || {
             read_pid(&bgp).is_some() && read_pid(&ldp).is_some()
         });
+        let started = Instant::now();
         second.cancel(&attempt, CoordinatorEpoch(1), 100).unwrap();
+        started
     });
-    let started = Instant::now();
     let t = settled(&run(&f.spec).unwrap());
-    canceller.join().unwrap();
+    let started = canceller.join().unwrap();
     assert_eq!(t.outcome(), Outcome::Cancelled);
     assert_eq!(t.exit(), Some(Exit::Signal(15)));
     assert!(started.elapsed() < Duration::from_secs(8));
