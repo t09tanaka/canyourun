@@ -248,6 +248,35 @@ fn settled(r: &Report) -> remote_task_runner::state::Termination {
     r.termination.expect("settled")
 }
 
+fn assert_recorded_command_stopped(identity: &remote_task_runner::storage::ProcessIdentity) {
+    assert!(identity.pid > 1);
+    match platform::process_start_identity(identity.pid) {
+        platform::StartIdentity::NoProcess => {}
+        platform::StartIdentity::Identity(now) | platform::StartIdentity::Zombie(now) => {
+            assert_ne!(now, identity.start_identity, "the recorded command remains");
+        }
+        platform::StartIdentity::Unknown => panic!("the recorded command's identity is unknown"),
+    }
+}
+
+fn assert_recorded_traffic_child_stopped(child: &task_traffic_controller::process::ChildIdentity) {
+    assert!(child.pid > 1);
+    match platform::process_start_identity(child.pid) {
+        platform::StartIdentity::NoProcess => {}
+        platform::StartIdentity::Identity(_) | platform::StartIdentity::Zombie(_) => {
+            // TTC's start time uses a different representation from the
+            // worker identity. Compare it only with TTC's recorded value.
+            let recorded = child
+                .start_time
+                .expect("the child's start time was recorded");
+            let now = task_traffic_controller::process::start_time(child.pid)
+                .expect("the current child's start time must be readable");
+            assert_ne!(now, recorded, "the recorded traffic child remains");
+        }
+        platform::StartIdentity::Unknown => panic!("the traffic child's identity is unknown"),
+    }
+}
+
 // Measure the stop from a command's durable start marker. Registration,
 // admission and earlier nodes are not part of the running-command budget.
 fn run_from_command_start(f: &Fx, marker: &Path) -> remote_task_runner::state::Termination {
@@ -268,10 +297,7 @@ fn run_from_command_start(f: &Fx, marker: &Path) -> remote_task_runner::state::T
             .reached(Receipt::Running));
         for (_, _, identity) in f.store.launches(f.attempt()).unwrap() {
             if let Some(identity) = identity {
-                assert!(
-                    !signal_pid(identity.pid, 0),
-                    "a settled command must be stopped"
-                );
+                assert_recorded_command_stopped(&identity);
             }
         }
         t
@@ -1352,10 +1378,10 @@ fn the_deadline_counts_the_whole_attempt() {
         assert!(sidecar.launch_intent_at.is_some());
         assert!(sidecar.terminal.is_some());
         if let Some(child) = sidecar.child {
-            assert!(!signal_pid(child.pid, 0));
+            assert_recorded_traffic_child_stopped(&child);
         }
         if let Some(identity) = &launches[0].2 {
-            assert!(!signal_pid(identity.pid, 0));
+            assert_recorded_command_stopped(identity);
         }
     }
     assert!(!f.output().contains("deadline-missed"));
