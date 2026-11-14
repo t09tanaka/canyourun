@@ -699,6 +699,25 @@ struct Control<'a> {
     pump_error: Arc<Mutex<Option<String>>>,
 }
 
+/// Notify only after a new grant was accepted by the clock. Diagnostics are
+/// best effort: their storage failure cannot change the lease decision.
+fn observe_lease(
+    clock: &mut LeaseClock,
+    now: u64,
+    key: Option<crate::wire::LeaseKey>,
+    db_expired: bool,
+    note: impl FnOnce(crate::wire::LeaseKey) -> bool,
+) -> LeaseStatus {
+    let before = clock.applied_key();
+    let status = clock.observe(now, key, db_expired);
+    if matches!(status, LeaseStatus::Valid { .. }) && clock.applied_key() != before {
+        if let Some(applied) = clock.applied_key() {
+            let _ = note(applied);
+        }
+    }
+    status
+}
+
 impl Control<'_> {
     /// One look at the cancel request, the lease and the timeouts.
     fn look(&mut self, stage: timeouts::Stage) -> Result<Option<StopReason>> {
@@ -713,7 +732,19 @@ impl Control<'_> {
             Some((k, e)) => (Some(k), e),
             None => (None, false),
         };
-        let status = self.lease.observe(now, key, db_expired);
+        let status = observe_lease(&mut self.lease, now, key, db_expired, |applied| {
+            // Like the identity diagnostic, this is not an authoritative
+            // receipt or a condition for keeping the command alive.
+            self.store
+                .append_event(
+                    Some(&rec.run_id),
+                    Some(attempt),
+                    "lease_renewal_observed",
+                    &json!({ "key": applied }),
+                    platform::wall_ms(),
+                )
+                .is_ok()
+        });
         let expired = status == LeaseStatus::Expired;
         if expired && !db_expired {
             // Persist it: from now on a renewal is refused, and no new node
@@ -1466,6 +1497,45 @@ pub fn run(spec: &SuperviseSpec) -> Result<Report> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_a_new_valid_grant_is_noted_even_when_the_diagnostic_cannot_be_written() {
+        use crate::ids::CoordinatorEpoch;
+        use crate::wire::LeaseKey;
+        let key = LeaseKey {
+            coordinator_epoch: CoordinatorEpoch(1),
+            lease_seq: 1,
+        };
+        let mut clock = LeaseClock::start(0, 100, 0, None);
+        let mut noted = Vec::new();
+        let status = observe_lease(&mut clock, 10, Some(key), false, |applied| {
+            noted.push(applied);
+            // A failed best-effort write has no result to feed back into
+            // the clock or the caller's stop decision.
+            false
+        });
+        assert_eq!(status, LeaseStatus::Valid { remaining_ms: 100 });
+        assert_eq!(noted, vec![key]);
+        assert_eq!(
+            observe_lease(&mut clock, 20, Some(key), false, |_| panic!("replay")),
+            LeaseStatus::Valid { remaining_ms: 90 }
+        );
+        let newer = LeaseKey {
+            lease_seq: 2,
+            ..key
+        };
+        assert_eq!(
+            observe_lease(&mut clock, 110, Some(newer), false, |_| panic!("late")),
+            LeaseStatus::Expired
+        );
+        let mut clock = LeaseClock::start(0, 100, 0, None);
+        assert_eq!(
+            observe_lease(&mut clock, 10, Some(key), true, |_| panic!(
+                "expired in database"
+            )),
+            LeaseStatus::Expired
+        );
+    }
 
     #[test]
     fn the_flag_is_set_when_its_guard_goes_also_by_a_panic() {

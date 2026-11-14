@@ -117,6 +117,11 @@ impl LeaseClock {
         }
     }
 
+    /// The last key whose grant this clock accepted, including its seed.
+    pub fn applied_key(&self) -> Option<LeaseKey> {
+        self.applied
+    }
+
     pub fn is_expired(&self) -> bool {
         self.expired
     }
@@ -152,7 +157,9 @@ mod tests {
     #[test]
     fn a_greater_key_restarts_the_countdown_from_when_it_was_seen() {
         let mut c = LeaseClock::start(0, 10_000, 0, Some(key(1, 1)));
+        assert_eq!(c.applied_key(), Some(key(1, 1)));
         assert_eq!(c.observe(6_000, Some(key(1, 2)), false), valid(10_000));
+        assert_eq!(c.applied_key(), Some(key(1, 2)));
         assert_eq!(c.observe(15_999, Some(key(1, 2)), false), valid(1));
         assert_eq!(
             c.observe(16_000, Some(key(1, 2)), false),
@@ -190,6 +197,7 @@ mod tests {
             c.observe(10_500, Some(key(1, 1)), false),
             LeaseStatus::Expired
         );
+        assert_eq!(c.applied_key(), None);
         // Still expired afterwards, whatever arrives, and even if the clock
         // were to be read as earlier.
         assert_eq!(
