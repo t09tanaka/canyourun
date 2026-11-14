@@ -23,7 +23,7 @@ fn fixture() -> (tempfile::TempDir, Spec) {
     }
     let key = root.path().join("key");
     remote_task_runner::secrets::key::init(&key).unwrap();
-    let spec = Spec {
+    let mut spec = Spec {
         state_dir: state,
         worker_state_dir: worker,
         worker_id: WorkerId::parse("persistent-local").unwrap(),
@@ -38,6 +38,16 @@ fn fixture() -> (tempfile::TempDir, Spec) {
         repo_root: None,
         expected_cluster: None,
     };
+    // Instrumented CLI/daemon/supervisor descendants keep the harness's private
+    // profile destination (including %p/%m), outside captured inputs and HOME.
+    if let Some(profile) = std::env::var_os("LLVM_PROFILE_FILE") {
+        spec.env.insert(
+            "LLVM_PROFILE_FILE".into(),
+            profile
+                .into_string()
+                .expect("coverage profile path is UTF-8"),
+        );
+    }
     (root, spec)
 }
 async fn shutdown(client: &Client) {
@@ -335,6 +345,9 @@ async fn bounded_queries_cli_configured_fixture_does_not_advance_epoch() {
             .args(args)
             .current_dir(root.path())
             .env_clear()
+            .envs(
+                std::env::var_os("LLVM_PROFILE_FILE").map(|profile| ("LLVM_PROFILE_FILE", profile)),
+            )
             .envs(&spec.env)
             .output()
             .unwrap();
@@ -396,6 +409,9 @@ async fn bounded_queries_cli_configured_fixture_does_not_advance_epoch() {
             .args(args)
             .current_dir(root.path())
             .env_clear()
+            .envs(
+                std::env::var_os("LLVM_PROFILE_FILE").map(|profile| ("LLVM_PROFILE_FILE", profile)),
+            )
             .envs(&spec.env)
             .output()
             .unwrap();
@@ -418,6 +434,9 @@ async fn bounded_queries_cli_configured_fixture_does_not_advance_epoch() {
             .args(["--json", "show", &id])
             .current_dir(root.path())
             .env_clear()
+            .envs(
+                std::env::var_os("LLVM_PROFILE_FILE").map(|profile| ("LLVM_PROFILE_FILE", profile)),
+            )
             .envs(&spec.env)
             .output()
             .unwrap();
@@ -479,6 +498,9 @@ async fn configured_cli_submit_captures_worktree_and_secrets_then_outlives_calle
             .args(args)
             .current_dir(&repo)
             .env_clear()
+            .envs(
+                std::env::var_os("LLVM_PROFILE_FILE").map(|profile| ("LLVM_PROFILE_FILE", profile)),
+            )
             .envs(&spec.env)
             .output()
             .unwrap();
@@ -510,7 +532,7 @@ async fn configured_cli_submit_captures_worktree_and_secrets_then_outlives_calle
     std::fs::set_permissions(&configdir, std::fs::Permissions::from_mode(0o700)).unwrap();
     write_input(&configdir.join("coordinator.json"), &spec).unwrap();
     let output=tokio::process::Command::new(&spec.executable).args(["--json","submit","--","/bin/sh","-c","set -e; sleep 1; test \"$(cat input.txt)\" = dirty-snapshot; test \"$(wc -c <private.env)\" -eq 40; cat private.env"])
-        .current_dir(&repo).env_clear().envs(&spec.env).output().await.unwrap();
+        .current_dir(&repo).env_clear().envs(std::env::var_os("LLVM_PROFILE_FILE").map(|profile|("LLVM_PROFILE_FILE",profile))).envs(&spec.env).output().await.unwrap();
     assert!(
         output.status.success(),
         "{} {}",
@@ -525,6 +547,7 @@ async fn configured_cli_submit_captures_worktree_and_secrets_then_outlives_calle
         .args(["--json", "submit", "--", "/usr/bin/true"])
         .current_dir(&repo)
         .env_clear()
+        .envs(std::env::var_os("LLVM_PROFILE_FILE").map(|profile| ("LLVM_PROFILE_FILE", profile)))
         .envs(&spec.env)
         .output()
         .await
@@ -725,6 +748,7 @@ async fn configured_cli_submit_captures_worktree_and_secrets_then_outlives_calle
         .args(["--json", "submit", "--", "/usr/bin/true"])
         .current_dir(&repo)
         .env_clear()
+        .envs(std::env::var_os("LLVM_PROFILE_FILE").map(|profile| ("LLVM_PROFILE_FILE", profile)))
         .envs(&spec.env)
         .output()
         .await
@@ -788,6 +812,7 @@ fn uninitialized_submit_is_typed_without_creating_config_or_state() {
     let output = Command::new(env!("CARGO_BIN_EXE_remote-task-runner"))
         .args(["--json", "submit", "--", "true"])
         .env_clear()
+        .envs(std::env::var_os("LLVM_PROFILE_FILE").map(|profile| ("LLVM_PROFILE_FILE", profile)))
         .env("HOME", root.path())
         .env("PATH", "/usr/bin:/bin")
         .current_dir(root.path())
@@ -812,6 +837,9 @@ fn command_commit_capture_requires_and_preserves_explicit_revision() {
             .args(args)
             .current_dir(&repo)
             .env_clear()
+            .envs(
+                std::env::var_os("LLVM_PROFILE_FILE").map(|profile| ("LLVM_PROFILE_FILE", profile)),
+            )
             .envs(&spec.env)
             .output()
             .unwrap();
