@@ -37,6 +37,18 @@ impl ProcessLock {
     }
 }
 
+impl Drop for ProcessLock {
+    fn drop(&mut self) {
+        // A child between fork and exec can still hold this open-file
+        // description, even though the descriptor is close-on-exec. Closing
+        // our descriptor alone would then leave the stopped owner's flock
+        // held until that child execs. Release ownership explicitly first.
+        // Drop cannot report unlock failures; closing the file remains the
+        // fallback and must never panic during another error's unwinding.
+        let _ = self._file.unlock();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -52,6 +64,22 @@ mod tests {
         ProcessLock::acquire(dir.path(), "y.lock").unwrap();
         assert!(first.path().ends_with("x.lock"));
         drop(first);
+        ProcessLock::acquire(dir.path(), "x.lock").unwrap();
+    }
+
+    #[test]
+    fn dropping_owner_releases_lock_even_with_an_inherited_description() {
+        let dir = tempfile::tempdir().unwrap();
+        let owner = ProcessLock::acquire(dir.path(), "x.lock").unwrap();
+        // dup and fork share the same open-file description. Keep that
+        // description alive without creating a child in the test process.
+        let inherited = owner._file.try_clone().unwrap();
+        assert!(ProcessLock::acquire(dir.path(), "x.lock").is_err());
+        drop(owner);
+        let next = ProcessLock::acquire(dir.path(), "x.lock").unwrap();
+        drop(inherited);
+        assert!(ProcessLock::acquire(dir.path(), "x.lock").is_err());
+        drop(next);
         ProcessLock::acquire(dir.path(), "x.lock").unwrap();
     }
 }
