@@ -32,6 +32,7 @@ fn fixture() -> (tempfile::TempDir, Spec) {
         env: BTreeMap::from([
             ("HOME".into(), root.path().display().to_string()),
             ("PATH".into(), "/usr/bin:/bin".into()),
+            ("TOKIO_WORKER_THREADS".into(), "2".into()),
             ("GIT_CONFIG_GLOBAL".into(), "/dev/null".into()),
             ("GIT_CONFIG_NOSYSTEM".into(), "1".into()),
         ]),
@@ -49,6 +50,65 @@ fn fixture() -> (tempfile::TempDir, Spec) {
         );
     }
     (root, spec)
+}
+// Private fixture metadata only: never dump argv, env, paths, journal payloads,
+// or arbitrary parse errors. Cap reads even when a child leaves malformed files.
+fn diagnose_attempt(spec: &Spec, attempt: &remote_task_runner::ids::AttemptId) {
+    use remote_task_runner::supervisor::spec::{command_id, SuperviseSpec};
+    use task_traffic_controller::managed::Sidecar;
+    fn read_json<T: serde::de::DeserializeOwned>(path: &std::path::Path) -> Option<T> {
+        let file = std::fs::File::open(path).ok()?;
+        if file.metadata().ok()?.len() > 256 * 1024 {
+            return None;
+        }
+        serde_json::from_reader(file.take(256 * 1024)).ok()
+    }
+    let dir = spec
+        .worker_state_dir
+        .join("attempts")
+        .join(attempt.as_str());
+    let input = dir.join("supervise.json");
+    let Some(supervise) = read_json::<SuperviseSpec>(&input) else {
+        eprintln!("supervisor spec exists={} readable=false", input.exists());
+        return;
+    };
+    let traffic = &supervise.traffic_state_dir;
+    let ledger_path = traffic.join("ledger.json");
+    let ledger = read_json::<serde_json::Value>(&ledger_path);
+    eprintln!(
+        "private TTC ledger exists={} readable={} entries={:?}",
+        ledger_path.exists(),
+        ledger.is_some(),
+        ledger
+            .as_ref()
+            .and_then(|l| l.get("entries_v2").or_else(|| l.get("entries")))
+            .and_then(|e| e.as_array())
+            .map(Vec::len)
+    );
+    for index in 0..supervise.nodes.len().min(8) {
+        let id = command_id(attempt, index);
+        let sidecar_path = traffic.join("managed").join(format!("{id}.json"));
+        let sidecar = read_json::<Sidecar>(&sidecar_path);
+        eprintln!(
+            "private TTC node={index} pipe_exists={} lease_exists={} sidecar_exists={} readable={}",
+            remote_task_runner::supervisor::spool::logs_dir(&supervise.spool_dir(), attempt)
+                .join(format!("node-{index}.pipe"))
+                .exists(),
+            traffic.join("leases").join(format!("{id}.lock")).exists(),
+            sidecar_path.exists(),
+            sidecar.is_some()
+        );
+        if let Some(sc) = sidecar {
+            eprintln!(
+                "private TTC phase={:?} owner_pid={} child_pid={:?} terminal={} descendants={}",
+                sc.phase,
+                sc.owner_pid,
+                sc.child.map(|c| c.pid),
+                sc.terminal.is_some(),
+                sc.descendants.len()
+            );
+        }
+    }
 }
 async fn shutdown(client: &Client) {
     assert!(matches!(
@@ -615,7 +675,12 @@ async fn configured_cli_submit_captures_worktree_and_secrets_then_outlives_calle
                     &spec.worker_state_dir,
                 )
                 .unwrap();
-                for a in attempts {
+                for a in attempts.iter().take(8) {
+                    diagnose_attempt(&spec, &a.attempt_id);
+                    eprintln!(
+                        "worker launch intents={:?}",
+                        worker.launches(&a.attempt_id).map(|l| l.len())
+                    );
                     if let Some(rec) = worker.get(&a.attempt_id).unwrap() {
                         eprintln!("worker state: {:?}", rec.state);
                     }
