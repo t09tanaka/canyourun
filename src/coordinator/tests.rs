@@ -21,6 +21,7 @@ impl WorkerLink for Silent {
 
 fn spec() -> TaskSpec {
     TaskSpec {
+        setup: None,
         plan_digest: Digest::of_bytes(b"plan"),
         manifest_digest: Digest::of_bytes(b"manifest"),
         commands: vec![CommandSpec {
@@ -211,4 +212,39 @@ fn declared_artifacts_reach_the_payload_and_its_hash() {
         payload_hash(&payload).unwrap(),
         payload_hash(&without).unwrap()
     );
+}
+
+#[test]
+fn setup_survives_queue_serialization_and_payload_construction() {
+    let mut task = spec();
+    // Old persisted queue records have no setup field.
+    let mut legacy = serde_json::to_value(&task).unwrap();
+    legacy.as_object_mut().unwrap().remove("setup");
+    assert!(serde_json::from_value::<TaskSpec>(legacy)
+        .unwrap()
+        .setup
+        .is_none());
+    let input = PlaceInput {
+        run_id: RunId::generate(),
+        task_id: TaskId::generate(),
+        generation: Generation(1),
+        source_id: Some(SourceId::generate()),
+        spec: serde_json::Value::Null,
+    };
+    assert!(build_payload(&input, &task, 1234).unwrap().setup.is_none());
+    task.setup = Some(crate::wire::SetupSpec {
+        steps: vec![],
+        toolchain: vec![],
+        scope: crate::wire::ReuseScope::Run,
+        freshness_secs: Some(90),
+        secrets: vec![],
+        no_cache: true,
+        step_timeout_ms: Some(123),
+    });
+    let read: TaskSpec = serde_json::from_slice(&serde_json::to_vec(&task).unwrap()).unwrap();
+    let payload = build_payload(&input, &read, 1234).unwrap();
+    assert_eq!(payload.setup, task.setup);
+    let roundtrip: AttemptPayload =
+        serde_json::from_slice(&serde_json::to_vec(&payload).unwrap()).unwrap();
+    assert_eq!(roundtrip.setup, task.setup);
 }

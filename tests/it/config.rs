@@ -1210,3 +1210,64 @@ fn priority_wrong_types_and_unknown_keys_are_errors() {
         assert!(parse_user("/u/config.toml", t).is_err(), "{t}");
     }
 }
+
+#[test]
+fn runtime_settings_map_non_default_limits_and_timing() {
+    let text = "schema_version = 1\n[coordinator]\nheartbeat_seconds = 2\nstale_seconds = 5\nlease_seconds = 12\nterm_grace_seconds = 3\nmax_active_task = 7\nlog_spool_limit_bytes = 12345\nretention_days = 2\n[scheduler]\nforecast_ttl_ms = 1500\nprefetch_per_worker = 4\npriority_step_seconds = 9\n";
+    let r = run(Some(text), None, None, &Overlay::default()).unwrap();
+    let s = r.runtime_settings().unwrap();
+    assert_eq!(s.coordinator.limits.max_active_task, 7);
+    assert_eq!(s.coordinator.limits.prefetch_per_worker, 4);
+    assert_eq!(s.coordinator.lease_ms, 12_000);
+    assert_eq!(s.coordinator.worker_budget_ms, 3000);
+    assert!(2 * s.coordinator.worker_budget_ms < s.coordinator.lease_ms);
+    assert_eq!(s.heartbeat_ms, 2000);
+    assert_eq!(s.stale_ms, 5000);
+    assert_eq!(s.term_grace_ms, 3000);
+    assert_eq!(s.retention_ms, 172_800_000);
+    assert_eq!(s.log_limit_bytes, 12345);
+    assert_eq!(s.scheduler.rules.forecast_ttl_ms, 1500);
+    assert_eq!(s.scheduler.rules.priority_step_ms, 9000);
+    assert_eq!(s.scheduler.rules.tie_window_ms, 1000);
+    assert_eq!(s.scheduler.forecast_wait_ms, 1000);
+}
+
+#[test]
+fn runtime_settings_refuse_invalid_timing_and_overflow() {
+    let base = run(None, None, None, &Overlay::default()).unwrap();
+    for ttl in [0, 999, 1000] {
+        let mut r = base.clone();
+        r.forecast_ttl_ms.value = ttl;
+        assert!(r.runtime_settings().is_err(), "ttl={ttl}");
+    }
+    let mut r = base.clone();
+    r.forecast_ttl_ms.value = 1001;
+    assert!(r.runtime_settings().is_ok());
+    r = base.clone();
+    r.lease_seconds.value = u64::MAX;
+    assert!(r
+        .runtime_settings()
+        .unwrap_err()
+        .to_string()
+        .contains("lease_seconds overflows"));
+    r = base.clone();
+    r.term_grace_seconds.value = u64::MAX;
+    assert!(r
+        .runtime_settings()
+        .unwrap_err()
+        .to_string()
+        .contains("term_grace_seconds overflows"));
+    r = base.clone();
+    r.max_active_task.value = 0;
+    assert!(r.runtime_settings().is_err());
+    r = base;
+    r.heartbeat_seconds.value = 1;
+    r.stale_seconds.value = 2;
+    r.lease_seconds.value = 3;
+    r.priority_step_seconds.value = 0;
+    r.prefetch_per_worker.value = 0;
+    let s = r.runtime_settings().unwrap();
+    assert_eq!(s.coordinator.worker_budget_ms, 750);
+    assert_eq!(s.coordinator.limits.prefetch_per_worker, 0);
+    assert_eq!(s.scheduler.rules.priority_step_ms, 0);
+}
